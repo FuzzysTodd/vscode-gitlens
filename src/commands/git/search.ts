@@ -104,8 +104,10 @@ const searchOperatorToTitleMap = new Map<SearchOperators, string>([
 	['', 'Search by Message'],
 	['=:', 'Search by Message'],
 	['message:', 'Search by Message'],
+	['-message:', 'Exclude by Message'],
 	['@:', 'Search by Author'],
 	['author:', 'Search by Author'],
+	['committer:', 'Search by Committer'],
 	['#:', 'Search by Commit SHA'],
 	['commit:', 'Search by Commit SHA'],
 	['?:', 'Search by File'],
@@ -226,6 +228,19 @@ export class SearchGitCommand extends QuickCommand<State> {
 				context.resultsKey = searchKey;
 			}
 
+			const nl = typeof search.naturalLanguage === 'object' ? search.naturalLanguage : undefined;
+			if (nl?.error) {
+				void window.showErrorMessage(`Unable to build a search from your description — ${nl.error}`);
+
+				// Re-enter the query step with the typed sentence intact: the step reads its value from
+				// `naturalLanguage.query` when it's an object.
+				state.naturalLanguage = nl;
+				state.query = undefined!;
+				context.resultPromise = undefined;
+				context.resultsKey = undefined;
+				continue;
+			}
+
 			if (state.showResultsInSideBar) {
 				void this.container.views.searchAndCompare.search(
 					state.repo.path,
@@ -333,11 +348,23 @@ export class SearchGitCommand extends QuickCommand<State> {
 				item: { type: 'add', operator: 'message:' },
 			},
 			{
+				label: searchOperatorToTitleMap.get('-message:')!,
+				description: `-message:<message> ${GlyphChars.Dash} excludes commits whose message contains the term`,
+				alwaysShow: true,
+				item: { type: 'add', operator: '-message:' },
+			},
+			{
 				label: searchOperatorToTitleMap.get('author:')!,
 				description: 'author:<author> or @:<author>',
 				buttons: [UseAuthorPickerQuickInputButton],
 				alwaysShow: true,
 				item: { type: 'add', operator: 'author:' },
+			},
+			{
+				label: searchOperatorToTitleMap.get('committer:')!,
+				description: 'committer:<committer>',
+				alwaysShow: true,
+				item: { type: 'add', operator: 'committer:' },
 			},
 			{
 				label: searchOperatorToTitleMap.get('commit:')!,
@@ -392,7 +419,7 @@ export class SearchGitCommand extends QuickCommand<State> {
 			);
 		}
 
-		const aiAllowed = this.container.ai.enabled && this.container.ai.allowed;
+		const aiAllowed = this.container.ai.allowed;
 
 		const matchCaseButton = createMatchCaseToggle(state.matchCase);
 		const matchAllButton = createMatchAllToggle(state.matchAll);

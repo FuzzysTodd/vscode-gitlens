@@ -1,16 +1,23 @@
+import type { ColumnMode } from '@gitkraken/commit-graph/view.js';
 import type { AIProviderAndModel, AIProviders } from '@gitlens/ai/constants.js';
+import type { GitHealthSlowness, GitHealthSlownessSample } from '@gitlens/git/gitHealth.js';
 import type { GitRevisionRangeNotation } from '@gitlens/git/models/revision.js';
+import type {
+	IntegrationIds,
+	StoredConfiguredIntegrationDescriptor,
+	StoredIntegrationConfigurations,
+} from '@gitlens/integrations/constants.js';
+import type { IntegrationConnectedKey } from '@gitlens/integrations/models/integration.js';
 import type { GraphBranchesVisibility, ViewShowBranchComparison } from './config.js';
-import type { IntegrationIds } from './constants.integrations.js';
 import type { SubscriptionState } from './constants.subscription.js';
 import type { TrackedUsage, TrackedUsageKeys } from './constants.telemetry.js';
 import type { GroupableTreeViewTypes, TreeViewTypes } from './constants.views.js';
 import type { Environment } from './container.js';
+import type { FeatureFlagMap } from './featureFlags/featureFlagService.js';
 import type { FeaturePreviews } from './features.js';
 import type { OnboardingStorage } from './onboarding/models/onboarding.js';
 import type { OrganizationSettings } from './plus/gk/models/organization.js';
 import type { PaidSubscriptionPlanIds, Subscription } from './plus/gk/models/subscription.js';
-import type { IntegrationConnectedKey } from './plus/integrations/models/integration.js';
 import type { DeepLinkServiceState } from './uris/deepLinks/deepLink.js';
 import type {
 	GraphDisplayMode,
@@ -34,12 +41,17 @@ export type IntegrationAuthenticationKeys =
 export const enum SyncedStorageKeys {
 	Version = 'gitlens:synced:version',
 	PreReleaseVersion = 'gitlens:synced:preVersion',
+	ApprovedAvatarRemoteTemplates = 'gitlens:avatars:approvedRemoteTemplates',
 }
 
 export type DeprecatedGlobalStorage = {
 	/** @deprecated */
+	'confirm:ai:generateCommits': boolean;
+	/** @deprecated */
 	'confirm:ai:generateRebase': boolean;
-	/** @deprecated use `confirm:ai:tos` */
+	/** @deprecated */
+	'confirm:ai:tos': boolean;
+	/** @deprecated */
 	'confirm:sendToOpenAI': boolean;
 	/** @deprecated */
 	'home:actions:completed': ('dismissed:welcome' | 'opened:scm')[];
@@ -79,7 +91,7 @@ export type DeprecatedGlobalStorage = {
 	/** @deprecated */
 	[key in `disallow:connection:${string}`]: any;
 } & {
-	/** @deprecated use `confirm:ai:tos` */
+	/** @deprecated */
 	[key in `confirm:ai:tos:${AIProviders}`]: boolean;
 };
 
@@ -87,10 +99,12 @@ interface GlobalStorageCore {
 	avatars: [string, StoredAvatar][];
 	'ai:scope:compose:model': AIProviderAndModel;
 	'ai:scope:review:model': AIProviderAndModel;
-	'confirm:ai:generateCommits': boolean;
-	'confirm:ai:tos': boolean;
+	'ai:scope:resolve:model': AIProviderAndModel;
+	'avatars:approvedRemoteTemplates': Record<string, 'allow' | 'deny'>;
 	repoVisibility: [string, StoredRepoVisibilityInfo][];
 	pendingWhatsNewOnFocus: boolean;
+	/** Ids of one-time settings migrations already applied (see `migrateSettings`). */
+	'settings:migrated': string[];
 	// Don't change this key name ('premium`) as its the stored subscription
 	'premium:subscription': Stored<Subscription & { lastValidatedAt: number | undefined }>;
 	'synced:version': string;
@@ -108,13 +122,20 @@ interface GlobalStorageCore {
 	'launchpad:indicator:hasInteracted': string;
 	'launchpadView:groups:expanded': StoredLaunchpadGroup[];
 	'graph:searchMode': StoredGraphSearchMode;
+	/** A/B (intro-video): the variant the most recently RENDERED sign-in gate actually showed */
+	'graph:signInGate:introVideoShown': boolean;
 	'graph:useNaturalLanguageSearch': boolean;
+	'views:pendingLegacyHide': boolean;
 	'integrations:configured': StoredIntegrationConfigurations;
 	/** Unified onboarding/dismissible UI state */
 	'onboarding:state': OnboardingStorage;
+	'featureFlags:flags': FeatureFlagMap;
+	/** Whether a feature-flag fetch has ever completed (even unsuccessfully) — see `hasEverFetched` */
+	'featureFlags:fetched': boolean;
 }
 
 type GlobalStorageDynamic = Record<`plus:preview:${FeaturePreviews}:usages`, StoredFeaturePreviewUsagePeriod[]> &
+	Record<`plus:trialReset:${string}:attempted`, boolean> &
 	Record<
 		`plus:organization:${string}:settings`,
 		Stored<(OrganizationSettings & { lastValidatedAt: number }) | undefined>
@@ -122,7 +143,6 @@ type GlobalStorageDynamic = Record<`plus:preview:${FeaturePreviews}:usages`, Sto
 	Record<`provider:authentication:skip:${string}`, boolean> &
 	Record<`gk:promo:${string}:ai:allAccess:dismissed`, boolean> &
 	Record<`gk:promo:${string}:ai:allAccess:notified`, boolean> &
-	Record<`gk:${string}:checkin`, Stored<StoredGKCheckInResponse>> &
 	Record<`gk:${string}:organizations`, Stored<StoredOrganization[]>> &
 	Record<`jira:${string}:organizations`, Stored<StoredJiraOrganization[] | undefined>> &
 	Record<`jira:${string}:projects`, Stored<StoredJiraProject[] | undefined>> &
@@ -152,18 +172,10 @@ export interface StoredGkCLIInstallInfo {
 	version?: string;
 }
 
-export type StoredIntegrationConfigurations = Record<
-	IntegrationIds,
-	StoredConfiguredIntegrationDescriptor[] | undefined
->;
-
-export interface StoredConfiguredIntegrationDescriptor {
-	cloud: boolean;
-	integrationId: IntegrationIds;
-	domain?: string;
-	expiresAt?: string;
-	scopes: string;
-}
+// Re-export the canonical stored-configuration types (imported above) rather than redefining them here,
+// so the multi-account descriptor shape (id/primary/type/accountName) can't drift between the extension's
+// storage typing and the integrations package that owns it.
+export type { StoredConfiguredIntegrationDescriptor, StoredIntegrationConfigurations };
 
 export interface StoredProductConfig {
 	promos: StoredPromo[];
@@ -181,22 +193,40 @@ export interface StoredPromo {
 }
 
 export type DeprecatedWorkspaceStorage = {
-	/** @deprecated use `confirm:ai:tos` */
+	/** @deprecated */
+	'confirm:ai:tos': boolean;
+	/** @deprecated */
 	'confirm:sendToOpenAI': boolean;
 	/** @deprecated */
 	'graph:banners:dismissed': Record<string, boolean>;
 	/** @deprecated */
 	'views:searchAndCompare:keepResults': boolean;
+	/** @deprecated Superseded by v2; its data included remote/interactive command time. */
+	'gitHealth:slowness': Record<string, GitHealthSlownessSample>;
+	/** @deprecated Superseded by v3; aggregate data cannot be safely assigned to an operation family. */
+	'gitHealth:slowness:v2': Record<string, GitHealthSlownessSample>;
 } & {
-	/** @deprecated use `confirm:ai:tos` */
+	/** @deprecated */
 	[key in `confirm:ai:tos:${AIProviders}`]: boolean;
 };
+
+/** Persisted passive-slowness summary for a repo. */
+export type StoredGitHealthSlowness = GitHealthSlowness;
+
+/** Per-repo Git Health banner suppression timestamps. */
+export type StoredGitHealthBannerSuppression = { dismissedAt?: number; visitedAt?: number };
 
 interface WorkspaceStorageCore {
 	assumeRepositoriesOnStartup?: boolean;
 	'branch:comparisons': StoredBranchComparisons;
-	'confirm:ai:tos': boolean;
 	'gitComandPalette:usage': StoredRecentUsage;
+	/** Per-repo sticky state for switch's "In a New Worktree" toggle. Key is the repo id. */
+	'gitComandPalette:switch:viaWorktree': Record<string, boolean>;
+	'gitComandPalette:worktreeDelete:actions': StoredWorktreeDeleteActions;
+	/** Per-repo Git Health banner suppression — when the user dismissed the strip and last visited the health view. */
+	'gitHealth:banner:v1': Record<string, StoredGitHealthBannerSuppression>;
+	/** Operation-classified local git-slowness summary per repo path (feeds targeted Git Health guidance). */
+	'gitHealth:slowness:v3': Record<string, StoredGitHealthSlowness>;
 	gitPath: string;
 	'graph:columns': Record<string, StoredGraphColumn>;
 	'graph:filtersByRepo': Record<string, StoredGraphFilters>;
@@ -213,6 +243,9 @@ interface WorkspaceStorageCore {
 	'views:repositories:autoRefresh': boolean;
 	'views:searchAndCompare:pinned': StoredSearchAndCompareItems;
 	'views:scm:grouped:selected': GroupableTreeViewTypes;
+	/** MRU of "Run Task on Worktree" picks. Key is the worktree's fsPath; values are task keys
+	 *  (`${task.source}:${task.name}`), newest first. */
+	'worktrees:runTaskHistory': Record<string, string[]>;
 }
 
 /**
@@ -225,7 +258,20 @@ export type RepositoryFilterValue = 'all' | 'exclude-worktrees' | string[] | und
 
 type WorkspaceStorageDynamic = Record<IntegrationConnectedKey, boolean> &
 	Record<`views:${TreeViewTypes}:repositoryFilter`, RepositoryFilterValue> &
-	Record<`graph:searchHistory:${string}`, StoredGraphSearchHistory[]>;
+	Record<`graph:searchHistory:${string}`, StoredGraphSearchHistory[]> &
+	/** Rollback record for a completed automatic rebase. Key suffix is the repo path. */
+	Record<`autoRebase:undo:${string}`, Stored<StoredAutoRebaseUndo>>;
+
+export interface StoredAutoRebaseUndo {
+	/** The branch that was rebased */
+	branch: string | undefined;
+	/** The branch tip before the rebase (orig-head) */
+	preRebaseSha: string;
+	/** The branch tip when the automatic rebase completed — undo refuses if the branch has moved since */
+	postRebaseSha: string;
+	/** What happened to the autostash at the end of the run */
+	autostash: 'none' | 'reapplied' | 'left-in-stash';
+}
 
 export type WorkspaceStorage = WorkspaceStorageCore & WorkspaceStorageDynamic;
 
@@ -234,59 +280,6 @@ export interface Stored<T, SchemaVersion extends number = 1> {
 	data: T;
 	timestamp?: number;
 }
-
-export type StoredGKLicenses = Partial<Record<StoredGKLicenseType, StoredGKLicense>>;
-
-export interface StoredGKCheckInResponse {
-	user: StoredGKUser;
-	licenses: {
-		paidLicenses: StoredGKLicenses;
-		effectiveLicenses: StoredGKLicenses;
-	};
-}
-
-export interface StoredGKUser {
-	id: string;
-	name: string;
-	email: string;
-	status: 'activated' | 'pending';
-	createdDate: string;
-	firstGitLensCheckIn?: string;
-}
-
-export interface StoredGKLicense {
-	latestStatus: 'active' | 'canceled' | 'cancelled' | 'expired' | 'in_trial' | 'non_renewing' | 'trial';
-	latestStartDate: string;
-	latestEndDate: string;
-	organizationId: string | undefined;
-	reactivationCount?: number;
-}
-
-export type StoredGKLicenseType =
-	| 'gitlens-pro'
-	| 'gitlens-advanced'
-	| 'gitlens-teams'
-	| 'gitlens-hosted-enterprise'
-	| 'gitlens-self-hosted-enterprise'
-	| 'gitlens-standalone-enterprise'
-	| 'bundle-pro'
-	| 'bundle-advanced'
-	| 'bundle-teams'
-	| 'bundle-hosted-enterprise'
-	| 'bundle-self-hosted-enterprise'
-	| 'bundle-standalone-enterprise'
-	| 'gitkraken_v1-pro'
-	| 'gitkraken_v1-advanced'
-	| 'gitkraken_v1-teams'
-	| 'gitkraken_v1-hosted-enterprise'
-	| 'gitkraken_v1-self-hosted-enterprise'
-	| 'gitkraken_v1-standalone-enterprise'
-	| 'gitkraken-v1-pro'
-	| 'gitkraken-v1-advanced'
-	| 'gitkraken-v1-teams'
-	| 'gitkraken-v1-hosted-enterprise'
-	| 'gitkraken-v1-self-hosted-enterprise'
-	| 'gitkraken-v1-standalone-enterprise';
 
 export interface StoredOrganization {
 	id: string;
@@ -385,10 +378,24 @@ export interface StoredDeepLinkContext {
 	worktreePath?: string | undefined;
 }
 
+/** The column-mode vocabulary AS PERSISTED. Deliberately re-declared rather than imported from the
+ *  engine: stored settings are a contract with data already on disk, so an engine-side change must
+ *  surface as a compile error at {@link storedGraphColumnModeBridge} and be answered with a migration
+ *  decision — not silently redefine what existing values mean. */
+export type StoredGraphColumnMode = 'numbers' | 'squares' | 'bar' | 'bipolar' | 'compact';
+
+/** Fails to compile if the persisted vocabulary and the engine's {@link ColumnMode} diverge in EITHER
+ *  direction (a mode added, removed, or renamed). Resolve by migrating stored values, then updating
+ *  {@link StoredGraphColumnMode} to match. */
+type ExactlyEqual<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+export const storedGraphColumnModeBridge: ExactlyEqual<StoredGraphColumnMode, ColumnMode> = true;
+
 export interface StoredGraphColumn {
 	isHidden?: boolean;
-	mode?: string;
+	mode?: StoredGraphColumnMode;
 	width?: number;
+	/** Column↔grouped placement for both columns: `undefined`/`true` = grouped with the default host zone (host Group commands write `true`; the webview echoes back the resolved zone id), a zone-id string = grouped with that zone, `false` = standalone column. */
+	grouped?: boolean | string;
 }
 
 export interface StoredGraphState {
@@ -410,6 +417,8 @@ export interface StoredGraphState {
 			activePanel?: GraphSidebarPanel;
 			/** How the sidebar's filter input presents non-matches: `true` hides them (filter), `false` dims them (highlight). */
 			searchBoxFilter?: boolean;
+			/** Whether the agents panel shows past (ended) sessions. Defaults to false (hidden). */
+			showPastAgentSessions?: boolean;
 		};
 		minimap?: {
 			visible?: boolean;
@@ -472,6 +481,8 @@ export interface StoredGraphExcludedRef {
 	type: StoredGraphRefType;
 	name: string;
 	owner?: string;
+	/** For a whole-remote wildcard (`name: '*'`) only — ids of branches exempted from the hide. */
+	except?: string[];
 }
 
 export interface StoredGraphIncludeOnlyRef {
@@ -533,6 +544,7 @@ export type StoredSearchAndCompareItem = StoredComparison | StoredSearch;
 export type StoredSearchAndCompareItems = Record<string, StoredSearchAndCompareItem>;
 export type StoredStarred = Record<string, boolean>;
 export type StoredRecentUsage = Record<string, number>;
+export type StoredWorktreeDeleteActions = { branch: boolean; upstream: boolean };
 
 export type StoredLaunchpadGroup =
 	| 'current-branch'

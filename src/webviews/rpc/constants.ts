@@ -5,14 +5,15 @@
  * host and webview bundles.
  */
 
-/** Namespace for Supertalk RPC messages to distinguish from existing IPC */
-// eslint-disable-next-line @typescript-eslint/naming-convention
+/** Namespace for Supertalk RPC messages on the shared postMessage pipe */
 export const RPC_NAMESPACE = '__supertalk_rpc__';
 
 /** Wrapper for Supertalk messages sent over VS Code webview channel */
 export interface RpcMessageWrapper {
 	[RPC_NAMESPACE]: true;
 	payload: unknown;
+	/** Compression applied to `payload`, if any. Absent means the payload is uncompressed. */
+	compressed?: 'deflate-raw';
 }
 
 /** Type guard to check if a message is a Supertalk RPC message */
@@ -23,6 +24,11 @@ export function isRpcMessage(message: unknown): message is RpcMessageWrapper {
 		RPC_NAMESPACE in message &&
 		(message as RpcMessageWrapper)[RPC_NAMESPACE] === true
 	);
+}
+
+/** Type guard for a binary RPC payload as delivered by VS Code's message channel */
+export function isBinaryRpcPayload(payload: unknown): payload is Uint8Array | ArrayBuffer {
+	return payload instanceof Uint8Array || payload instanceof ArrayBuffer;
 }
 
 // Cached encoder/decoder instances for binary payload encoding
@@ -48,4 +54,18 @@ export function encodeRpcPayload(message: unknown): Uint8Array {
  */
 export function decodeRpcPayload(data: Uint8Array | ArrayBuffer): unknown {
 	return JSON.parse(textDecoder.decode(data));
+}
+
+/** Minimum encoded payload size (bytes) worth compressing — carried over from the legacy IPC stack's threshold. */
+export const rpcCompressionMinBytes = 1024;
+
+/**
+ * Inflates a raw-DEFLATE compressed payload and parses it — the counterpart to the host's `deflateRaw`.
+ * Uses the native `DecompressionStream`, available in both Chromium webviews and Node >= 18, so it is
+ * bundle-safe on both sides.
+ */
+export async function inflateRpcPayload(data: Uint8Array | ArrayBuffer): Promise<unknown> {
+	// `body` is only null for a Response with no body (e.g. a 204/205); `data` always provides one.
+	const stream = new Response(data).body!.pipeThrough(new DecompressionStream('deflate-raw'));
+	return JSON.parse(await new Response(stream).text());
 }

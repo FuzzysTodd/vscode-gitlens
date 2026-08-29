@@ -21,7 +21,7 @@ export function getExtensionModeLabel(mode: ExtensionMode): string {
 		case ExtensionMode.Test:
 			return 'test';
 		default:
-			// eslint-disable-next-line @typescript-eslint/restrict-template-expressions
+			// oxlint-disable-next-line typescript/restrict-template-expressions
 			return `unknown (${mode})`;
 	}
 }
@@ -63,6 +63,20 @@ export async function getHostAppName(): Promise<string | undefined> {
 	}
 
 	return _hostAppName ?? undefined;
+}
+
+/** Maps a host app name to the CLI's MCP-install provider slug (e.g. `code` -> `vscode`). */
+export function toMcpInstallProvider<T extends string | undefined>(appHostName: T): T {
+	switch (appHostName) {
+		case 'code':
+			return 'vscode' as T;
+		case 'code-insiders':
+			return 'vscode-insiders' as T;
+		case 'code-exploration':
+			return 'vscode-exploration' as T;
+		default:
+			return appHostName;
+	}
 }
 
 let _hostExecutablePath: string | undefined;

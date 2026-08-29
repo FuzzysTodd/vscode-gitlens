@@ -470,6 +470,7 @@ export async function openChanges(
 		const commit = await getCommitForFile(commitOrRefs, file);
 		void executeCommand<DiffWithPreviousCommandArgs>('gitlens.diffWithPrevious:command', {
 			commit: commit,
+			range: null,
 			showOptions: options,
 		});
 
@@ -570,6 +571,7 @@ export async function openChangesWithWorking(
 
 	void (await executeEditorCommand<DiffWithWorkingCommandArgs>('gitlens.diffWithWorking:command', undefined, {
 		uri: GitUri.fromFile(file, ref.repoPath, ref.ref),
+		range: null,
 		showOptions: options,
 		lhsTitle: options?.lhsTitle,
 	}));
@@ -1055,7 +1057,10 @@ export async function undoCommit(
 
 	await svc.ops.reset('HEAD~1', { mode: 'soft' });
 
-	const scmRepo = await svc.getScmRepository();
+	// Open the repo in the SCM if it isn't already, so the undone commit's message is restored to this
+	// repo's input box rather than an ancestor's (which would overwrite whatever is typed there) --
+	// worktrees nested inside another repo are never registered on their own
+	const scmRepo = await svc.getOrOpenScmRepository();
 	if (scmRepo != null && message) {
 		scmRepo.inputBox.value = message;
 	}

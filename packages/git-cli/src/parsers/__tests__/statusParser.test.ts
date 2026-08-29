@@ -1,5 +1,6 @@
 import * as assert from 'assert';
 import { GitFileConflictStatus, GitFileIndexStatus, GitFileWorkingTreeStatus } from '@gitlens/git/models/fileStatus.js';
+import { formatDetachedHeadName } from '@gitlens/git/utils/branch.utils.js';
 import type { Uri } from '@gitlens/utils/uri.js';
 import { parseGitStatus } from '../statusParser.js';
 
@@ -143,6 +144,22 @@ suite('Status Parser Test Suite', () => {
 		assert.strictEqual(result.files[0].indexStatus, GitFileIndexStatus.Renamed, 'Should be renamed');
 	});
 
+	test('V1: parses staged content change with a working-tree type change (MT)', () => {
+		const data = ['## main', 'MT typechanged.ts'].join('\n');
+
+		const result = parseGitStatus(data, repoPath, 1, getUri);
+
+		assert.ok(result, 'Should return a status');
+		assert.strictEqual(result.files.length, 1, 'Should have 1 file');
+		assert.strictEqual(result.files[0].path, 'typechanged.ts', 'Should have correct path');
+		assert.strictEqual(result.files[0].indexStatus, GitFileIndexStatus.Modified, 'Should be index modified');
+		assert.strictEqual(
+			result.files[0].workingTreeStatus,
+			GitFileWorkingTreeStatus.TypeChanged,
+			'Should be working tree type changed',
+		);
+	});
+
 	test('V1: parses deleted file', () => {
 		const data = ['## main', ' D removed.ts'].join('\n');
 
@@ -178,6 +195,23 @@ suite('Status Parser Test Suite', () => {
 		assert.strictEqual(result.upstream?.state.ahead, 2, 'Should parse ahead count');
 		assert.strictEqual(result.upstream?.state.behind, 1, 'Should parse behind count');
 		assert.strictEqual(result.upstream?.missing, false, 'Should not be missing when branch.ab is present');
+	});
+
+	test('V2: detached HEAD — branch.head is the literal `(detached)` token', () => {
+		// Git prints `# branch.head (detached)` for ANY non-branch HEAD (plain detached, rebase,
+		// bisect). `GitStatus` must classify it as detached and swap in the synthesized `(sha…)`
+		// label — regression guard for the `isDetachedHead` narrowing that dropped this token.
+		const data = ['# branch.oid abc1234def5678', '# branch.head (detached)'].join('\n');
+
+		const result = parseGitStatus(data, repoPath, 2, getUri);
+
+		assert.ok(result, 'Should return a status');
+		assert.strictEqual(result.detached, true, 'Should be detached');
+		assert.strictEqual(
+			result.branch,
+			formatDetachedHeadName('abc1234def5678'),
+			'Should synthesize the detached label from the SHA',
+		);
 	});
 
 	test('V2: missing upstream when no branch.ab header', () => {

@@ -4,12 +4,15 @@ import { checkboxBaseStyles } from '../checkbox/checkbox.css.js';
 import { GlElement } from '../element.js';
 import type { RadioGroup } from './radio-group.js';
 import { radioStyles } from './radio.css.js';
-
 import '../code-icon.js';
 
-export const tagName = 'gl-radio';
+declare global {
+	interface HTMLElementTagNameMap {
+		['gl-radio']: Radio;
+	}
+}
 
-@customElement(tagName)
+@customElement('gl-radio')
 export class Radio extends GlElement {
 	static override shadowRootOptions: ShadowRootInit = {
 		...GlElement.shadowRootOptions,
@@ -51,17 +54,21 @@ export class Radio extends GlElement {
 		return html`<code-icon icon="circle-filled"></code-icon>`;
 	}
 
+	private handleLabelSlotChange(e: Event) {
+		const slot = e.target as HTMLSlotElement;
+		const hasVisibleLabel = slot.assignedNodes({ flatten: true }).some(node => {
+			if (node.nodeType === Node.TEXT_NODE) return Boolean(node.textContent?.trim());
+
+			return node instanceof HTMLElement && !node.classList.contains('sr-only');
+		});
+		this.toggleAttribute('sr-only-label', !hasVisibleLabel);
+	}
+
 	override render(): unknown {
 		return html`<label ?aria-disabled=${this.disabled}
 			><button class="input" .disabled=${this.disabled} @click=${this.handleClick}></button>
 			<div class="control">${this.renderCircle()}</div>
-			<slot class="label-text"></slot>
+			<slot class="label-text" @slotchange=${this.handleLabelSlotChange}></slot>
 		</label>`;
-	}
-}
-
-declare global {
-	interface HTMLElementTagNameMap {
-		[tagName]: Radio;
 	}
 }

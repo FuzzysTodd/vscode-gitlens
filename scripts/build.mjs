@@ -26,11 +26,14 @@ const env = {
 	NODE_FORCE_COLORS: '1',
 	FORCE_COLOR: '1',
 };
+delete env.NO_COLOR;
 
 // Build webpack command
 let cmd = `webpack`;
 if (watch) {
 	cmd += ' --watch';
+} else {
+	cmd += ' --fail-on-warnings';
 }
 cmd += ` --mode ${mode}`;
 if (build?.length || webviews?.length) {
@@ -92,13 +95,13 @@ if (build?.includes('unit-tests')) {
 	console.log(`Running: ${buildPkgsCmd}`);
 
 	const pkgsCode = await new Promise(resolve => {
-		const pkgs = spawn(buildPkgsCmd, [], {
+		const pkgs = spawn(buildPkgsCmd, {
 			shell: true,
 			stdio: 'inherit',
 			env: env,
 		});
 
-		pkgs.on('exit', code => resolve(code || 0));
+		pkgs.on('exit', (code, signal) => resolve(exitCode(code, signal)));
 	});
 
 	if (pkgsCode !== 0) {
@@ -111,34 +114,40 @@ if (build?.includes('unit-tests')) {
 const isFullBuild = !build?.length && !target?.length && !webviews?.length;
 
 if (!quick && !watch) {
-	const prettyCmd = process.env.CI ? `pnpm run pretty:check` : `pnpm run pretty`;
-	console.log(`Running: ${prettyCmd}`);
+	const fmtCmd = process.env.CI ? `pnpm run fmt:check` : `pnpm run fmt`;
+	console.log(`Running: ${fmtCmd}`);
 
-	const prettyCode = await new Promise(resolve => {
-		const pretty = spawn(prettyCmd, [], {
+	const formatCode = await new Promise(resolve => {
+		const fmt = spawn(fmtCmd, {
 			shell: true,
 			stdio: 'inherit',
-			env: {
-				...process.env,
-				NODE_FORCE_COLORS: '1',
-				FORCE_COLOR: '1',
-			},
+			env: env,
 		});
 
-		pretty.on('exit', code => resolve(code || 0));
+		fmt.on('exit', (code, signal) => resolve(exitCode(code, signal)));
 	});
 
-	if (prettyCode !== 0) {
-		process.exit(prettyCode);
+	if (formatCode !== 0) {
+		process.exit(formatCode);
 	}
+}
+
+/**
+ * A child killed by a signal exits with a null code — scoring that as 0 would report a build that
+ * was OOM-killed or interrupted as a success.
+ * @param {number | null} code @param {NodeJS.Signals | null} signal @returns {number}
+ */
+function exitCode(code, signal) {
+	if (code != null) return code;
+	return signal != null ? 1 : 0;
 }
 
 /** @param {string} command @returns {Promise<number>} exit code (always resolves; never rejects) */
 function run(command) {
 	console.log(`Running: ${command}`);
-	const child = spawn(command, [], { shell: true, stdio: 'inherit', env: env });
+	const child = spawn(command, { shell: true, stdio: 'inherit', env: env });
 	return new Promise(resolve => {
-		child.on('exit', code => resolve(code || 0));
+		child.on('exit', (code, signal) => resolve(exitCode(code, signal)));
 		// Spawn failures emit 'error' without 'exit' — resolve as failure so the batch never hangs.
 		child.on('error', () => resolve(1));
 	});
@@ -151,7 +160,7 @@ function run(command) {
 // builds keep the single-process path.
 let bundleCmds;
 if (isFullBuild && !watch) {
-	let baseCmd = `webpack --mode ${mode}`;
+	let baseCmd = `webpack --mode ${mode} --fail-on-warnings`;
 	if (quick) {
 		baseCmd += ` --env quick`;
 	}
@@ -175,11 +184,12 @@ if (isFullBuild && !watch) {
 
 // Run the bundle process(es) and, for one-shot builds, a single whole-project oxlint (lint +
 // type-check) pass concurrently. tsgo-backed type checking and Rust-native linting both run inside
-// oxlint, so it replaces the old ForkTsChecker + ESLint plugins. Watch builds lint incrementally via
+// oxlint, so a single pass covers both. Watch builds lint incrementally via
 // the inline OxLintWebpackPlugin (added whenever not in quick mode), so they skip this standalone pass.
 const tasks = bundleCmds.map(c => run(c));
 if (!quick && !watch) {
-	tasks.push(run(`oxlint --type-aware --type-check`));
+	tasks.push(run(`oxlint --type-aware --type-check --deny-warnings`));
+	tasks.push(run(`node ./scripts/check-deps.mjs`));
 }
 
 // allSettled (not all) so a failure in one process never abandons the others mid-flight — every

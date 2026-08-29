@@ -1,28 +1,39 @@
-import { consume } from '@lit/context';
 import { SignalWatcher } from '@lit-labs/signals';
+import { consume } from '@lit/context';
 import type { PropertyValues } from 'lit';
 import { css, html, LitElement, nothing } from 'lit';
-import { customElement } from 'lit/decorators.js';
+import { customElement, property } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
+import { basename } from '@gitlens/utils/path.js';
 import type { AgentSessionState } from '../../../../../agents/models/agentSessionState.js';
+import type { WebviewTelemetryEvents } from '../../../../../constants.telemetry.js';
 import { createCommandLink } from '../../../../../system/commands.js';
 import type { AgentSessionCategory, StickyDetailResolver } from '../../../shared/agentUtils.js';
 import {
 	agentPhaseToCategory,
+	canResolvePermission,
+	createAgentSessionArchiveHref,
+	createAgentSessionOpenHref,
 	createStickyDetailResolver,
 	describeAgentSession,
+	filterAgentSessionsForFamily,
 	formatAgentElapsed,
 	fpField,
 	getAgentPhaseLabel,
+	getAgentSessionOpenAction,
+	isAgentSessionCurrentInFamily,
 	permissionFingerprint,
 	sortAgentSessions,
 } from '../../../shared/agentUtils.js';
 import { scrollableBase } from '../../../shared/components/styles/lit/base.css.js';
+import { emitTelemetrySentEvent } from '../../../shared/telemetry.js';
 import { graphStateContext } from '../context.js';
+import './gl-graph-coachmark.js';
 import '../../../shared/components/badges/badge.js';
 import '../../../shared/components/button.js';
 import '../../../shared/components/code-icon.js';
-import '../../../shared/components/hooks-banner.js';
+import '../../../shared/components/skeleton-loader.js';
+import '../../../shared/components/agents-banner.js';
 import '../../../shared/components/overlays/tooltip.js';
 
 declare global {
@@ -71,12 +82,31 @@ const columns: readonly KanbanColumnDef[] = [
 	{ id: 'inactive', label: 'Inactive' },
 ];
 
+/** The cards' `data-telemetry-action` attributes that report `graph/kanban/sessionAction`, mapped to
+ *  their telemetry names through the events map (same table style as the sidebar's
+ *  `graphSidebarActionTelemetry`) so the DOM attributes and the metric can't drift. Permission actions
+ *  are deliberately absent — their event carries a different payload. */
+type SessionActionTelemetryAttribute = 'open-session' | 'resume-session' | 'open-plan';
+
+const sessionActionTelemetryNames: Record<
+	SessionActionTelemetryAttribute,
+	WebviewTelemetryEvents['graph/kanban/sessionAction']['action']
+> = {
+	'open-session': 'openSession',
+	'resume-session': 'resumeSession',
+	'open-plan': 'openPlanFile',
+};
+
 function columnIdForSession(session: AgentSessionState): KanbanColumnId {
+	// Terminal sessions are done — group them with the abandoned/idle-too-long Inactive column
+	// rather than surfacing them as live Idle work.
+	if (session.phase === 'ended') return 'inactive';
+
 	if (session.phase === 'waiting' || session.pendingPermission != null) return 'needs-input';
 
 	if (session.phase === 'working') return 'working';
 
-	const last = session.lastActivity.getTime();
+	const last = session.lastActivity;
 	if (Number.isFinite(last) && Date.now() - last > inactiveThresholdMs) return 'inactive';
 
 	return 'idle';
@@ -100,65 +130,66 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 				width: 100%;
 				height: 100%;
 				min-height: 0;
-				background-color: var(--vscode-editor-background);
 				color: var(--vscode-foreground);
+				background-color: var(--vscode-editor-background);
 				--gl-kanban-card-bg: var(--vscode-sideBar-background, var(--vscode-editor-background));
 				--gl-kanban-card-border: var(--vscode-panel-border, transparent);
 				--gl-kanban-column-gap: 1.2rem;
-				--gl-kanban-card-radius: 0.4rem;
+				--gl-kanban-card-radius: var(--gl-radius-sm);
 			}
 
 			/* Section is a flex column so the header stays auto-sized at the top and the body
-			   gets the remaining height (via flex: 1 / min-height: 0). Without this, <section>'s
-			   default block layout produces a content-sized body that never overflows — both the
-			   horizontal column scroll and the per-column vertical scroll silently disappear. */
+	   gets the remaining height (via flex: 1 / min-height: 0). Without this, <section>'s
+	   default block layout produces a content-sized body that never overflows — both the
+	   horizontal column scroll and the per-column vertical scroll silently disappear. */
 			section {
 				display: flex;
-				flex-direction: column;
 				flex: 1 1 auto;
-				min-height: 0;
+				flex-direction: column;
 				width: 100%;
+				min-height: 0;
 			}
 
 			.header {
 				display: flex;
-				align-items: center;
-				gap: 0.8rem;
-				/* 0.6rem right so the close button sits at a tight inset matching the visualizations
-				 * toolbar; left stays at 1.2rem for the title's breathing room. min-height + tight
-				 * vertical padding matches the Treemap/Visual History toolbar height (3.2rem). */
-				padding: 0.4rem 0.6rem 0.4rem 1.2rem;
-				min-height: 3.2rem;
-				border-bottom: 1px solid var(--vscode-panel-border, transparent);
 				flex: none;
+				gap: var(--gl-space-8);
+				align-items: center;
+				min-height: 3.2rem;
+
+				/* 0.6rem right so the close button sits at a tight inset matching the visualizations
+		 * toolbar; left stays at 1.2rem for the title's breathing room. min-height + tight
+		 * vertical padding matches the Treemap/Visual History toolbar height (3.2rem). */
+				padding: var(--gl-space-4) var(--gl-space-6) var(--gl-space-4) var(--gl-space-12);
+				border-bottom: var(--gl-border-width) solid var(--vscode-panel-border, transparent);
 			}
 
 			.header__title {
 				display: flex;
+				gap: var(--gl-space-8);
 				align-items: baseline;
-				gap: 0.8rem;
-				font-size: 1.3rem;
+				font-size: var(--gl-font-base);
 				font-weight: 600;
 			}
 
 			.header__title h2 {
-				font: inherit;
-				margin: 0;
 				padding: 0;
-				font-size: 1.1rem;
+				margin: 0;
+				font: inherit;
+				font-size: var(--gl-font-sm);
 				font-weight: 600;
 				text-transform: uppercase;
 				white-space: nowrap;
 			}
 
 			.header__count {
-				font-size: 1.1rem;
+				font-size: var(--gl-font-sm);
 				color: var(--color-foreground--65);
 			}
 
 			/* Experimental stamp uses the shared gl-badge with appearance=experimental. Sits inside
-			   .header__title, between the title h2 and the session count, signalling that the whole
-			   view (not just one control) is experimental. */
+	   .header__title, between the title h2 and the session count, signalling that the whole
+	   view (not just one control) is experimental. */
 			.header__experimental gl-badge {
 				--gl-badge-font-size: 0.95rem;
 			}
@@ -167,26 +198,26 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 				margin-left: auto;
 			}
 
-			.hooks-banner {
+			.agents-banner {
 				/* No bottom margin — .body below has its own 1.2rem padding-top, so an extra
-				 * margin-bottom here would double up to 2.4rem of visual gap. */
+		 * margin-bottom here would double up to 2.4rem of visual gap. */
 				display: block;
-				margin: 1.2rem 1.2rem 0;
+				margin: var(--gl-space-12) var(--gl-space-12) 0;
 			}
 
 			.body {
-				flex: 1 1 auto;
 				display: grid;
-				grid-auto-flow: column;
+				flex: 1 1 auto;
 				grid-auto-columns: minmax(24rem, 1fr);
+				grid-auto-flow: column;
 				gap: var(--gl-kanban-column-gap);
-				padding: 1.2rem;
 				min-height: 0;
-				overflow-x: auto;
-				overflow-y: hidden;
+				padding: var(--gl-space-12);
+				overflow: auto hidden;
+
 				/* Hint to the browser to GPU-composite the scrolling layer. Without this, horizontal
-				   scroll of the kanban body forces a full document repaint per frame; with it the
-				   browser can scroll the existing layer's painted bitmap. */
+		   scroll of the kanban body forces a full document repaint per frame; with it the
+		   browser can scroll the existing layer's painted bitmap. */
 				will-change: scroll-position;
 			}
 
@@ -194,134 +225,150 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 				display: flex;
 				flex-direction: column;
 				min-height: 0;
-				background-color: color-mix(in srgb, var(--vscode-editor-background) 92%, transparent);
-				border: 1px solid var(--gl-kanban-card-border);
-				border-radius: var(--gl-kanban-card-radius);
-				overflow: hidden;
+
 				/* Paint isolation: confine column-internal repaints (card hover/scroll) so the
-				   browser doesn't re-layout the whole kanban body when one column scrolls or a
-				   card hover-state changes. contain:content enables layout, paint, and style
-				   containment but keeps the column's intrinsic size correct (no size). */
+		   browser doesn't re-layout the whole kanban body when one column scrolls or a
+		   card hover-state changes. contain:content enables layout, paint, and style
+		   containment but keeps the column's intrinsic size correct (no size). */
 				contain: content;
+				overflow: hidden;
+				background-color: color-mix(in srgb, var(--vscode-editor-background) 92%, transparent);
+				border: var(--gl-border-width) solid var(--gl-kanban-card-border);
+				border-radius: var(--gl-kanban-card-radius);
 			}
 
 			.column__heading {
 				display: flex;
+				gap: var(--gl-space-6);
 				align-items: center;
-				gap: 0.6rem;
-				padding: 0.8rem 1rem;
-				font-size: 1.1rem;
+				padding: var(--gl-space-8) var(--gl-space-10);
+				font-size: var(--gl-font-sm);
 				font-weight: 600;
-				border-bottom: 1px solid var(--gl-kanban-card-border);
+				color: var(--color-foreground--65);
 				text-transform: uppercase;
 				letter-spacing: 0.04em;
-				color: var(--color-foreground--65);
+				border-bottom: var(--gl-border-width) solid var(--gl-kanban-card-border);
 			}
 
 			.column__heading[data-column='needs-input'] {
 				color: var(--gl-agent-waiting-color);
 			}
+
 			.column__heading[data-column='working'] {
 				color: var(--gl-agent-working-color);
 			}
 
 			.column__heading-label {
-				font: inherit;
-				margin: 0;
 				padding: 0;
+				margin: 0;
+				font: inherit;
 			}
 
 			.column__count {
 				margin-left: auto;
-				font-size: 1rem;
-				color: var(--color-foreground--65);
+				font-size: var(--gl-font-micro);
 				font-weight: 400;
+				color: var(--color-foreground--65);
 				text-transform: none;
 				letter-spacing: 0;
 			}
 
 			.column__list {
-				flex: 1 1 auto;
 				display: flex;
+				flex: 1 1 auto;
 				flex-direction: column;
-				gap: 0.8rem;
-				padding: 0.8rem;
-				overflow-y: auto;
+				gap: var(--gl-space-8);
 				min-height: 0;
+				padding: var(--gl-space-8);
+				overflow-y: auto;
+
 				/* Same GPU-composite hint as the body. Each column scrolls independently when its
-				   card list overflows; promoting the layer keeps per-column vertical scroll smooth. */
+		   card list overflows; promoting the layer keeps per-column vertical scroll smooth. */
 				will-change: scroll-position;
 			}
 
 			.column__empty {
-				color: var(--color-foreground--50);
+				padding: var(--gl-space-4) var(--gl-space-2);
+				font-size: var(--gl-font-sm);
 				font-style: italic;
-				padding: 0.4rem 0.2rem;
-				font-size: 1.1rem;
+				color: var(--color-foreground--50);
 			}
 
 			.card {
 				display: flex;
 				flex-direction: column;
-				gap: 0.6rem;
+				gap: var(--gl-space-6);
 				padding: 0.9rem 1rem;
-				background-color: var(--gl-kanban-card-bg);
-				border: 1px solid var(--gl-kanban-card-border);
-				border-radius: var(--gl-kanban-card-radius);
-				box-shadow: 0 1px 0 rgba(0, 0, 0, 0.06);
-				text-align: left;
-				color: inherit;
+
+				/* Off-screen cards skip layout and paint entirely via content-visibility, keeping long
+		   columns (Inactive collects every ended session) cheap to lay out and scroll.
+		   contain-intrinsic-size reserves a placeholder box while skipped — its auto keyword
+		   keeps the last-rendered size once a card has been painted, so scrollbar jitter stays
+		   minimal as cards enter the viewport. */
+				content-visibility: auto;
+				contain-intrinsic-size: auto 10rem;
 				font: inherit;
-				cursor: pointer;
+				color: inherit;
+				text-align: left;
 				appearance: none;
-				/* Paint isolation: card hover (border-color + color-mix background change) repaints
-				   only this card's box, not its column or siblings. Without it, hover transitions
-				   thrashed visibly on scroll because the browser would re-evaluate paint regions
-				   across the column. */
-				contain: layout style paint;
+				cursor: pointer;
+				background-color: var(--gl-kanban-card-bg);
+				border: var(--gl-border-width) solid var(--gl-kanban-card-border);
+				border-radius: var(--gl-kanban-card-radius);
+				box-shadow: 0 1px 0 rgb(0 0 0 / 6%);
 			}
 
 			.card:hover {
-				border-color: var(--vscode-focusBorder, var(--gl-kanban-card-border));
 				background-color: var(--vscode-list-hoverBackground, var(--gl-kanban-card-bg));
+				border-color: var(--vscode-focusBorder, var(--gl-kanban-card-border));
 			}
 
 			.card:focus-visible {
-				outline: 1px solid var(--vscode-focusBorder);
+				outline: var(--gl-border-width) solid var(--vscode-focusBorder);
 				outline-offset: -1px;
+			}
+
+			/* A ghost (visited-but-not-current) card — same dim idiom as the details panel's
+		   .card--ghost (opacity 0.6), applied on top of whichever column accent the card
+		   otherwise carries. */
+			.card--ghost {
+				opacity: 0.6;
 			}
 
 			.card[data-column='needs-input'] {
 				border-left: 2px solid var(--gl-agent-waiting-color);
 			}
+
 			.card[data-column='working'] {
 				border-left: 2px solid var(--gl-agent-working-color);
 			}
+
 			.card[data-column='idle'] {
 				border-left: 2px solid var(--gl-agent-idle-color);
 			}
+
 			.card[data-column='inactive'] {
 				border-left: 2px solid color-mix(in srgb, var(--gl-agent-idle-color) 50%, transparent);
 			}
 
 			.card__head {
 				display: flex;
+				gap: var(--gl-space-6);
 				align-items: baseline;
 				justify-content: space-between;
-				gap: 0.6rem;
 			}
 
 			.card__title {
-				font-size: 1.2rem;
-				font-weight: 600;
-				white-space: nowrap;
+				min-width: 0;
 				overflow: hidden;
 				text-overflow: ellipsis;
-				min-width: 0;
+				font-size: var(--gl-font-md);
+				font-weight: 600;
+				white-space: nowrap;
 			}
 
 			.card__phase {
-				font-size: 1rem;
+				font-size: var(--gl-font-micro);
 				font-weight: 500;
 				color: var(--color-foreground--65);
 				white-space: nowrap;
@@ -330,61 +377,74 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 			.card[data-column='needs-input'] .card__phase {
 				color: var(--gl-agent-waiting-color);
 			}
+
 			.card[data-column='working'] .card__phase {
 				color: var(--gl-agent-working-color);
 			}
 
 			/* 2nd row: subtitle on the left, Open Session icon button on the right. Always laid out
-			   even when the subtitle is missing so the Open Session stays visually anchored. */
+	   even when the subtitle is missing so the Open Session stays visually anchored. */
 			.card__sub-row {
 				display: flex;
+				gap: var(--gl-space-6);
 				align-items: center;
 				justify-content: space-between;
-				gap: 0.6rem;
 				min-height: 1.8rem;
 			}
 
 			.card__subtitle {
-				font-size: 1rem;
-				color: var(--color-foreground--65);
-				white-space: nowrap;
+				flex: 1 1 auto;
+				min-width: 0;
 				overflow: hidden;
 				text-overflow: ellipsis;
-				min-width: 0;
-				flex: 1 1 auto;
+				font-size: var(--gl-font-micro);
+				color: var(--color-foreground--65);
+				white-space: nowrap;
 			}
 
-			.card__open {
+			.card__open,
+			.card__archive {
 				flex: none;
 			}
 
 			.card__detail {
-				font-size: 1.1rem;
+				display: -webkit-box;
+				overflow: hidden;
+				-webkit-line-clamp: 3;
+				font-size: var(--gl-font-sm);
 				line-height: 1.4;
 				color: var(--vscode-foreground);
-				display: -webkit-box;
-				-webkit-line-clamp: 3;
 				-webkit-box-orient: vertical;
-				overflow: hidden;
 			}
 
 			.card__actions {
 				display: flex;
+				gap: var(--gl-space-4);
 				align-items: center;
-				gap: 0.4rem;
-				margin-top: 0.2rem;
 				justify-content: flex-end;
+				margin-top: var(--gl-space-2);
 			}
 
-			/* Permission actions (Allow / Deny / View Plan) cluster on the left when present;
-			   margin-right: auto pushes Open Session — the trailing child — to the far right. When
-			   no permission is pending, Open Session is alone and flex-end already right-aligns it. */
+			/* Sole child of .card__actions — margin-right: auto overrides its flex-end to keep the
+	   Allow / Deny / View Plan cluster left-aligned. */
 			.card__permission-actions {
 				display: flex;
-				align-items: center;
-				gap: 0.4rem;
 				flex-wrap: wrap;
+				gap: var(--gl-space-4);
+				align-items: center;
 				margin-right: auto;
+			}
+
+			.card__permission-actions-hint {
+				/* Shares the action row to the left of the buttons and absorbs the available
+		   space, truncating before the actions wrap. */
+				flex: 1 1 0;
+				min-width: 0;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+				font-size: var(--gl-font-micro);
+				color: var(--color-foreground--65);
 			}
 
 			.card__actions gl-button {
@@ -392,14 +452,14 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 			}
 
 			.empty-state {
-				flex: 1 1 auto;
 				display: flex;
+				flex: 1 1 auto;
 				flex-direction: column;
+				gap: var(--gl-space-6);
 				align-items: center;
 				justify-content: center;
-				gap: 0.6rem;
+				padding: var(--gl-space-20);
 				color: var(--color-foreground--65);
-				padding: 2rem;
 				text-align: center;
 			}
 
@@ -410,7 +470,10 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 		`,
 	];
 
-	@consume({ context: graphStateContext, subscribe: true })
+	/** Drives only the coach-mark auto-show trigger; mounting this view is itself the mode entry. */
+	@property({ type: Boolean, attribute: 'graph-ready' }) graphReady = false;
+
+	@consume({ context: graphStateContext, subscribe: false })
 	private graphState!: typeof graphStateContext.__context__;
 
 	/** Periodic re-render driver. Connected on `connectedCallback`, cleared on disconnect so we
@@ -433,6 +496,20 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 		buckets: Map<KanbanColumnId, AgentSessionState[]>;
 	};
 
+	/** Memoized family filter, keyed on raw-array identity AND `family`. `graphState.agentSessions`
+	 *  gets a fresh array reference on every host push even when only a foreign-family session
+	 *  changed — without this, `buildBuckets`'s own identity-keyed cache (`_bucketsCache`) would
+	 *  miss on every such push despite the filtered content being unchanged. */
+	private _familyFilterCache?: {
+		sessionsRef: readonly AgentSessionState[];
+		family: string | undefined;
+		// `graphState.worktreePaths` arrives on a DIFFERENT notification channel than
+		// `agentSessions` — comparing this reference too (not just `sessionsRef`/`family`) catches a
+		// worktree add/remove that would otherwise serve a stale filtered list.
+		worktreePathsRef: readonly string[] | undefined;
+		filtered: AgentSessionState[];
+	};
+
 	/** Monotonically-increasing tick counter mixed into {@link computeFingerprint} so the periodic
 	 *  live-tick deterministically invalidates the no-op-render guard once per interval — without
 	 *  it, `shouldUpdate` would short-circuit the tick (session content is unchanged across the
@@ -447,12 +524,47 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 	 *  exceptions later abort the cycle. */
 	private _lastFingerprint?: string;
 
+	/** Progressive-reveal counter: how many columns (in {@link columns} priority order) render
+	 *  real cards. Starts at 0 so the first paint draws only the board chrome — header plus
+	 *  column shells with skeleton placeholders — and the rAF scheduler (`_revealFrameHandle`)
+	 *  reveals one more column per animation frame. Mixed into {@link computeFingerprint} (the
+	 *  `r` prefix) so each reveal step survives the no-op-render dedupe even when session data is
+	 *  unchanged. */
+	private _revealedColumns = 0;
+
+	/** rAF handle for the progressive reveal above — one frame per column, kicked off in
+	 *  `connectedCallback` and cancelled on disconnect alongside the live-tick interval so a fast
+	 *  toggle away neither leaks frames nor mutates a detached element. */
+	private _revealFrameHandle?: number;
+
 	/** Sticky "current tool call" resolver shared with the details panel — see
 	 *  {@link createStickyDetailResolver}. Hides the brief inter-tool-call flicker where
 	 *  `session.statusDetail` empties before the next tool latches, by holding the last live tool
 	 *  detail for the resolver's default 3s window. Permission detail lines are not stickified —
 	 *  they reflect a steady state rather than a stream of events. */
 	private readonly _stickyResolver: StickyDetailResolver = createStickyDetailResolver();
+
+	/** Filters `sessions` down to the selected repo's family, returning a STABLE reference across
+	 *  renders when the raw array reference and `family` haven't changed — required so
+	 *  `buildBuckets`'s own identity-keyed cache (see {@link _bucketsCache}) doesn't miss on every
+	 *  host push. */
+	private familyFilteredSessions(sessions: readonly AgentSessionState[]): AgentSessionState[] {
+		const family = this.family;
+		const worktreePaths = this.graphState.worktreePaths;
+		const cache = this._familyFilterCache;
+		if (cache?.sessionsRef === sessions && cache?.family === family && cache?.worktreePathsRef === worktreePaths) {
+			return cache.filtered;
+		}
+
+		const filtered = filterAgentSessionsForFamily(sessions, family, this.familyWorktreePaths);
+		this._familyFilterCache = {
+			sessionsRef: sessions,
+			family: family,
+			worktreePathsRef: worktreePaths,
+			filtered: filtered,
+		};
+		return filtered;
+	}
 
 	private buildBuckets(sessions: readonly AgentSessionState[]): {
 		sorted: AgentSessionState[];
@@ -484,15 +596,16 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 		// because we already have `sorted` in hand; only runs on cache-miss (i.e., once per push
 		// where the array reference changes), so the prune frequency stays bounded.
 		if (this._stickyResolver.size > 0) {
-			this._stickyResolver.prune(sorted.map(s => s.id));
+			this._stickyResolver.prune(sorted);
 		}
 
 		return { sorted: sorted, buckets: buckets };
 	}
 
-	/** Build a stable string capturing every field the kanban actually renders, plus the live-tick
-	 *  generation. Identical fingerprint between two reactive pushes → no visible change → skip
-	 *  the render entirely via {@link shouldUpdate}. The host fires `DidChangeAgentSessionsNotification`
+	/** Build a stable string capturing every field the kanban actually renders, plus the
+	 *  progressive-reveal and live-tick generations (`r`/`t` prefixes). Identical fingerprint
+	 *  between two reactive pushes → no visible change → skip
+	 *  the render entirely via {@link shouldUpdate}. The host's `AgentsService.onSessionsChanged` fires
 	 *  on every Claude Code event (multiple per second during active work) with a fresh array
 	 *  reference; many of those carry no meaningful diff for the kanban — same phase, same tool
 	 *  call, same prompt — and we'd otherwise pay a full Lit render-and-diff for each one.
@@ -509,23 +622,26 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 	 *  - `pendingPermission` — encoded by {@link permissionFingerprint} so every needs-input
 	 *    variant's renderable fields (plan summary/file, question text/count, tool name/desc, …)
 	 *    contribute, not just the kind/toolName pair the early version captured.
+	 *  - `worktreePath`/`commonPath` — drive the ghost (visited-but-not-current) dimming, "now in X"
+	 *    detail-line override, and the header/column count exclusion; a session moving repos must
+	 *    repaint even when nothing else about it changed.
 	 *
 	 *  Adding a new rendered field requires extending this fingerprint (or {@link permissionFingerprint}
 	 *  for permission-typed fields) or the kanban will silently fail to update when only that
 	 *  field changes. */
 	private computeFingerprint(sessions: readonly AgentSessionState[]): string {
-		const parts: string[] = [`t${this._tickGeneration}`];
+		const parts: string[] = [`r${this._revealedColumns}t${this._tickGeneration}`];
 		for (const s of sessions) {
 			const subtitle = s.worktree?.branch?.name ?? s.worktree?.name ?? s.worktree?.path ?? '';
 			parts.push(
-				`${s.id}|${s.phase}|${fpField(s.status)}|${fpField(s.statusDetail)}|${fpField(s.displayName)}|${fpField(s.lastPrompt)}|${fpField(subtitle)}|${s.phaseSince.getTime()}|${Math.floor(s.lastActivity.getTime() / 60000)}|${permissionFingerprint(s.pendingPermission)}`,
+				`${s.id}|${s.phase}|${fpField(s.status)}|${fpField(s.statusDetail)}|${fpField(s.displayName)}|${fpField(s.lastPrompt)}|${fpField(subtitle)}|${s.phaseSince}|${Math.floor(s.lastActivity / 60000)}|${permissionFingerprint(s.pendingPermission)}|${fpField(s.worktreePath)}|${fpField(s.commonPath)}`,
 			);
 		}
 		return parts.join('\n');
 	}
 
 	override shouldUpdate(_changedProps: PropertyValues): boolean {
-		const fingerprint = this.computeFingerprint(this.graphState.agentSessions ?? []);
+		const fingerprint = this.computeFingerprint(this.familyFilteredSessions(this.graphState.agentSessions ?? []));
 		if (this._lastFingerprint === fingerprint) {
 			return false;
 		}
@@ -540,7 +656,32 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 		// fingerprint. Storing before `super.update()` would advance `_lastFingerprint` to the
 		// just-failed inputs and lock the kanban on whatever paint survived.
 		super.update(changedProps);
-		this._lastFingerprint = this.computeFingerprint(this.graphState.agentSessions ?? []);
+		this._lastFingerprint = this.computeFingerprint(
+			this.familyFilteredSessions(this.graphState.agentSessions ?? []),
+		);
+	}
+
+	/** Impression telemetry — point-in-time snapshot, fired once per mount (the component mounts
+	 *  only while Kanban is the active display mode and remounts per activation, so first-render is
+	 *  one impression). `agentSessions` is a signal initialized to `[]` and populated asynchronously,
+	 *  so on a fast toggle before the first push the counts below may all read 0 and later arrivals
+	 *  do NOT re-fire — treat them as "what was visible at open", not a settled total. Mirrors the
+	 *  agents sidebar's `emitAgentsShownTelemetry` semantics (the same signal makes "not loaded" and
+	 *  "loaded but empty" indistinguishable, so deferring — as the treemap does on `data.root` — isn't
+	 *  possible here). */
+	protected override firstUpdated(): void {
+		const sessions = this.familyFilteredSessions(this.graphState.agentSessions ?? []);
+		const { buckets } = this.buildBuckets(sessions);
+		emitTelemetrySentEvent(this, {
+			name: 'graph/kanban/shown',
+			data: {
+				'sessions.count': sessions.length,
+				'sessions.working.count': buckets.get('working')?.length ?? 0,
+				'sessions.needsInput.count': buckets.get('needs-input')?.length ?? 0,
+				'sessions.idle.count': buckets.get('idle')?.length ?? 0,
+				'sessions.inactive.count': buckets.get('inactive')?.length ?? 0,
+			},
+		});
 	}
 
 	override connectedCallback(): void {
@@ -553,6 +694,11 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 			this._tickGeneration++;
 			this.requestUpdate();
 		}, liveTickIntervalMs);
+
+		// Start revealing columns one per frame — see `scheduleReveal`. A rAF callback runs before
+		// the next frame's paint, so render 0 (board chrome) paints in the mount frame and column 1
+		// lands in the following one; no double-rAF hop needed.
+		this.scheduleReveal();
 	}
 
 	override disconnectedCallback(): void {
@@ -561,6 +707,27 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 			clearInterval(this._liveTickHandle);
 			this._liveTickHandle = undefined;
 		}
+		if (this._revealFrameHandle != null) {
+			cancelAnimationFrame(this._revealFrameHandle);
+			this._revealFrameHandle = undefined;
+		}
+	}
+
+	/** Progressive-reveal driver: one animation frame per column until all of {@link columns} are
+	 *  shown — the two-phase mount that keeps card-tree construction (the expensive part of
+	 *  switching into Kanban) off the first paint. Idempotent: a pending frame or an already-full
+	 *  `_revealedColumns` (e.g. reconnect of a long-lived instance) makes this a no-op. */
+	private scheduleReveal(): void {
+		if (this._revealFrameHandle != null || this._revealedColumns >= columns.length) return;
+
+		this._revealFrameHandle = requestAnimationFrame(() => {
+			this._revealFrameHandle = undefined;
+			if (this._revealedColumns >= columns.length) return;
+
+			this._revealedColumns++;
+			this.requestUpdate();
+			this.scheduleReveal();
+		});
 	}
 
 	private onClose = (): void => {
@@ -582,11 +749,33 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 		// catches Open Session (in `.card__sub-row`) AND the permission actions (`.card__actions`),
 		// regardless of which subtree they live in — so layout changes can't silently regress the
 		// guard the way `closest('.card__actions')` did when Open Session moved to the sub-row.
+		// The buttons handle their own activation (command links); this delegated listener only
+		// observes the composed click for telemetry — one listener instead of per-render closures.
 		const target = event.target as HTMLElement | null;
-		if (target?.closest('gl-button') != null) return;
+		const actionButton = target?.closest<HTMLElement>('gl-button');
+		if (actionButton != null) {
+			this.emitCardActionTelemetry(actionButton, sessionId);
+			return;
+		}
 
 		const session = (this.graphState.agentSessions ?? []).find(s => s.id === sessionId);
 		if (session == null) return;
+
+		const family = this.family;
+		emitTelemetrySentEvent(this, {
+			name: 'graph/kanban/sessionSelected',
+			data: {
+				'session.phase': session.phase,
+				'session.category': agentPhaseToCategory[session.phase],
+				'session.hasPendingPermission': session.pendingPermission != null,
+				// Same repo-family comparison the open-session gate in graph-app applies — a
+				// cross-repo card click is a no-op there, so this flag explains "dead" clicks.
+				'session.sameRepo': family != null && session.commonPath === family,
+				// Prefer the rendered card's column — recomputing via `columnIdForSession` could
+				// disagree with what the user actually saw (idle → inactive is a time threshold).
+				column: (card?.dataset.column as KanbanColumnId | undefined) ?? columnIdForSession(session),
+			},
+		});
 
 		this.dispatchEvent(
 			new CustomEvent('gl-graph-kanban-open-session', {
@@ -600,6 +789,77 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 			}),
 		);
 	};
+
+	/** Telemetry for the card's inner action buttons, identified by `data-telemetry-action` —
+	 *  static attributes instead of per-button click closures (see `onCardClick`'s perf note). */
+	private emitCardActionTelemetry(button: HTMLElement, sessionId: string): void {
+		const action = button.dataset.telemetryAction;
+		switch (action) {
+			case 'permission-allow':
+			case 'permission-deny': {
+				const session = (this.graphState.agentSessions ?? []).find(s => s.id === sessionId);
+				emitTelemetrySentEvent(this, {
+					name: 'graph/kanban/permissionResolved',
+					data: {
+						decision: action === 'permission-allow' ? 'allow' : 'deny',
+						'permission.kind': session?.pendingPermission?.kind ?? 'unknown',
+					},
+				});
+				return;
+			}
+		}
+
+		const sessionAction = sessionActionTelemetryNames[action as SessionActionTelemetryAttribute];
+		if (sessionAction == null) return;
+
+		emitTelemetrySentEvent(this, {
+			name: 'graph/kanban/sessionAction',
+			data: { action: sessionAction },
+		});
+	}
+
+	/** Resolves the graph's selected repo exactly as the open-session gate does
+	 *  (`GraphApp.fallbackRepoFamily`): a stale/unmatched `selectedRepository` resolves to
+	 *  `undefined` (NO `?? repos[0]` fallback), so `session.sameRepo` can't report `true` for a
+	 *  click the gate would reject — the flag exists to explain those dead clicks. */
+	private get effectiveRepo() {
+		const repoId = this.graphState.selectedRepository;
+		const repos = this.graphState.repositories;
+		return repoId != null ? repos?.find(r => r.id === repoId) : repos?.[0];
+	}
+
+	/** The effective repo's family path (`commonPath ?? path`), for scoping which agent sessions
+	 *  the kanban shows and for the `session.sameRepo` telemetry comparison. */
+	private get family(): string | undefined {
+		const repo = this.effectiveRepo;
+		return repo == null ? undefined : (repo.commonPath ?? repo.path);
+	}
+
+	/** Repo-family worktree paths as a Set, for `isAgentSessionCurrentInFamily`/`filterAgentSessionsForFamily`
+	 *  lookups. Constructed fresh each read — the arrays involved are small and this mirrors what
+	 *  `familyFilteredSessions` already does; not worth a separate memo on top of that method's own
+	 *  reference-keyed cache. */
+	private get familyWorktreePaths(): Set<string> | undefined {
+		const worktreePaths = this.graphState.worktreePaths;
+		return worktreePaths != null ? new Set(worktreePaths) : undefined;
+	}
+
+	/** Whether `session` is a ghost for the active family — admitted into `familyFilteredSessions`
+	 *  only via its visited history, while its CURRENT identity (commonPath/worktreePath) is a
+	 *  foreign repo. Ghost cards dim and show a "now in <dir>" hint instead of rendering as
+	 *  ordinary active work — see `renderCard`. Hoisted here alongside `family` since both the
+	 *  card renderer and the column/header counts need it. */
+	private isGhost(session: AgentSessionState): boolean {
+		return !isAgentSessionCurrentInFamily(session, this.family, this.familyWorktreePaths);
+	}
+
+	/** Label for a ghost card's actual current location — mirrors `gl-details-agent-status`'s
+	 *  `ghostLocationLabel`: the worktree path's directory basename, falling back to the provider
+	 *  name when the session has no resolved worktree at all. Copy stays exactly `now in <dir>` so
+	 *  every surface (details panel, branch sheet, kanban) reads the same. */
+	private ghostLocationHint(session: AgentSessionState): string {
+		return `now in ${session.worktreePath ? basename(session.worktreePath) : session.providerName}`;
+	}
 
 	private onCardKeydown = (event: KeyboardEvent): void => {
 		// Enter and Space activate the card as an "open WIP details" affordance, matching the
@@ -618,8 +878,11 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 	};
 
 	override render(): unknown {
-		const rawSessions = this.graphState.agentSessions ?? [];
+		const rawSessions = this.familyFilteredSessions(this.graphState.agentSessions ?? []);
 		const { sorted: sessions, buckets: sessionsByColumn } = this.buildBuckets(rawSessions);
+		// Ghosts are still rendered (dimmed, in their column) but must not inflate the header count
+		// — it answers "how many sessions are actually running in this family right now".
+		const currentCount = sessions.filter(s => !this.isGhost(s)).length;
 
 		return html`
 			<section aria-label="Agent Kanban">
@@ -630,12 +893,18 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 							class="header__experimental"
 							placement="bottom"
 							content="This is an experimental feature"
-							distance="6"
+							.distance=${6}
 						>
 							<gl-badge appearance="experimental" aria-label="Experimental feature">EXP</gl-badge>
 						</gl-tooltip>
+						<gl-graph-coachmark
+							mark="kanban"
+							placement="bottom"
+							.anchor=${() => this.renderRoot.querySelector<HTMLElement>('.header__title') ?? undefined}
+							?auto-show=${this.graphReady}
+						></gl-graph-coachmark>
 						<span class="header__count" aria-live="polite"
-							>${sessions.length} session${sessions.length === 1 ? '' : 's'}</span
+							>${currentCount} session${currentCount === 1 ? '' : 's'}</span
 						>
 					</div>
 					<gl-button
@@ -648,13 +917,17 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 						<code-icon icon="close"></code-icon>
 					</gl-button>
 				</div>
-				${(this.graphState.canInstallClaudeHook ?? false) && !(this.graphState.hooksBannerCollapsed ?? true)
-					? html`<gl-hooks-banner
-							class="hooks-banner"
-							source="graph-kanban"
-							layout="responsive"
-						></gl-hooks-banner>`
-					: nothing}
+				${
+					(this.graphState.canInstallHooks ?? false) && !(this.graphState.agentsBannerCollapsed ?? true)
+						? html`<gl-agents-banner
+								class="agents-banner"
+								source="graph-kanban"
+								layout="responsive"
+								.mcpCanAutoRegister=${this.graphState.mcpCanAutoRegister ?? false}
+								.hooksAvailable=${(this.graphState.hooksAgents?.length ?? 0) > 0}
+							></gl-agents-banner>`
+						: nothing
+				}
 				${sessions.length === 0 ? this.renderEmpty() : this.renderColumns(sessionsByColumn)}
 			</section>
 		`;
@@ -677,32 +950,54 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 			${repeat(
 				columns,
 				c => c.id,
-				c => this.renderColumn(c, sessionsByColumn.get(c.id) ?? []),
+				(c, index) => this.renderColumn(c, sessionsByColumn.get(c.id) ?? [], index),
 			)}
 		</div>`;
 	}
 
-	private renderColumn(column: KanbanColumnDef, sessions: readonly AgentSessionState[]) {
+	private renderColumn(column: KanbanColumnDef, sessions: readonly AgentSessionState[], index: number) {
 		const headingId = `kanban-column-heading-${column.id}`;
+		// Same rationale as the header count — ghosts still render as cards below but don't count
+		// toward the column's own badge.
+		const currentCount = sessions.filter(s => !this.isGhost(s)).length;
+		// Progressive reveal (see `_revealedColumns`): columns at or beyond the reveal count show
+		// skeleton placeholders instead of cards, so mounting paints the board chrome first and
+		// card trees land one column per frame in priority order. Emptiness is known now — buckets
+		// are computed synchronously — so an unrevealed empty column renders its real "Nothing
+		// here" state immediately rather than skeletons.
+		const revealed = index < this._revealedColumns;
 		return html`<section class="column" aria-labelledby=${headingId}>
 			<header class="column__heading" data-column=${column.id} id=${headingId}>
 				<h3 class="column__heading-label">${column.label}</h3>
-				<span
-					class="column__count"
-					aria-label=${`${sessions.length} session${sessions.length === 1 ? '' : 's'}`}
-					>${sessions.length}</span
+				<span class="column__count" aria-label=${`${currentCount} session${currentCount === 1 ? '' : 's'}`}
+					>${currentCount}</span
 				>
 			</header>
 			<div class="column__list scrollable">
-				${sessions.length === 0
-					? html`<p class="column__empty">Nothing here</p>`
-					: repeat(
-							sessions,
-							s => s.id,
-							s => this.renderCard(s, column.id),
-						)}
+				${
+					sessions.length === 0
+						? html`<p class="column__empty">Nothing here</p>`
+						: revealed
+							? repeat(
+									sessions,
+									s => s.id,
+									s => this.renderCard(s, column.id),
+								)
+							: this.renderColumnSkeletons()
+				}
 			</div>
 		</section>`;
+	}
+
+	/** Placeholder stack for a not-yet-revealed column — three loaders sized like a card's detail
+	 *  block, spaced by the `.column__list` gap. Replaced by real cards when the reveal scheduler
+	 *  reaches this column. */
+	private renderColumnSkeletons() {
+		return html`
+			<skeleton-loader lines="3"></skeleton-loader>
+			<skeleton-loader lines="3"></skeleton-loader>
+			<skeleton-loader lines="3"></skeleton-loader>
+		`;
 	}
 
 	private renderCard(session: AgentSessionState, columnId: KanbanColumnId) {
@@ -710,7 +1005,15 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 		const elapsed = formatAgentElapsed(session.phaseSince);
 		const phaseLabel = getAgentPhaseLabel(category, session.pendingPermission);
 		const subtitle = sessionSubtitle(session);
-		const detail = this.resolveStickyDetail(session, category, elapsed);
+		// A ghost (visited-but-not-current) session still gets a card in whichever column its phase
+		// maps to — this family is part of its history — but its detail line is replaced with where
+		// it actually is now, and the card dims (`.card--ghost`) so it doesn't read as ordinary
+		// active work. Session-id-based actions (open, resolve permission, archive) stay fully
+		// functional: they address the session wherever it actually is.
+		const ghost = this.isGhost(session);
+		const detail = ghost ? this.ghostLocationHint(session) : this.resolveStickyDetail(session, category);
+		const openAction = getAgentSessionOpenAction(session);
+		const archiveHref = session.phase === 'ended' ? createAgentSessionArchiveHref(session) : undefined;
 
 		// Use a `<div role="button" tabindex="0">` rather than a native `<button>` so we can host
 		// interactive descendants (gl-button for Open Session / Allow / Deny / View Plan) without
@@ -720,7 +1023,7 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 		// before tabbing into the inner actions.
 		const ariaLabel = `${session.displayName} — ${phaseLabel}${elapsed != null ? ` (${elapsed})` : ''}`;
 		return html`<div
-			class="card"
+			class="card${ghost ? ' card--ghost' : ''}"
 			role="button"
 			tabindex="0"
 			data-column=${columnId}
@@ -730,24 +1033,45 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 			@keydown=${this.onCardKeydown}
 		>
 			<div class="card__head">
-				<span class="card__title" title=${session.displayName}>${session.displayName}</span>
+				<gl-tooltip content=${session.displayName}
+					><span class="card__title">${session.displayName}</span></gl-tooltip
+				>
 				<span class="card__phase">${phaseLabel}${elapsed != null ? ` · ${elapsed}` : ''}</span>
 			</div>
 			<div class="card__sub-row">
-				${subtitle != null
-					? html`<span class="card__subtitle">${subtitle}</span>`
-					: html`<span class="card__subtitle"></span>`}
+				${
+					subtitle != null
+						? html`<span class="card__subtitle">${subtitle}</span>`
+						: html`<span class="card__subtitle"></span>`
+				}
+				${
+					archiveHref != null
+						? html`<gl-button
+								class="card__archive"
+								appearance="toolbar"
+								tooltip="Archive Session"
+								aria-label="Archive Session"
+								href=${archiveHref}
+							>
+								<code-icon icon="archive"></code-icon>
+							</gl-button>`
+						: nothing
+				}
 				<gl-button
 					class="card__open"
 					appearance="toolbar"
-					tooltip="Open Session"
-					href=${createCommandLink('gitlens.agents.openSession', JSON.stringify(session.id))}
+					tooltip=${openAction.label}
+					aria-label=${openAction.label}
+					data-telemetry-action=${
+						openAction.command === 'gitlens.agents.resumeSession' ? 'resume-session' : 'open-session'
+					}
+					href=${createAgentSessionOpenHref(session)}
 				>
-					<code-icon icon="link-external"></code-icon>
+					<code-icon icon=${openAction.icon}></code-icon>
 				</gl-button>
 			</div>
 			<p class="card__detail">${detail}</p>
-			${this.renderPermissionActions(session)}
+			${this.renderPermissionActions(session, category)}
 		</div>`;
 	}
 
@@ -756,20 +1080,16 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 	 *  the same fallback chain the kanban shipped with — `describeAgentSession` for needs-input
 	 *  and idle, with `lastPrompt` ahead of the elapsed clock so idle cards keep showing the
 	 *  most informative content. */
-	private resolveStickyDetail(
-		session: AgentSessionState,
-		category: AgentSessionCategory,
-		elapsed: string | undefined,
-	): string {
+	private resolveStickyDetail(session: AgentSessionState, category: AgentSessionCategory): string {
 		if (category === 'needs-input' && session.pendingPermission != null) {
 			// Evict any prior working-phase entry. The needs-input branch bypasses
 			// `resolveLiveTool` (the only call site that evicts on phase change), so without this
 			// explicit eviction a session that goes working+tool_use → needs-input → working
 			// (permission resolved) would briefly re-render the PRE-permission tool detail from
 			// the still-fresh sticky cache, even though the agent has moved on.
-			this._stickyResolver.evict(session.id);
+			this._stickyResolver.evict(session);
 			return (
-				describeAgentSession(session, category, elapsed, {
+				describeAgentSession(session, category, {
 					awaitingPrefix: 'short',
 					idleFallback: 'lastPrompt',
 				}) ??
@@ -781,21 +1101,68 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 		const stickyTool = this._stickyResolver.resolveLiveTool(session);
 		if (stickyTool != null) return stickyTool;
 
-		const live = describeAgentSession(session, category, elapsed, {
+		const live = describeAgentSession(session, category, {
 			awaitingPrefix: 'short',
 			idleFallback: 'none',
 		});
+		const lastActive = formatAgentElapsed(session.lastActivity);
 		return (
 			live ??
 			session.lastPrompt ??
-			(elapsed != null ? `Last active ${elapsed} ago` : undefined) ??
+			(lastActive != null ? `Last active ${lastActive} ago` : undefined) ??
 			'No recent activity'
 		);
 	}
 
-	private renderPermissionActions(session: AgentSessionState) {
+	private renderPermissionActions(session: AgentSessionState, category: AgentSessionCategory) {
 		const permission = session.pendingPermission;
-		if (permission == null) return nothing;
+		// Permission actions exist only for needs-input. A card with no payload still gets one — the
+		// unresolvable Open Session block below, via `canResolvePermission`'s false branch (which
+		// already treats a null ask the same as an unresolvable one).
+		if (category !== 'needs-input') return nothing;
+
+		// Read before the guard below: `canResolvePermission` is a type predicate, so its false
+		// branch narrows `permission` away entirely.
+		const planHref =
+			permission?.kind === 'plan' && permission.planFilePath != null
+				? createCommandLink('gitlens.agents.openPlanFile', JSON.stringify(permission.planFilePath))
+				: undefined;
+
+		// An unresolvable ask (no blocking hook entry to route it through) loses Allow/Deny and gets
+		// Open Session instead. View Plan stays: opening the file is local and needs no routing
+		// entry, so it is the one thing still worth offering.
+		if (!canResolvePermission(category, permission)) {
+			const openAction = getAgentSessionOpenAction(session);
+			return html`<div class="card__actions">
+				<div class="card__permission-actions">
+					<span class="card__permission-actions-hint">Answer in the agent's session</span>
+					<gl-button
+						appearance="secondary"
+						density="compact"
+						tooltip=${openAction.label}
+						data-telemetry-action="open-session"
+						href=${createAgentSessionOpenHref(session)}
+					>
+						<code-icon icon=${openAction.icon}></code-icon>
+						${openAction.label}
+					</gl-button>
+					${
+						planHref != null
+							? html`<gl-button
+									appearance="secondary"
+									density="compact"
+									tooltip="View Plan"
+									data-telemetry-action="open-plan"
+									href=${planHref}
+								>
+									<code-icon icon="tasklist"></code-icon>
+									View Plan
+								</gl-button>`
+							: nothing
+					}
+				</div>
+			</div>`;
+		}
 
 		const isPlan = permission.kind === 'plan';
 		return html`<div class="card__actions">
@@ -804,8 +1171,10 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 					appearance="secondary"
 					density="compact"
 					tooltip=${isPlan ? 'Approve Plan' : 'Allow'}
+					data-telemetry-action="permission-allow"
 					href=${createCommandLink('gitlens.agents.resolvePermission', {
 						sessionId: session.id,
+						providerId: session.providerId,
 						decision: 'allow' as const,
 					})}
 				>
@@ -816,26 +1185,31 @@ export class GlGraphKanban extends SignalWatcher(LitElement) {
 					appearance="secondary"
 					density="compact"
 					tooltip=${isPlan ? 'Reject Plan' : 'Deny'}
+					data-telemetry-action="permission-deny"
 					href=${createCommandLink('gitlens.agents.resolvePermission', {
 						sessionId: session.id,
+						providerId: session.providerId,
 						decision: 'deny' as const,
 					})}
 				>
 					<code-icon icon="x"></code-icon>
 					${isPlan ? 'Reject' : 'Deny'}
 				</gl-button>
-				${isPlan && permission.planFilePath != null
-					? html`<gl-button
-							appearance="toolbar"
-							tooltip="View Plan"
-							href=${createCommandLink(
-								'gitlens.agents.openPlanFile',
-								JSON.stringify(permission.planFilePath),
-							)}
-						>
-							<code-icon icon="tasklist"></code-icon>
-						</gl-button>`
-					: nothing}
+				${
+					isPlan && permission.planFilePath != null
+						? html`<gl-button
+								appearance="toolbar"
+								tooltip="View Plan"
+								data-telemetry-action="open-plan"
+								href=${createCommandLink(
+									'gitlens.agents.openPlanFile',
+									JSON.stringify(permission.planFilePath),
+								)}
+							>
+								<code-icon icon="tasklist"></code-icon>
+							</gl-button>`
+						: nothing
+				}
 			</div>
 		</div>`;
 	}

@@ -5,7 +5,7 @@ import { GitTag } from '@gitlens/git/models/tag.js';
 import type { GitTagsSubProvider } from '@gitlens/git/providers/tags.js';
 import type { TagSortOptions } from '@gitlens/git/utils/sorting.js';
 import { sortTags } from '@gitlens/git/utils/sorting.js';
-import { filterMap } from '@gitlens/utils/array.js';
+import { ensureArray, filterMap } from '@gitlens/utils/array.js';
 import { isCancellationError } from '@gitlens/utils/cancellation.js';
 import { debug } from '@gitlens/utils/decorators/log.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
@@ -66,6 +66,7 @@ export class TagsGitSubProvider implements GitTagsSubProvider {
 
 						// Annotated tags: peeledObjectname is the commit SHA; objectname is the tag-object SHA.
 						// Lightweight tags: peeledObjectname is empty; objectname is already the commit SHA.
+						const annotated = Boolean(record.peeledObjectname);
 						const sha = record.peeledObjectname || record.objectname;
 
 						tags.push(
@@ -76,6 +77,7 @@ export class TagsGitSubProvider implements GitTagsSubProvider {
 								record.subject,
 								record.creatorDate ? new Date(record.creatorDate) : undefined,
 								record.authorDate ? new Date(record.authorDate) : undefined,
+								annotated,
 							),
 						);
 					}
@@ -179,6 +181,41 @@ export class TagsGitSubProvider implements GitTagsSubProvider {
 				reason =>
 					new TagError(
 						{ reason: reason, action: 'delete', tag: name, gitCommand: { repoPath: repoPath, args: args } },
+						ex as GitError,
+					),
+			);
+		}
+	}
+
+	@debug()
+	async pushTag(
+		repoPath: string,
+		name: string | string[],
+		remote: string,
+		options?: { force?: boolean },
+	): Promise<void> {
+		const names = ensureArray(name);
+		const args = ['push'];
+		if (options?.force) {
+			args.push('--force');
+		}
+
+		args.push(remote, ...names.map(n => `refs/tags/${n}`));
+
+		try {
+			await this.git.run({ cwd: repoPath }, ...args);
+		} catch (ex) {
+			throw getGitCommandError(
+				'tag',
+				ex as GitError,
+				reason =>
+					new TagError(
+						{
+							reason: reason,
+							action: 'push',
+							tag: names.join(', '),
+							gitCommand: { repoPath: repoPath, args: args },
+						},
 						ex as GitError,
 					),
 			);

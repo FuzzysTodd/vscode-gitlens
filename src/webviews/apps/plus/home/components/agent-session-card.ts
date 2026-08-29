@@ -2,13 +2,19 @@ import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import { basename } from '@gitlens/utils/path.js';
 import type { AgentSessionState } from '../../../../home/protocol.js';
+import type { AgentSessionCategory } from '../../../shared/agentUtils.js';
+import { agentPhaseToCategory, agentProviderIcon } from '../../../shared/agentUtils.js';
 import '../../../shared/components/card/card.js';
 import '../../../shared/components/code-icon.js';
 import '../../../shared/components/pills/agent-status-pill.js';
 
-export const agentSessionCardTagName = 'gl-agent-session-card';
+declare global {
+	interface HTMLElementTagNameMap {
+		['gl-agent-session-card']: GlAgentSessionCard;
+	}
+}
 
-@customElement(agentSessionCardTagName)
+@customElement('gl-agent-session-card')
 export class GlAgentSessionCard extends LitElement {
 	static override styles = [
 		css`
@@ -19,58 +25,57 @@ export class GlAgentSessionCard extends LitElement {
 			.content {
 				display: flex;
 				flex-direction: column;
-				gap: 0.4rem;
-				padding: 0.4rem 0;
+				gap: var(--gl-space-4);
+				padding: var(--gl-space-4) 0;
 			}
 
 			.header {
 				display: inline-flex;
+				gap: var(--gl-space-6);
 				align-items: center;
-				gap: 0.6rem;
 				max-width: 100%;
 				margin-block: 0;
 			}
 
 			.header__icon {
-				color: var(--vscode-descriptionForeground);
 				flex: none;
+				color: var(--vscode-descriptionForeground);
 			}
 
 			.header__name {
 				flex: 1;
 				min-width: 0;
-				white-space: nowrap;
 				overflow: hidden;
 				text-overflow: ellipsis;
 				font-weight: bold;
+				white-space: nowrap;
 			}
 
 			.details {
 				display: flex;
 				flex-direction: column;
-				gap: 0.2rem;
+				gap: var(--gl-space-2);
 				font-size: 0.9em;
 				color: var(--vscode-descriptionForeground);
 			}
 
 			.detail {
 				display: inline-flex;
+				gap: var(--gl-space-4);
 				align-items: center;
-				gap: 0.4rem;
 			}
 
 			.sessions {
 				display: flex;
 				flex-direction: column;
-				gap: 0.4rem;
+				gap: var(--gl-space-4);
 			}
 
 			.session {
 				display: flex;
-				flex-direction: row;
+				flex-flow: row wrap;
+				gap: var(--gl-space-4);
 				align-items: center;
-				gap: 0.4rem;
-				flex-wrap: wrap;
 			}
 
 			.session code-icon {
@@ -78,8 +83,8 @@ export class GlAgentSessionCard extends LitElement {
 			}
 
 			.session__name {
-				color: var(--vscode-descriptionForeground);
 				font-size: 0.9em;
+				color: var(--vscode-descriptionForeground);
 			}
 
 			.session__subagents {
@@ -103,6 +108,19 @@ export class GlAgentSessionCard extends LitElement {
 	override render(): unknown {
 		if (this.sessions.length === 0) return nothing;
 
+		// Ended sessions accumulate (retained ~30 days), so they collapse into one summary pill
+		// instead of one row each — the popover carries the per-session detail.
+		const rest: AgentSessionState[] = [];
+		const ended: AgentSessionState[] = [];
+		for (const s of this.sessions) {
+			const cat: AgentSessionCategory = agentPhaseToCategory[s.phase];
+			if (cat === 'ended') {
+				ended.push(s);
+			} else {
+				rest.push(s);
+			}
+		}
+
 		return html`
 			<gl-card>
 				<div class="content">
@@ -116,7 +134,19 @@ export class GlAgentSessionCard extends LitElement {
 						<span class="header__name" title=${this.labelTitle}>${this.label}</span>
 					</p>
 					${this.renderDetails()}
-					<div class="sessions">${this.sessions.map(s => this.renderSession(s))}</div>
+					<div class="sessions">
+						${rest.map(s => this.renderSession(s))}
+						${
+							ended.length > 0
+								? html`<div class="session">
+										<code-icon icon="robot" title="Agent"></code-icon>
+										<gl-agent-status-pill
+											.summary=${{ category: 'ended', sessions: ended }}
+										></gl-agent-status-pill>
+									</div>`
+								: nothing
+						}
+					</div>
 				</div>
 			</gl-card>
 		`;
@@ -153,22 +183,18 @@ export class GlAgentSessionCard extends LitElement {
 	private renderSession(session: AgentSessionState): unknown {
 		return html`
 			<div class="session">
-				<code-icon icon="robot" title="Agent"></code-icon>
+				<code-icon icon=${agentProviderIcon(session.providerId)} title=${session.providerName}></code-icon>
 				<gl-agent-status-pill .session=${session}></gl-agent-status-pill>
 				<span class="session__name">${session.displayName}</span>
-				${session.subagentCount > 0
-					? html`<span class="session__subagents">
-							<code-icon icon="organization" title="Subagents"></code-icon>
-							${session.subagentCount}
-						</span>`
-					: nothing}
+				${
+					session.subagentCount > 0
+						? html`<span class="session__subagents">
+								<code-icon icon="organization" title="Subagents"></code-icon>
+								${session.subagentCount}
+							</span>`
+						: nothing
+				}
 			</div>
 		`;
-	}
-}
-
-declare global {
-	interface HTMLElementTagNameMap {
-		[agentSessionCardTagName]: GlAgentSessionCard;
 	}
 }

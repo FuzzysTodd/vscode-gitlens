@@ -1,4 +1,5 @@
 import type { PromptTemplate } from './models/promptTemplates.js';
+import type { AIResponseFormat, JSONSchema } from './models/provider.js';
 
 export const generateCommitMessage: PromptTemplate<'generate-commitMessage'> = {
 	id: 'generate-commitMessage_v2',
@@ -187,54 +188,6 @@ Example output structure:
 Based on the provided code diff and any additional context, create a concise but meaningful title and description following the instructions above`,
 };
 
-export const generateCreateCodeSuggest: PromptTemplate<'generate-create-codeSuggestion'> = {
-	id: 'generate-create-codeSuggestion_v2',
-	variables: ['diff', 'context', 'instructions'],
-	template: `You are an advanced AI programming assistant and are tasked with summarizing code changes into a concise and meaningful code review title and description. You will be provided with a code diff and optional additional context. Your goal is to analyze the changes and create a clear, informative code review title and description that accurately represents the modifications made to the code
-
-First, examine the following code changes provided in Git diff format:
-<~~diff~~>
-\${diff}
-</~~diff~~>
-
-Now, if provided, use this context to understand the motivation behind the changes and any relevant background information:
-<~~additional-context~~>
-\${context}
-</~~additional-context~~>
-
-To create an effective title and description, follow these steps:
-
-1. Carefully analyze the diff and context, focusing on:
-   - The purpose and rationale of the changes
-   - Any problems addressed or benefits introduced
-   - Any significant logic changes or algorithmic improvements
-2. Ensure the following when composing the title and description:
-   - Emphasize the 'why' of the change, its benefits, or the problem it addresses
-   - Use an informal yet professional tone
-   - Use a future-oriented manner, third-person singular present tense (e.g., 'Fixes', 'Updates', 'Improves', 'Adds', 'Removes')
-   - Be clear and concise
-   - Synthesize only meaningful information from the diff and context
-   - Avoid outputting code, specific code identifiers, names, or file names unless crucial for understanding
-   - Avoid repeating information, broad generalities, and unnecessary phrases like "this", "this commit", or "this change"
-3. Summarize the main purpose of the changes in a single, concise sentence, which will be the title
-4. Provide a detailed explanation of the changes, which will be the description
-   - Add line breaks for readability and to separate independent ideas
-   - Focus on the "why" rather than the "what" of the changes
-
-Write your title inside <summary> tags and your description inside <body> tags and include no other text
-Example output structure:
-<summary>
-[code-suggestion-title-goes-here]
-</summary>
-<body>
-[code-suggestion-description-goes-here]
-</body>
-
-\${instructions}
-
-Based on the provided code diff and any additional context, create a concise but meaningful code review title and description following the instructions above`,
-};
-
 export const explainChanges: PromptTemplate<'explain-changes'> = {
 	id: 'explain-changes',
 	variables: ['diff', 'message', 'instructions'],
@@ -339,23 +292,35 @@ Example output structure:
 Based on the provided commit messages and associated issues, create a set of markdown changelog entries following the instructions above. Do not include any explanatory text or metadata`,
 };
 
+/** Example output block shared by the {@link generateSearchQuery} template and its structural-retry prompt */
+export const generateSearchQueryExampleJson = `{
+   "query": "[search operators here]",
+   "explanation": "[one short sentence describing the interpretation]",
+   "mode": "highlight",
+   "alternates": []
+}`;
+
 export const generateSearchQuery: PromptTemplate<'generate-searchQuery'> = {
-	id: 'generate-searchQuery_v2',
+	id: 'generate-searchQuery_v4',
 	variables: ['query', 'date', 'context', 'instructions'],
 	template: `You are an advanced AI assistant that converts natural language queries into structured Git search operators. Your task is to analyze a user's natural language query about their Git repository history and convert it into the appropriate search operators.
 
 Available search operators:
 - 'message:' - Search in commit messages (e.g. 'message:fix bug'); maps to \`git log --extended-regexp --grep=<value>\`
+- '-message:' - Exclude commits whose message contains a term (e.g. '-message:wip'); maps to \`git log --invert-grep --grep=<value>\`. Never mix 'message:' and '-message:' in the same query -- git's --invert-grep applies to every --grep pattern in the command, so combining included and excluded message terms is invalid.
 - 'author:' - Search by a specific author (e.g. 'author:eamodio' or use '@me' for current user); maps to \`git log --author=<value>\`
+- 'committer:' - Search by a specific committer (e.g. 'committer:eamodio' or use '@me' for current user); maps to \`git log --committer=<value>\`. There is no way to exclude an author or committer -- only to include one; if the user asks to exclude one, explain that limitation in the explanation field and omit the filter rather than inventing syntax.
 - 'commit:' - Search by a specific commit SHA (e.g. 'commit:4ce3a')
 - 'file:' - Search by file path (e.g. 'file:"package.json"', 'file:"*.ts"'); maps to \`git log -- <value>\`
 - 'change:' - Search by specific code changes using regular expressions (e.g. 'change:"function.*auth"', 'change:"import.*react"'); maps to \`git log -G<value>\`
-- 'type:' - Search by type -- supports stash, tip, and wip (e.g. 'type:stash', 'type:tip', 'type:wip'). Use 'type:wip' for queries about work in progress, uncommitted changes, or pending changes across worktrees.
+- 'type:' - Search by type -- supports stash, tip, merge, and wip (e.g. 'type:stash', 'type:tip', 'type:merge', 'type:wip'). Use 'type:merge' for merge commits only, and 'type:wip' for queries about work in progress, uncommitted changes, or pending changes across worktrees.
 - 'ref:' - Search for commits reachable by a reference (branch, tag, commit) or reference range. Supports single refs (e.g. 'ref:main', 'ref:v1.0'), two-dot ranges (e.g. 'ref:main..feature' for commits in feature but not in main), three-dot ranges (e.g. 'ref:main...feature' for symmetric difference), and relative refs (e.g. 'ref:HEAD~5..HEAD'); maps to \`git log <ref>\`
 - 'after:' - Search for commits after a certain date or range (e.g. 'after:2023-01-01', 'after:"6 months ago"', 'after:"last Tuesday"', 'after:"noon"', 'after:"1 month 2 days ago"'); maps to \`git log --since=<value>\`
 - 'before:' - Search for commits before a certain date or range (e.g. 'before:2023-01-01', 'before:"6 months ago"', 'before:"yesterday"', 'before:"3PM GMT"'); maps to \`git log --until=<value>\`
 
-File and change values should be double-quoted. You can use multiple message, author, file, change, and ref operators at the same time if needed.
+File and change values should be double-quoted. You can use multiple message, author, committer, file, change, and ref operators at the same time if needed.
+
+The values of 'message:', '-message:', 'author:', and 'committer:' are compiled as case-insensitive POSIX extended regular expressions (ERE). Any regex metacharacters in the user's intended literal text -- \`( ) [ ] { } . * + ? | ^ $ \\\` -- MUST be escaped with a backslash unless they are intentionally being used as regex.
 
 Use 'ref:' when the query involves exploring commit history within or between specific references. Use temporal operators ('after:', 'before:') for date-based filtering. These operators can be combined when appropriate.
 
@@ -367,15 +332,72 @@ Temporal queries leverage Git's 'approxidate' parser, which understands relative
 The current date is \${date}
 \${context}
 
+When repository refs (branches, worktrees) are listed in the context above, only use ref: values from that list — never invent a ref name.
+If the context above includes a previously failed query and the error it produced, return a corrected query that fixes that error while preserving the original intent.
+
 User Query: \${query}
 
 \${instructions}
 
-Convert the user's natural language query into the appropriate search operators. Return only the search query string without any explanatory text. If the query cannot be converted to search operators, return the original query as a message search. For complex temporal expressions that might be ambiguous, prefer simpler, more reliable relative date formats.`,
+Convert the user's natural language query into the appropriate search operators.
+
+Respond ONLY with a JSON object in this exact shape:
+- "query": the converted search query using the operators above, as a single string
+- "explanation": one short sentence, in the user's own terms, describing how their query was interpreted
+- "mode": one of "highlight", "filter", or "select" — "highlight" is the default (find and mark matches); use "filter" when the user asks to see ONLY matching commits (e.g. "only my commits", "just show", "filter to"); use "select" when the user asks to be taken to a specific commit or location (e.g. "take me to", "jump to", "what commit is X at", "where is")
+- "alternates": an array of 0-2 alternative queries for the same intent — one broader, one narrower, whichever make sense; use an empty array if none do
+
+If the query cannot be converted to search operators, put the original text in "query" as a message search with all regex metacharacters escaped, and explain that in "explanation".
+
+For complex temporal expressions that might be ambiguous, prefer simpler, more reliable relative date formats.
+
+Example output structure:
+${generateSearchQueryExampleJson}
+
+Return only the JSON object and no other text — no code fences, no explanatory text.`,
 };
 
+/** Schema counterpart of the {@link generateSearchQuery} template's described output shape */
+export const generateSearchQuerySchema: AIResponseFormat = {
+	name: 'generate_search_query',
+	schema: {
+		type: 'object',
+		additionalProperties: false,
+		required: ['query', 'explanation', 'mode', 'alternates'],
+		properties: {
+			query: { type: 'string', description: 'The converted search query using the documented operators' },
+			explanation: {
+				type: 'string',
+				description: "One short sentence, in the user's own terms, describing how the query was interpreted",
+			},
+			mode: {
+				type: 'string',
+				enum: ['highlight', 'filter', 'select'],
+				description:
+					'How the query should be applied: highlight matches, filter to only matches, or select/jump to a specific commit',
+			},
+			alternates: {
+				type: 'array',
+				items: { type: 'string' },
+				description: 'Up to 2 alternative queries for the same intent; empty array if none make sense',
+			},
+		},
+	},
+};
+
+/** Example output block shared by the {@link generateCommits} template and its structural-retry prompt */
+export const generateCommitsExampleJson = `{
+   "commits": [
+      {
+         "message": "[commit message here]",
+         "explanation": "[detailed explanation of changes here]",
+         "hunks": [{"hunk": [index from hunk_map]}, {"hunk": [index from hunk_map]}]
+      }
+   ]
+}`;
+
 export const generateCommits: PromptTemplate<'generate-commits'> = {
-	id: 'generate-commits_v2',
+	id: 'generate-commits_v3',
 	variables: ['hunks', 'existingCommits', 'commitMessages', 'hunkMap', 'instructions'],
 	template: `You are an advanced AI programming assistant tasked with organizing code changes into commits. Your goal is to create a complete set of commits that are related, grouped logically, atomic, and easy to review. You will be working with individual code hunks and may have some existing commits that already have hunks assigned.
 
@@ -440,22 +462,14 @@ Follow these guidelines:
 
 8. Write a detailed explanation for each commit (separate from the commit message), walking through the changes in further detail as if explaining them to a reviewer.
 
-Output your complete commit organization as a JSON array. Each commit in the array should be an object with the following properties:
+Output your complete commit organization as a single JSON object with a "commits" property. The "commits" property is an array where each commit is an object with the following properties:
 - "message": A string containing the commit message
 - "explanation": A string with a detailed explanation of the changes in the commit. Note that this is separate from the commit message and provides more detail than in the message itself.
 - "hunks": An array of objects, each representing a hunk in the commit. Each hunk object should have:
   - "hunk": The hunk index (number) from the hunk_map
 
-Write the JSON structure below inside a <output> tag and include no other text:
-<output>
-[
-   {
-      "message": "[commit message here]",
-      "explanation": "[detailed explanation of changes here]",
-      "hunks": [{"hunk": [index from hunk_map]}, {"hunk": [index from hunk_map]}]
-   }
-]
-</output>
+Example output structure:
+${generateCommitsExampleJson}
 
 Remember:
 - Text in [] brackets above should be replaced with your own text, not including the brackets
@@ -466,8 +480,41 @@ Remember:
 
 \${instructions}
 
-Now, proceed with your analysis and organization of the commits. Return only the <output> tag and no other text.
+Now, proceed with your analysis and organization of the commits. Return only the JSON object and no other text — no code fences, no XML tags, and no explanatory text.
 `,
+};
+
+/** Schema counterpart of the {@link generateCommits} template's described output shape */
+export const generateCommitsSchema: AIResponseFormat = {
+	name: 'generate_commits',
+	schema: {
+		type: 'object',
+		additionalProperties: false,
+		required: ['commits'],
+		properties: {
+			commits: {
+				type: 'array',
+				items: {
+					type: 'object',
+					additionalProperties: false,
+					required: ['message', 'explanation', 'hunks'],
+					properties: {
+						message: { type: 'string', description: 'The commit message' },
+						explanation: { type: 'string', description: 'Detailed explanation of the changes' },
+						hunks: {
+							type: 'array',
+							items: {
+								type: 'object',
+								additionalProperties: false,
+								required: ['hunk'],
+								properties: { hunk: { type: 'integer', description: 'Hunk index from the hunk_map' } },
+							},
+						},
+					},
+				},
+			},
+		},
+	},
 };
 
 export const startWorkFromIssue: PromptTemplate<'start-work-issue'> = {
@@ -527,8 +574,11 @@ You can use GitKraken MCP tools to gather additional context about the repositor
 Now, proceed with your analysis and provide a comprehensive review of the PR. Return only the relevant information without any additional text.`,
 };
 
+// Shared by the reviewChanges and reviewDetail templates so line-citation rules can't drift apart
+const lineCitationGuidance = `- For "lines", copy the "start" and "end" numbers from the \`[NNNNN]\` annotations of the specific lines your finding concerns. Do not count, infer, or estimate — use only the annotated numbers. Removed lines (blank brackets \`[     ]\`) cannot be cited; pick the nearest surrounding new-file line instead. Anchor the range tightly to the lines the finding actually concerns; do not span an entire hunk. If a finding is not tied to specific lines, set "lines" to null; if not tied to a single file, set "file" to null`;
+
 export const reviewChanges: PromptTemplate<'review-changes'> = {
-	id: 'review-changes',
+	id: 'review-changes_v2',
 	variables: ['diff', 'message', 'context', 'instructions'],
 	template: `You are an expert code reviewer analyzing a set of code changes. Your goal is to identify meaningful issues — bugs, logic errors, security vulnerabilities, missing error handling, and potential regressions — while ignoring style preferences and linter-level concerns. Focus on problems a careful human reviewer would catch.
 
@@ -549,40 +599,117 @@ Author's description of the changes:
 Related work items (known pull requests and issues for this change set). Use these for *intent*: what the change is trying to accomplish. They are not authoritative spec — if a finding contradicts the stated intent, flag it rather than defer to it. May be empty.
 \${context}
 
-Produce a structured review in the following XML format. Include ONLY the XML tags described — no other text:
+Produce a structured review as a single JSON object with this exact structure:
 
-<overview>
-A concise 1-3 sentence summary of what these changes do and their overall quality. Note any systemic concerns.
-</overview>
-<focus-areas>
-<area severity="critical|warning|suggestion" files="comma-separated file paths">
-<label>Short title of the concern (under 60 chars)</label>
-<rationale>Why this matters — what could go wrong or what is suboptimal</rationale>
-<findings>
-<finding severity="critical|warning|suggestion" file="path/to/file.ts" lines="start-end">
-<title>Specific issue title</title>
-<description>Clear explanation of the problem and how to address it</description>
-</finding>
-</findings>
-</area>
-</focus-areas>
+{
+  "overview": "A concise 1-3 sentence summary of what these changes do and their overall quality. Note any systemic concerns.",
+  "focusAreas": [
+    {
+      "label": "Short title of the concern (under 60 chars)",
+      "rationale": "Why this matters — what could go wrong or what is suboptimal",
+      "severity": "critical|warning|suggestion",
+      "files": ["path/to/file.ts"],
+      "findings": [
+        {
+          "severity": "critical|warning|suggestion",
+          "title": "Specific issue title",
+          "description": "Clear explanation of the problem and how to address it",
+          "file": "path/to/file.ts",
+          "lines": { "start": 42, "end": 45 }
+        }
+      ]
+    }
+  ]
+}
 
 Guidelines:
 - Severity levels: "critical" = bugs, security issues, data loss risks; "warning" = logic concerns, missing error handling, potential regressions; "suggestion" = improvements, maintainability, performance
 - Group related findings into focus areas by theme, not by file
-- If changes look correct and well-structured, say so in the overview and include zero focus areas
+- If changes look correct and well-structured, say so in the overview and use an empty "focusAreas" array
 - 3-5 high-quality findings are better than 15 low-quality ones
-- For \`lines="start-end"\`, copy the numbers from the \`[NNNNN]\` annotations of the specific lines your finding concerns. Do not count, infer, or estimate — use only the annotated numbers. Removed lines (blank brackets \`[     ]\`) cannot be cited; pick the nearest surrounding new-file line instead. Anchor the range tightly to the lines the finding actually concerns; do not span an entire hunk.
+${lineCitationGuidance}
 - Do not flag style issues, naming preferences, or things a linter would catch
 - Base conclusions only on the code shown — do not speculate about unseen code
 
 \${instructions}
 
-Review the changes and produce the structured XML output above.`,
+Review the changes and return only the JSON object above — no other text, no code fences.`,
+};
+
+// Nullable so the same schema passes OpenAI strict mode (all properties required, optionals as
+// null-unions) and Anthropic's structured outputs (which allow optionals natively)
+const reviewFindingSchema: JSONSchema = {
+	type: 'object',
+	additionalProperties: false,
+	required: ['severity', 'title', 'description', 'file', 'lines'],
+	properties: {
+		severity: { type: 'string', enum: ['critical', 'warning', 'suggestion'] },
+		title: { type: 'string' },
+		description: { type: 'string' },
+		file: { type: ['string', 'null'] },
+		lines: {
+			type: ['object', 'null'],
+			additionalProperties: false,
+			required: ['start', 'end'],
+			properties: { start: { type: 'integer' }, end: { type: 'integer' } },
+		},
+	},
+};
+
+function buildReviewResultSchema(name: string, findings: JSONSchema): AIResponseFormat {
+	return {
+		name: name,
+		schema: {
+			type: 'object',
+			additionalProperties: false,
+			required: ['overview', 'focusAreas'],
+			properties: {
+				overview: { type: 'string' },
+				focusAreas: {
+					type: 'array',
+					items: {
+						type: 'object',
+						additionalProperties: false,
+						required: ['label', 'rationale', 'severity', 'files', 'findings'],
+						properties: {
+							label: { type: 'string' },
+							rationale: { type: 'string' },
+							severity: { type: 'string', enum: ['critical', 'warning', 'suggestion'] },
+							files: { type: 'array', items: { type: 'string' } },
+							findings: findings,
+						},
+					},
+				},
+			},
+		},
+	};
+}
+
+/** Schema counterpart of the {@link reviewChanges} template's output shape */
+export const reviewResultSchema: AIResponseFormat = buildReviewResultSchema('review_result', {
+	type: ['array', 'null'],
+	items: reviewFindingSchema,
+});
+
+/** Schema counterpart of the {@link reviewOverview} template — the manifest-only pass has no diffs,
+ *  so the grammar itself forbids findings (the template mandates `"findings": null`) */
+export const reviewOverviewSchema: AIResponseFormat = buildReviewResultSchema('review_overview', { type: 'null' });
+
+/** Schema counterpart of the {@link reviewDetail} template's output shape */
+export const reviewDetailSchema: AIResponseFormat = {
+	name: 'review_detail',
+	schema: {
+		type: 'object',
+		additionalProperties: false,
+		required: ['findings'],
+		properties: {
+			findings: { type: 'array', items: reviewFindingSchema },
+		},
+	},
 };
 
 export const reviewOverview: PromptTemplate<'review-overview'> = {
-	id: 'review-overview',
+	id: 'review-overview_v2',
 	variables: ['files', 'message', 'context', 'instructions'],
 	template: `You are an expert code reviewer performing an initial assessment of a set of code changes. You are given a file manifest (not full diffs) — use the file paths, change types, and line counts to identify which areas deserve closer inspection.
 
@@ -599,28 +726,47 @@ Author's description of the changes:
 Related work items (known pull requests and issues for this change set). Use these for *intent* — what the change is trying to accomplish — when ranking which areas deserve closer review. May be empty.
 \${context}
 
-Produce a structured assessment in the following XML format. Include ONLY the XML tags described — no other text:
+Produce a structured assessment as a single JSON object with this exact structure:
 
-<overview>
-A concise 1-3 sentence summary of the scope and nature of these changes based on the file manifest and description.
-</overview>
-<focus-areas>
-<area severity="critical|warning|suggestion" files="comma-separated file paths">
-<label>Short title of the area to inspect (under 60 chars)</label>
-<rationale>Why this area deserves closer review — based on the types of files changed, the volume of changes, and potential risk</rationale>
-</area>
-</focus-areas>
+{
+  "overview": "A concise 1-3 sentence summary of the scope and nature of these changes based on the file manifest and description.",
+  "focusAreas": [
+    {
+      "label": "Short title of the area to inspect (under 60 chars)",
+      "rationale": "Why this area deserves closer review — based on the types of files changed, the volume of changes, and potential risk",
+      "severity": "critical|warning|suggestion",
+      "files": ["path/to/file.ts"],
+      "findings": null
+    }
+  ]
+}
 
 Guidelines:
 - Severity reflects potential risk: "critical" = security-sensitive files, auth/crypto/payment paths, database migrations; "warning" = core logic changes, API changes, large modifications; "suggestion" = refactoring, config changes, documentation
 - Rank focus areas from highest to lowest risk
 - Group related files into focus areas by theme
 - Include 2-6 focus areas. If changes are very simple, fewer is fine
-- Do NOT include <findings> — those come in a later pass when full diffs are available
+- Always set "findings" to null — findings come in a later pass when full diffs are available
 
 \${instructions}
 
-Assess the changes and produce the structured XML output above.`,
+Assess the changes and return only the JSON object above — no other text, no code fences.`,
+};
+
+export const reviewRefine: PromptTemplate<'review-refine'> = {
+	id: 'review-refine_v2',
+	variables: ['instructions'],
+	template: `The user has follow-up guidance for the review you produced above. Produce an updated review that incorporates it:
+- Keep prior findings that remain valid — do not drop them just because the guidance doesn't mention them
+- Update or remove findings the guidance invalidates or de-prioritizes
+- Add any new findings the guidance surfaces
+- Return the COMPLETE updated review, not just the changes
+
+<~~instructions~~>
+\${instructions}
+</~~instructions~~>
+
+Produce the full updated review as a single JSON object in the same structure as your previous response. Return only the JSON object — no other text, no code fences.`,
 };
 
 export const addressReviewFindings: PromptTemplate<'address-review-findings'> = {
@@ -648,7 +794,7 @@ Guidelines:
 };
 
 export const reviewDetail: PromptTemplate<'review-detail'> = {
-	id: 'review-detail',
+	id: 'review-detail_v2',
 	variables: ['diff', 'overview', 'message', 'focusArea', 'context', 'instructions'],
 	template: `You are an expert code reviewer performing a detailed inspection of specific files that were flagged for closer review. You have the context from an initial overview assessment.
 
@@ -676,23 +822,28 @@ Code changes for the files in this focus area (Git diff format). Each non-header
 \${diff}
 </~~diff~~>
 
-Produce detailed findings in the following XML format. Include ONLY the XML tags — no other text:
+Produce detailed findings as a single JSON object with this exact structure:
 
-<findings>
-<finding severity="critical|warning|suggestion" file="path/to/file.ts" lines="start-end">
-<title>Specific issue title</title>
-<description>Clear explanation of the problem and how to address it</description>
-</finding>
-</findings>
+{
+  "findings": [
+    {
+      "severity": "critical|warning|suggestion",
+      "title": "Specific issue title",
+      "description": "Clear explanation of the problem and how to address it",
+      "file": "path/to/file.ts",
+      "lines": { "start": 42, "end": 45 }
+    }
+  ]
+}
 
 Guidelines:
 - Severity: "critical" = bugs, security, data loss; "warning" = logic concerns, error handling, regressions; "suggestion" = improvements, maintainability
-- For \`lines="start-end"\`, copy the numbers from the \`[NNNNN]\` annotations of the specific lines your finding concerns. Do not count, infer, or estimate — use only the annotated numbers. Removed lines (blank brackets \`[     ]\`) cannot be cited; pick the nearest surrounding new-file line instead. Anchor the range tightly to the lines the finding actually concerns; do not span an entire hunk.
+${lineCitationGuidance}
 - Be concrete — explain what the problem is and how to fix it
-- If the code in this area looks correct, return an empty <findings></findings> block
+- If the code in this area looks correct, return {"findings": []}
 - Do not flag style issues or things a linter would catch
 
 \${instructions}
 
-Inspect the diff for this focus area and produce the structured XML findings above.`,
+Inspect the diff for this focus area and return only the JSON object above — no other text, no code fences.`,
 };

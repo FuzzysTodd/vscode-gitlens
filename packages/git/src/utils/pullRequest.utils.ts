@@ -4,8 +4,71 @@ import type {
 	PullRequestRefs,
 	PullRequestRepositoryIdentityDescriptor,
 	PullRequestShape,
+	PullRequestSortField,
+	PullRequestSorting,
+	PullRequestStackInfo,
 } from '../models/pullRequest.js';
 import { shortenRevision } from './revision.utils.js';
+
+/** How many pull requests a merge action affects — unstacked is always 1; a stacked merge lands either
+ *  just this layer and everything below it (`position`), or the whole stack (`wholeStack`). The one
+ *  source every merge-confirmation and merge-action label counts from, so they can't drift apart.
+ *  Takes only the two fields it needs (not the full {@link PullRequestStackInfo}) since callers on the
+ *  webview side carry narrower serialized stack shapes. */
+export function getStackedMergeCount(
+	stack: Pick<PullRequestStackInfo, 'position' | 'size'> | undefined,
+	options?: { wholeStack?: boolean },
+): number {
+	if (stack == null) return 1;
+	return options?.wholeStack ? stack.size : stack.position;
+}
+
+/**
+ * How each sort field is read off a {@link PullRequestShape}, for the filtered PR search, which MERGES its
+ * relationship × state facets in the facade and so has to order the union itself instead of trusting the
+ * per-facet server order. Only the fields the shape carries appear — the same rule as `getIssueComparator`, and
+ * the reason {@link PullRequestSortField} is just these two.
+ */
+const pullRequestSortValues: Partial<
+	Record<PullRequestSortField, (pr: PullRequestShape) => number | Date | string | undefined>
+> = {
+	created: pr => pr.createdDate,
+	updated: pr => pr.updatedDate,
+};
+
+/**
+ * A comparator for one sort key over normalized pull requests, or `undefined` when the field isn't derivable
+ * from a {@link PullRequestShape} — the signal that the key is only honorable on a SINGLE-origin read where the
+ * provider already ordered the page. Missing values sort LAST in both directions (partitioned before any
+ * arithmetic so two missing values compare equal, exactly as `getIssueComparator` does).
+ *
+ * Note it orders whatever it is handed. Sorting a page already capped at the result ceiling does not make it the
+ * top N.
+ */
+export function getPullRequestComparator(
+	sort: PullRequestSorting,
+): ((a: PullRequestShape, b: PullRequestShape) => number) | undefined {
+	const [field, direction] = sort.split(':') as [PullRequestSortField, 'asc' | 'desc'];
+	const getValue = pullRequestSortValues[field];
+	if (getValue == null) return undefined;
+
+	return (a, b) => {
+		const left = toComparable(getValue(a));
+		const right = toComparable(getValue(b));
+		if (left == null || right == null) {
+			if (left == null && right == null) return 0;
+
+			return left == null ? 1 : -1;
+		}
+
+		const ordered = left < right ? -1 : left > right ? 1 : 0;
+		return direction === 'asc' ? ordered : -ordered;
+	};
+}
+
+function toComparable(value: number | Date | string | undefined): number | string | undefined {
+	return value instanceof Date ? value.getTime() : value;
+}
 
 export interface PullRequestUrlIdentity<TProvider extends string = string> {
 	provider?: TProvider;
@@ -39,6 +102,18 @@ export function getPullRequestIdentityFromMaybeUrl(search: string): PullRequestU
 	}
 
 	return prNumber == null ? undefined : { ownerAndRepo: undefined, prNumber: prNumber, provider: undefined };
+}
+
+/** A pull request's display number from its url, or `undefined` for a url naming no pull request. Anchors
+ *  on the provider's pull request path segment (GitHub `pull`, Bitbucket `pull-requests`, GitLab
+ *  `merge_requests`, Azure `pullrequest`) so a digit-leading owner (`github.com/1Password/x/pull/123`)
+ *  can't win. */
+export function getPullRequestNumberFromUrl(url: string): string | undefined {
+	// No loose fallback: `getPullRequestIdentityFromMaybeUrl` scans for any `/<digits>`, which reads a bare
+	// repository url like `github.com/1Password/sdk` as pull request #1. Callers that hold a real pull
+	// request fall back to its id instead, and the one that asks whether a pasted url names a pull request
+	// needs "no" for an answer.
+	return url.match(/(?:pull|pull-requests|merge_requests|pullrequest)\/(\d+)(?:\b|\/|$)/)?.[1];
 }
 
 export function getRepositoryIdentityForPullRequest(
@@ -92,7 +167,9 @@ export function serializePullRequest(value: PullRequest): PullRequestShape {
 		},
 		id: value.id,
 		nodeId: value.nodeId,
+		number: value.number,
 		title: value.title,
+		body: value.body,
 		url: value.url,
 		createdDate: value.createdDate,
 		updatedDate: value.updatedDate,
@@ -101,6 +178,7 @@ export function serializePullRequest(value: PullRequest): PullRequestShape {
 		author: {
 			id: value.author.id,
 			name: value.author.name,
+			username: value.author.username,
 			avatarUrl: value.author.avatarUrl,
 			url: value.author.url,
 		},
@@ -116,6 +194,9 @@ export function serializePullRequest(value: PullRequest): PullRequestShape {
 						sha: value.refs.head.sha,
 						branch: value.refs.head.branch,
 						url: value.refs.head.url,
+						cloneHttps: value.refs.head.cloneHttps,
+						cloneSsh: value.refs.head.cloneSsh,
+						isFork: value.refs.head.isFork,
 					},
 					base: {
 						exists: value.refs.base.exists,
@@ -124,6 +205,9 @@ export function serializePullRequest(value: PullRequest): PullRequestShape {
 						sha: value.refs.base.sha,
 						branch: value.refs.base.branch,
 						url: value.refs.base.url,
+						cloneHttps: value.refs.base.cloneHttps,
+						cloneSsh: value.refs.base.cloneSsh,
+						isFork: value.refs.base.isFork,
 					},
 					isCrossRepository: value.refs.isCrossRepository,
 				}
@@ -135,13 +219,24 @@ export function serializePullRequest(value: PullRequest): PullRequestShape {
 		thumbsUpCount: value.thumbsUpCount,
 		reviewDecision: value.reviewDecision,
 		reviewRequests: value.reviewRequests,
+		latestReviews: value.latestReviews,
 		assignees: value.assignees,
+		authoredByMe: value.authoredByMe,
 		project: value.project
 			? {
 					id: value.project.id,
 					name: value.project.name,
 					resourceId: value.project.resourceId,
 					resourceName: value.project.resourceName,
+				}
+			: undefined,
+		stack: value.stack
+			? {
+					id: value.stack.id,
+					number: value.stack.number,
+					size: value.stack.size,
+					position: value.stack.position,
+					baseRef: value.stack.baseRef,
 				}
 			: undefined,
 	};

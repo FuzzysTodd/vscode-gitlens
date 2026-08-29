@@ -13,16 +13,9 @@ import {
 import { filterMap } from '@gitlens/utils/array.js';
 import { fuzzyFilter } from '@gitlens/utils/fuzzy.js';
 import { whitespaceRegex } from '../../../../../constants.js';
-import {
-	ChooseAuthorRequest,
-	ChooseComparisonRequest,
-	ChooseFileRequest,
-	ChooseRefRequest,
-	SearchHistoryDeleteRequest,
-	SearchHistoryGetRequest,
-	SearchHistoryStoreRequest,
-} from '../../../../plus/graph/protocol.js';
-import { ipcContext } from '../../contexts/ipc.js';
+import type { GraphSearchRelaxation } from '../../../../plus/graph/protocol.js';
+import { searchActionsContext } from '../../../plus/graph/search/searchContext.js';
+import { blurActiveElement } from '../../../shared/focus.js';
 import type { CompletionItem, CompletionSelectEvent, GlAutocomplete } from '../autocomplete/autocomplete.js';
 import { GlElement } from '../element.js';
 import type {
@@ -37,9 +30,11 @@ import {
 	structuredSearchAutocompleteCommand,
 } from './models.js';
 import '../button.js';
+import '../actions/action-nav.js';
 import '../autocomplete/autocomplete.js';
 import '../code-icon.js';
 import '../copy-container.js';
+import '../overlays/tooltip.js';
 
 export interface SearchNavigationEventDetail {
 	direction: 'first' | 'previous' | 'next' | 'last';
@@ -48,6 +43,11 @@ export interface SearchNavigationEventDetail {
 export interface SearchModeChangeEventDetail {
 	searchMode: 'normal' | 'filter';
 	useNaturalLanguage: boolean;
+	/** Whether `searchMode` is a deliberate user choice (filter-toggle click, an explicit exit-filter
+	 *  action) rather than a ride-along of the current state (an NL on/off toggle reporting whatever
+	 *  the filter happens to be — possibly an NL-forced value that must never be persisted as the
+	 *  user's preference nor supersede its pending restore). */
+	explicitMode: boolean;
 }
 
 export interface SearchCancelEventDetail {
@@ -66,6 +66,7 @@ declare global {
 		'gl-search-cancel': CustomEvent<SearchCancelEventDetail>;
 		'gl-search-pause': CustomEvent<void>;
 		'gl-search-resume': CustomEvent<void>;
+		'gl-search-exit': CustomEvent<void>;
 	}
 }
 
@@ -81,19 +82,18 @@ export class GlSearchInput extends GlElement {
 			--gl-search-input-foreground: var(--vscode-input-foreground);
 			--gl-search-input-border: var(--vscode-input-border, transparent);
 			--gl-search-input-placeholder: var(
-				--vscode-editor-placeholder\\\.foreground,
+				--vscode-editor-placeholder\\.foreground,
 				var(--vscode-input-placeholderForeground)
 			);
 			--gl-search-input-buttons-left: 1;
 			--gl-search-input-buttons-right: 4;
 
-			display: inline-flex;
-			flex-direction: row;
-			align-items: center;
-			gap: 0.4rem;
 			position: relative;
-
+			display: inline-flex;
 			flex: auto 1 1;
+			flex-direction: row;
+			gap: var(--gl-space-4);
+			align-items: center;
 		}
 
 		:host([data-ai-allowed]) {
@@ -114,25 +114,27 @@ export class GlSearchInput extends GlElement {
 
 		label {
 			display: flex;
-			justify-content: center;
+			gap: var(--gl-space-2);
 			align-items: center;
-			gap: 0.2rem;
+			justify-content: center;
 			width: 3.2rem;
 			height: 2.4rem;
 			color: var(--gl-search-input-foreground);
 			cursor: pointer;
-			border-radius: 3px;
+			border-radius: var(--gl-radius-sm);
 		}
+
 		label:hover {
 			background-color: var(--vscode-toolbar-hoverBackground);
 		}
+
 		label:focus {
-			outline: 1px solid var(--vscode-focusBorder);
+			outline: var(--gl-border-width) solid var(--vscode-focusBorder);
 			outline-offset: -1px;
 		}
 
 		.icon-small {
-			font-size: 1rem;
+			font-size: var(--gl-font-micro);
 		}
 
 		.field {
@@ -143,22 +145,21 @@ export class GlSearchInput extends GlElement {
 		input {
 			width: 100%;
 			height: 2.7rem;
-			background-color: var(--gl-search-input-background);
-			color: var(--gl-search-input-foreground);
-			border: 1px solid var(--gl-search-input-border);
-			border-radius: var(--gl-input-border-radius);
-			padding-top: 0;
-			padding-bottom: 1px;
-			padding-left: calc(0.7rem + calc(1.96rem * var(--gl-search-input-buttons-left)));
-			padding-right: calc(0.7rem + calc(1.96rem * var(--gl-search-input-buttons-right)));
+			padding: 0 calc(0.7rem + calc(1.96rem * var(--gl-search-input-buttons-right))) 1px
+				calc(0.7rem + calc(1.96rem * var(--gl-search-input-buttons-left)));
 			font-family: inherit;
 			font-size: inherit;
+			color: var(--gl-search-input-foreground);
+			background-color: var(--gl-search-input-background);
+			border: var(--gl-border-width) solid var(--gl-search-input-border);
+			border-radius: var(--gl-input-border-radius);
 		}
 
 		input:focus {
-			outline: 1px solid var(--vscode-focusBorder);
+			outline: var(--gl-border-width) solid var(--vscode-focusBorder);
 			outline-offset: -1px;
 		}
+
 		input::placeholder {
 			color: var(--gl-search-input-placeholder);
 		}
@@ -170,6 +171,7 @@ export class GlSearchInput extends GlElement {
 		input[aria-valid='false'] {
 			border-color: var(--vscode-inputValidation-errorBorder);
 		}
+
 		input[aria-valid='false']:focus {
 			outline-color: var(--vscode-inputValidation-errorBorder);
 		}
@@ -178,20 +180,34 @@ export class GlSearchInput extends GlElement {
 			position: absolute;
 			top: 100%;
 			left: 0;
+
+			/* Same tier as the gl-autocomplete dropdown (its display: contents host puts both in
+   this stacking context) — the tie keeps the later-in-DOM autocomplete on top, as before */
+			z-index: var(--gl-z-popover);
 			width: 100%;
-			padding: 0.4rem;
-			transform: translateY(-0.1rem);
-			z-index: 1000;
-			background-color: var(--vscode-inputValidation-infoBackground);
-			border: 1px solid var(--vscode-inputValidation-infoBorder);
-			color: var(--gl-search-input-foreground);
-			font-size: 1.2rem;
+			padding: var(--gl-space-4);
+			font-size: var(--gl-font-md);
 			line-height: 1.4;
+			color: var(--gl-search-input-foreground);
+			background-color: var(--vscode-inputValidation-infoBackground);
+			border: var(--gl-border-width) solid var(--vscode-inputValidation-infoBorder);
+			transform: translateY(-0.1rem);
 		}
 
 		input[aria-valid='false'] ~ .message {
 			background-color: var(--vscode-inputValidation-errorBackground);
 			border-color: var(--vscode-inputValidation-errorBorder);
+		}
+
+		.message-action {
+			margin-left: var(--gl-space-8);
+			color: var(--vscode-textLink-foreground);
+			text-decoration: underline;
+			cursor: pointer;
+		}
+
+		.message-action:hover {
+			color: var(--vscode-textLink-activeForeground);
 		}
 
 		/* Input highlighting overlay */
@@ -203,42 +219,39 @@ export class GlSearchInput extends GlElement {
 
 		.input-highlight {
 			position: absolute;
-			top: 0;
-			left: 0;
-			right: 0;
-			bottom: 0;
-			pointer-events: none;
-			white-space: pre;
-			overflow: hidden;
+			inset: 0;
 			box-sizing: border-box;
 			height: 2.7rem;
-			border: 1px solid transparent;
-			border-radius: var(--gl-input-border-radius);
+
+			/* Match input padding exactly, but using margins to ensure clipping */
+			margin: 0 calc(0.7rem + calc(1.96rem * var(--gl-search-input-buttons-right))) 1px
+				calc(0.7rem + calc(1.96rem * var(--gl-search-input-buttons-left)));
+			overflow: hidden;
 			font-family: inherit;
 			font-size: inherit;
 			line-height: 2.7rem;
 			color: var(--gl-search-input-foreground);
-			/* Match input padding exactly, but using margins to ensure clipping */
-			margin-top: 0;
-			margin-bottom: 1px;
-			margin-left: calc(0.7rem + calc(1.96rem * var(--gl-search-input-buttons-left)));
-			margin-right: calc(0.7rem + calc(1.96rem * var(--gl-search-input-buttons-right)));
+			white-space: pre;
+			pointer-events: none;
+			border: var(--gl-border-width) solid transparent;
+			border-radius: var(--gl-input-border-radius);
 		}
 
 		/* CSS Custom Highlight API for operators */
 		::highlight(search-operators) {
-			color: var(--vscode-textLink-foreground);
 			font-weight: 600;
+			color: var(--vscode-textLink-foreground);
 		}
 
 		/* Input with transparent background and text to show overlay */
 		.input-container input {
 			position: relative;
 			z-index: 1;
-			background: transparent;
+
 			/* Make input text invisible so only overlay shows */
 			color: transparent;
 			caret-color: var(--gl-search-input-foreground);
+			background: transparent;
 		}
 
 		/* In natural language mode, show the input text normally */
@@ -255,30 +268,36 @@ export class GlSearchInput extends GlElement {
 			position: absolute;
 			top: 0.2rem;
 			right: 0.2rem;
+			z-index: 2; /* Above input and overlay */
 			display: inline-flex;
 			flex-direction: row;
 			gap: 0.1rem;
-			z-index: 2; /* Above input and overlay */
+		}
+
+		.controls action-nav {
+			display: contents;
 		}
 
 		.controls.controls__start {
 			--button-compact-padding: 0.4rem;
 			--button-line-height: 1;
 
-			left: 0.2rem;
 			right: auto;
+			left: 0.2rem;
 		}
 
 		button {
 			padding: 0;
 			color: var(--gl-search-input-foreground);
-			border: 1px solid transparent;
 			background: none;
+			border: var(--gl-border-width) solid transparent;
 		}
+
 		button:focus:not([disabled]) {
-			outline: 1px solid var(--vscode-focusBorder);
+			outline: var(--gl-border-width) solid var(--vscode-focusBorder);
 			outline-offset: -1px;
 		}
+
 		button:not([disabled]) {
 			cursor: pointer;
 		}
@@ -290,28 +309,28 @@ export class GlSearchInput extends GlElement {
 
 		code {
 			display: inline-block;
-			backdrop-filter: brightness(1.3);
-			border-radius: 3px;
-			padding: 0px 4px;
+			padding: 0 var(--gl-space-4);
 			font-family: var(--vscode-editor-font-family);
+			border-radius: var(--gl-radius-sm);
+			backdrop-filter: brightness(1.3);
 		}
 
 		/* .popover {
-			margin-left: -0.25rem;
-		}
-		.popover::part(body) {
-			padding: 0 0 0.5rem 0;
-			font-size: var(--vscode-font-size);
-			background-color: var(--vscode-menu-background);
-		} */
+margin-left: -0.25rem;
+}
+.popover::part(body) {
+padding: 0 0 0.5rem 0;
+font-size: var(--vscode-font-size);
+background-color: var(--vscode-menu-background);
+} */
 
 		gl-copy-container {
 			--copy-padding: 0 0.1rem;
 		}
 	`;
 
-	@consume({ context: ipcContext })
-	private readonly _ipc!: typeof ipcContext.__context__;
+	@consume({ context: searchActionsContext, subscribe: true })
+	private readonly _searchActions!: typeof searchActionsContext.__context__;
 
 	@query('input') input!: HTMLInputElement;
 
@@ -325,6 +344,18 @@ export class GlSearchInput extends GlElement {
 	@property({ type: Boolean }) searching = false;
 	@property({ type: Boolean }) hasMoreResults = false;
 	@property({ type: Boolean }) showAutocompleteOnFocus = true;
+	/** Renders `errorMessage` in calm/info styling instead of error/red. */
+	@property({ type: Boolean }) errorCalm = false;
+	/** The active search's pattern failed to compile as regex and matched literally instead. */
+	@property({ type: Boolean }) fallbackActive = false;
+	@property({ type: String }) fallbackDetail = '';
+	/** The settled search used the literal fallback and found nothing. */
+	@property({ type: Boolean }) showFallbackHelper = false;
+	@property({ type: Array }) relaxations: GraphSearchRelaxation[] = [];
+	/** The settled NL search found nothing but has counted relaxation offers — see {@link renderMessage}. */
+	@property({ type: Boolean }) showRelaxationsHelper = false;
+	/** The active error is an unavailable-AI NL failure — offers a "Search as text instead" action. */
+	@property({ type: Boolean }) showSearchAsTextHelper = false;
 	@property({ type: String })
 	get value() {
 		return this._value;
@@ -339,7 +370,9 @@ export class GlSearchInput extends GlElement {
 
 	@state() private errorMessage = '';
 	@state() private processedQuery: string | undefined;
+	@state() private explanation: string | undefined;
 	@state() private _value = '';
+	@state() private repairing = false;
 
 	// Autocomplete state
 	@state() private autocompleteOpen = false;
@@ -381,8 +414,6 @@ export class GlSearchInput extends GlElement {
 		return `${this.label} commits (press Enter to search, ↑↓ for history), e.g. @me after:1.week.ago file:*.ts`;
 	}
 
-	private repoPath: string | undefined;
-
 	private _searchHistory: SearchQuery[] = [];
 	private searchHistoryPos = -1;
 	private get searchHistory() {
@@ -397,8 +428,8 @@ export class GlSearchInput extends GlElement {
 	override connectedCallback(): void {
 		super.connectedCallback?.();
 
-		void this._ipc
-			.sendRequest(SearchHistoryGetRequest, { repoPath: this.repoPath })
+		void this._searchActions
+			.getHistory()
 			.then(response => (this.searchHistory = response.history))
 			.catch(() => {});
 	}
@@ -465,13 +496,18 @@ export class GlSearchInput extends GlElement {
 		// Clear all search-related UI state
 		this.errorMessage = '';
 		this.processedQuery = undefined;
+		this.explanation = undefined;
 		this.searchHistoryPos = -1;
 		this.originalHistoryState = undefined;
 
 		// Emit cancel to backend - idempotent, safe to always call
 		this.emit('gl-search-cancel', { preserveResults: false });
 
-		// Send empty search immediately to clear results
+		// Send empty search immediately to clear results. Re-assert emptiness first: the cancel
+		// dispatch above runs handlers synchronously, and a handler that imperatively rewrites box
+		// props would otherwise leak into this emission (which re-reads live props) — resurrecting
+		// and re-running the query the user just cleared.
+		this._value = '';
 		this.onSearchChanged(true);
 		this._lastSearch = undefined;
 	}
@@ -500,6 +536,7 @@ export class GlSearchInput extends GlElement {
 			// Input has content - update UI state
 			this.errorMessage = '';
 			this.processedQuery = undefined;
+			this.explanation = undefined;
 			this.canDeleteHistoryItem = false;
 
 			// Reset history position when user types something different
@@ -777,6 +814,8 @@ export class GlSearchInput extends GlElement {
 	 * Handles picker commands (author, ref, file/folder)
 	 */
 	private async handlePickerCommand(command: SearchCompletionCommand) {
+		blurActiveElement();
+
 		const value = this.value;
 		const operator = this.cursorOperator?.operator;
 		if (!operator) return;
@@ -787,11 +826,11 @@ export class GlSearchInput extends GlElement {
 		try {
 			switch (command.command) {
 				case 'pick-author': {
-					const result = await this._ipc.sendRequest(ChooseAuthorRequest, {
-						title: 'Search by Author',
-						placeholder: 'Choose contributors to include commits from',
-						picked: currentValue ? [currentValue] : undefined,
-					});
+					const result = await this._searchActions.chooseAuthor(
+						'Search by Author',
+						'Choose contributors to include commits from',
+						currentValue ? [currentValue] : undefined,
+					);
 
 					if (result.authors?.length) {
 						this.insertPickerValues(result.authors, operator, command.multi ?? false);
@@ -801,13 +840,15 @@ export class GlSearchInput extends GlElement {
 				}
 
 				case 'pick-ref': {
-					const result = await this._ipc.sendRequest(ChooseRefRequest, {
-						title: 'Search by Branch or Tag',
-						placeholder: 'Choose a branch or tag to filter by',
-						allowedAdditionalInput: { range: false, rev: false },
-						include: ['branches', 'tags', 'HEAD'],
-						picked: currentValue || undefined,
-					});
+					const result = await this._searchActions.chooseRef(
+						'Search by Branch or Tag',
+						'Choose a branch or tag to filter by',
+						{
+							allowedAdditionalInput: { range: false, rev: false },
+							include: ['branches', 'tags', 'HEAD'],
+							picked: currentValue || undefined,
+						},
+					);
 
 					if (result?.name) {
 						this.insertPickerValues([result.name], operator, command.multi ?? false);
@@ -817,10 +858,7 @@ export class GlSearchInput extends GlElement {
 				}
 
 				case 'pick-comparison': {
-					const result = await this._ipc.sendRequest(ChooseComparisonRequest, {
-						title: 'Search by Comparison Range',
-						placeholder: 'Choose two refs to compare',
-					});
+					const result = await this._searchActions.chooseComparison('Search by Comparison Range');
 
 					if (result?.range) {
 						this.insertPickerValues([result.range], operator, false);
@@ -831,12 +869,14 @@ export class GlSearchInput extends GlElement {
 
 				case 'pick-file':
 				case 'pick-folder': {
-					const result = await this._ipc.sendRequest(ChooseFileRequest, {
-						title: command.command === 'pick-file' ? 'Search by File' : 'Search by Folder',
-						type: command.command === 'pick-file' ? 'file' : 'folder',
-						openLabel: 'Add to Search',
-						picked: currentValue ? [currentValue] : undefined,
-					});
+					const result = await this._searchActions.chooseFile(
+						command.command === 'pick-file' ? 'Search by File' : 'Search by Folder',
+						command.command === 'pick-file' ? 'file' : 'folder',
+						{
+							openLabel: 'Add to Search',
+							picked: currentValue ? [currentValue] : undefined,
+						},
+					);
 
 					if (result.files?.length) {
 						this.insertPickerValues(result.files, operator, command.multi ?? false);
@@ -941,11 +981,13 @@ export class GlSearchInput extends GlElement {
 
 	/** Opens the author picker and appends `author:<email>` terms to the query. */
 	async pickAuthors(): Promise<void> {
+		blurActiveElement();
+
 		try {
-			const result = await this._ipc.sendRequest(ChooseAuthorRequest, {
-				title: 'Search by Author',
-				placeholder: 'Choose contributors to include commits from',
-			});
+			const result = await this._searchActions.chooseAuthor(
+				'Search by Author',
+				'Choose contributors to include commits from',
+			);
 			this.appendOperatorValues('author:', result.authors ?? []);
 		} catch {
 			this.input.focus();
@@ -954,13 +996,17 @@ export class GlSearchInput extends GlElement {
 
 	/** Opens the ref picker and appends a `ref:<name>` term to the query. */
 	async pickRefs(): Promise<void> {
+		blurActiveElement();
+
 		try {
-			const result = await this._ipc.sendRequest(ChooseRefRequest, {
-				title: 'Search by Branch or Tag',
-				placeholder: 'Choose a branch or tag to filter by',
-				allowedAdditionalInput: { range: false, rev: false },
-				include: ['branches', 'tags', 'HEAD'],
-			});
+			const result = await this._searchActions.chooseRef(
+				'Search by Branch or Tag',
+				'Choose a branch or tag to filter by',
+				{
+					allowedAdditionalInput: { range: false, rev: false },
+					include: ['branches', 'tags', 'HEAD'],
+				},
+			);
 			this.appendOperatorValues('ref:', result?.name ? [result.name] : []);
 		} catch {
 			this.input.focus();
@@ -969,10 +1015,10 @@ export class GlSearchInput extends GlElement {
 
 	/** Opens the file picker and appends `file:<path>` terms to the query. */
 	async pickFiles(): Promise<void> {
+		blurActiveElement();
+
 		try {
-			const result = await this._ipc.sendRequest(ChooseFileRequest, {
-				title: 'Search by File',
-				type: 'file',
+			const result = await this._searchActions.chooseFile('Search by File', 'file', {
 				openLabel: 'Add to Search',
 			});
 			this.appendOperatorValues('file:', result.files ?? []);
@@ -1083,6 +1129,7 @@ export class GlSearchInput extends GlElement {
 		this.emit('gl-search-modechange', {
 			searchMode: this.filter ? 'filter' : 'normal',
 			useNaturalLanguage: this.naturalLanguage,
+			explicitMode: true,
 		});
 		// Don't trigger a new search - just update the mode for future searches
 		// and let the UI update based on the current results
@@ -1096,11 +1143,16 @@ export class GlSearchInput extends GlElement {
 
 	private updateNaturalLanguage(useNaturalLanguage: boolean) {
 		this.processedQuery = undefined;
+		this.explanation = undefined;
 
 		this.naturalLanguage = useNaturalLanguage && this.aiAllowed;
+		// `searchMode` here is a report of the current state, not a choice — this can fire without any
+		// user gesture (`willUpdate` drops NL mode when AI becomes unavailable), and `filter` may hold
+		// an NL-forced value.
 		this.emit('gl-search-modechange', {
 			searchMode: this.filter ? 'filter' : 'normal',
 			useNaturalLanguage: this.naturalLanguage,
+			explicitMode: false,
 		});
 
 		// Update autocomplete to reflect the new mode
@@ -1137,6 +1189,11 @@ export class GlSearchInput extends GlElement {
 				} else if (this.searching) {
 					// If search is running, pause it (preserve results)
 					this.emit('gl-search-pause');
+				} else {
+					// Nothing left to dismiss — announce that the user is leaving the box so the host can put
+					// focus somewhere useful. The query is preserved; clearing stays on the `×` control. Still
+					// consumed either way, so the key can't also act on whatever else is listening.
+					this.emit('gl-search-exit');
 				}
 
 				return true;
@@ -1363,21 +1420,24 @@ export class GlSearchInput extends GlElement {
 		this.errorMessage = errorMessage;
 	}
 
-	async logSearch(search: SearchQuery): Promise<void> {
+	async logSearch(search: SearchQuery, options?: { store?: boolean }): Promise<void> {
 		// Store exactly what user entered/sees (NL form or structured form)
 		let queryToStore;
 		if (search.naturalLanguage) {
 			if (typeof search.naturalLanguage === 'boolean') {
 				queryToStore = search.query;
 				this.processedQuery = undefined;
+				this.explanation = undefined;
 				this.errorMessage = '';
 			} else if (search.naturalLanguage.error) {
 				queryToStore = search.naturalLanguage.query;
 				this.processedQuery = undefined;
+				this.explanation = undefined;
 				this.errorMessage = search.naturalLanguage.error;
 			} else {
 				queryToStore = search.naturalLanguage.query;
 				this.processedQuery = search.naturalLanguage.processedQuery;
+				this.explanation = search.naturalLanguage.explanation;
 				this.errorMessage = '';
 			}
 		} else {
@@ -1388,13 +1448,12 @@ export class GlSearchInput extends GlElement {
 			queryToStore = search.query;
 		}
 
+		if (options?.store === false) return;
+
 		const searchToStore: SearchQuery = { ...search, query: queryToStore };
 
 		try {
-			const response = await this._ipc.sendRequest(SearchHistoryStoreRequest, {
-				repoPath: this.repoPath,
-				search: searchToStore,
-			});
+			const response = await this._searchActions.storeHistory(searchToStore);
 			this.searchHistory = response.history;
 			this.searchHistoryPos = -1;
 		} catch {}
@@ -1402,10 +1461,7 @@ export class GlSearchInput extends GlElement {
 
 	private async deleteHistoryEntry(query: string): Promise<void> {
 		try {
-			const response = await this._ipc.sendRequest(SearchHistoryDeleteRequest, {
-				repoPath: this.repoPath,
-				query: query,
-			});
+			const response = await this._searchActions.deleteHistory(query);
 			this.searchHistory = response.history;
 			// Move to next entry if available, otherwise restore original value
 			if (this.searchHistoryPos >= 0 && this.searchHistoryPos < this.searchHistory.length) {
@@ -1444,31 +1500,44 @@ export class GlSearchInput extends GlElement {
 		// The caller (graph-app.ts) will trigger the search if needed
 	}
 
+	/** Restores only the filter toggle, imperatively — a change-memoized `?filter` binding can't be
+	 *  relied on to undo a forced value. Deliberately narrow: it must never touch the query text,
+	 *  because it runs inside `cancelSearch`'s clear sequence, and writing the old query back there
+	 *  resurrects the text the user just cleared — which the trailing change emission then re-runs
+	 *  as a live search. */
+	setExternalFilter(filter: boolean): void {
+		this.filter = filter;
+	}
+
 	override render(): unknown {
 		return html`<div class="field">
 				<div class="controls controls__start">
-					<gl-button
-						appearance="input"
-						role="checkbox"
-						aria-checked="${this.filter}"
-						tooltip="Filter Commits"
-						aria-label="Filter Commits"
-						@click="${this.handleFilterClick}"
-					>
-						<code-icon icon="list-filter"></code-icon>
-					</gl-button>
-					${this.aiAllowed
-						? html`<gl-button
-								appearance="input"
-								role="checkbox"
-								aria-checked="${this.naturalLanguage}"
-								tooltip="Natural Language Search (AI Preview)"
-								aria-label="Natural Language Search (AI Preview)"
-								@click="${this.handleNaturalLanguageClick}"
-							>
-								<code-icon icon="sparkle"></code-icon>
-							</gl-button>`
-						: nothing}
+					<action-nav role="toolbar" aria-label="Search mode">
+						<gl-button
+							appearance="input"
+							role="checkbox"
+							aria-checked="${this.filter}"
+							tooltip="Filter Commits"
+							aria-label="Filter Commits"
+							@click="${this.handleFilterClick}"
+						>
+							<code-icon icon="list-filter"></code-icon>
+						</gl-button>
+						${
+							this.aiAllowed
+								? html`<gl-button
+										appearance="input"
+										role="checkbox"
+										aria-checked="${this.naturalLanguage}"
+										tooltip="Natural Language Search (AI Preview)"
+										aria-label="Natural Language Search (AI Preview)"
+										@click="${this.handleNaturalLanguageClick}"
+									>
+										<code-icon icon="sparkle"></code-icon>
+									</gl-button>`
+								: nothing
+						}
+					</action-nav>
 				</div>
 				<div class="input-container">
 					<div class="input-highlight" aria-hidden="true">${this.renderHighlightedText()}</div>
@@ -1488,7 +1557,7 @@ export class GlSearchInput extends GlElement {
 						spellcheck="false"
 						placeholder="${this.placeholder}"
 						.value="${live(this.value ?? '')}"
-						aria-valid="${!this.errorMessage}"
+						aria-valid="${!this.errorMessage || this.errorCalm}"
 						@input="${this.handleInput}"
 						@keydown="${this.handleShortcutKeys}"
 						@keyup="${this.handleKeyup}"
@@ -1497,22 +1566,25 @@ export class GlSearchInput extends GlElement {
 						@blur="${this.handleInputBlur}"
 						@scroll="${this.handleInputScroll}"
 					/>
-					${this.errorMessage ? html`<div class="message">${this.errorMessage}</div>` : nothing}
-					${this.renderAutocomplete()}
+					${this.renderMessage()} ${this.renderAutocomplete()}
 				</div>
 			</div>
 			<div class="controls">
-				${this.value
-					? html`<gl-button
-							appearance="input"
-							tooltip="Clear"
-							aria-label="Clear"
-							@click="${this.handleClear}"
-						>
-							<code-icon icon="close"></code-icon>
-						</gl-button>`
-					: nothing}
-				${this.renderSearchOptions()}
+				<action-nav role="toolbar" aria-label="Search options">
+					${
+						this.value
+							? html`<gl-button
+									appearance="input"
+									tooltip="Clear"
+									aria-label="Clear"
+									@click="${this.handleClear}"
+								>
+									<code-icon icon="close"></code-icon>
+								</gl-button>`
+							: nothing
+					}
+					${this.renderSearchOptions()}
+				</action-nav>
 			</div>`;
 	}
 
@@ -1601,6 +1673,117 @@ export class GlSearchInput extends GlElement {
 		return this.value;
 	}
 
+	/**
+	 * Renders the search box's message area: the zero-result fallback helper takes priority (it isn't an
+	 * error — the search succeeded, just matched nothing), then the plain error/info message.
+	 */
+	private renderMessage() {
+		if (this.showFallbackHelper) {
+			return html`<div class="message">
+				No results — pattern isn't valid regex
+				<a href="#" class="message-action" @click="${this.handleMatchLiterallyClick}">Match literally</a>
+				${
+					this.aiAllowed && !this.naturalLanguage
+						? this.repairing
+							? html`<span class="message-action" aria-disabled="true"
+									><code-icon icon="loading" modifier="spin"></code-icon> Fixing…</span
+								>`
+							: html`<a href="#" class="message-action" @click="${this.handleFixWithAiClick}"
+									>Fix with AI</a
+								>`
+						: nothing
+				}
+			</div>`;
+		}
+
+		if (this.showRelaxationsHelper && this.relaxations.length) {
+			return html`<div class="message">
+				No matches —
+				${this.relaxations
+					.slice(0, 3)
+					.map(
+						relaxation =>
+							html`<a
+								href="#"
+								class="message-action"
+								@click="${(e: Event) => this.handleRelaxationClick(e, relaxation)}"
+								>${relaxation.count}${relaxation.capped ? '+' : ''} ${relaxation.label}</a
+							>`,
+					)}
+			</div>`;
+		}
+
+		if (!this.errorMessage) return nothing;
+
+		return html`<div class="message">
+			${this.errorMessage}
+			${
+				this.showSearchAsTextHelper
+					? html`<a href="#" class="message-action" @click="${this.handleSearchAsTextClick}"
+							>Search as text instead</a
+						>`
+					: nothing
+			}
+		</div>`;
+	}
+
+	/** "Match literally" action: flips the regex toggle off through the same handler a user click takes,
+	 *  so the change event and search refresh fire naturally. */
+	private handleMatchLiterallyClick(e: Event) {
+		e.preventDefault();
+		this.handleMatchRegex(e);
+	}
+
+	/** "Search as text instead" action (unavailable-AI NL failure): drops NL mode — and regex matching,
+	 *  visibly, since an English sentence can be VALID regex with the wrong meaning ("yesterday?") — then
+	 *  re-submits the same text as a plain text search. */
+	private handleSearchAsTextClick(e: Event) {
+		e.preventDefault();
+		this.updateNaturalLanguage(false);
+		this.errorMessage = '';
+		if (this.matchRegex) {
+			this.handleMatchRegex(e);
+		} else {
+			this.onSearchChanged(true);
+		}
+	}
+
+	/** "Fix with AI" action (manual zero-result helper): asks the host to repair the pattern, then puts
+	 *  the suggestion into the box as visible, editable text and searches. */
+	private async handleFixWithAiClick(e: Event): Promise<void> {
+		e.preventDefault();
+		if (this.repairing) return;
+
+		this.repairing = true;
+		const requested = this.value;
+		try {
+			const rsp = await this._searchActions.repair(this.value, this.fallbackDetail || undefined);
+			// The user kept typing during the round-trip — leave their in-progress edit alone.
+			if (this.value !== requested) return;
+
+			if (rsp.query) {
+				this.value = rsp.query;
+				this.errorMessage = '';
+				this.onSearchChanged(true);
+			} else if (rsp.error) {
+				this.errorMessage = rsp.error;
+			}
+		} catch {
+			// leave the existing helper row in place
+		} finally {
+			this.repairing = false;
+		}
+	}
+
+	/** A relaxation chip: replaces the search with the counted broader query — visible and editable,
+	 *  NL toggle off — through the same apply path "Fix with AI" uses. */
+	private handleRelaxationClick(e: Event, relaxation: GraphSearchRelaxation) {
+		e.preventDefault();
+		this.updateNaturalLanguage(false);
+		this.value = relaxation.query;
+		this.onSearchChanged(true);
+	}
+
 	private renderAutocomplete() {
 		// Show description if we have items, operator help, or NL mode
 		const hasDescription = Boolean(this.autocompleteItems.length || this.naturalLanguage || this.cursorOperator);
@@ -1608,20 +1791,25 @@ export class GlSearchInput extends GlElement {
 		return html`<gl-autocomplete
 			id="autocomplete-list"
 			.items="${this.autocompleteItems}"
-			?open="${this.autocompleteOpen && hasDescription && !this.errorMessage}"
+			?open="${this.autocompleteOpen && hasDescription && !this.errorMessage && !this.showFallbackHelper}"
 			@gl-autocomplete-select="${this.handleAutocompleteSelect}"
 			@gl-autocomplete-cancel="${this.hideAutocomplete}"
+			@gl-autocomplete-active-change="${() => this.requestUpdate()}"
 		>
-			${hasDescription
-				? html`<div slot="description">
-						${this.cursorOperator
-							? html`${this.cursorOperator.description}${this.renderOperatorExample(this.cursorOperator)}`
-							: this.naturalLanguage
-								? this.renderNaturalLanguageDescription()
-								: html`Combine filters to build powerful searches, e.g.
-										<code>@me after:1.week.ago file:*.ts</code>`}
-					</div>`
-				: nothing}
+			${
+				hasDescription
+					? html`<div slot="description">
+							${
+								this.cursorOperator
+									? html`${this.cursorOperator.description}${this.renderOperatorExample(this.cursorOperator)}`
+									: this.naturalLanguage
+										? this.renderNaturalLanguageDescription()
+										: html`Combine filters to build powerful searches, e.g.
+												<code>@me after:1.week.ago file:*.ts</code>`
+							}
+						</div>`
+					: nothing
+			}
 		</gl-autocomplete>`;
 	}
 
@@ -1638,7 +1826,9 @@ export class GlSearchInput extends GlElement {
 		}
 
 		if (this.processedQuery) {
-			return html`Query: <code>${this.processedQuery}</code>`;
+			return html`<gl-tooltip ?disabled="${!this.explanation}"
+				>Query: <code>${this.processedQuery}</code><span slot="content">${this.explanation}</span></gl-tooltip
+			>`;
 		}
 
 		return html`Describe what you're looking for and let AI build the query, e.g.
@@ -1670,12 +1860,12 @@ export class GlSearchInput extends GlElement {
 				appearance="input"
 				role="checkbox"
 				aria-checked="${this.matchCaseOverride}"
-				tooltip="Match Case${this.matchCaseOverride && !this.matchCase
-					? ' (always on without regular expressions)'
-					: ''}"
-				aria-label="Match Case${this.matchCaseOverride && !this.matchCase
-					? ' (always on without regular expressions)'
-					: ''}"
+				tooltip="Match Case${
+					this.matchCaseOverride && !this.matchCase ? ' (always on without regular expressions)' : ''
+				}"
+				aria-label="Match Case${
+					this.matchCaseOverride && !this.matchCase ? ' (always on without regular expressions)' : ''
+				}"
 				?disabled="${!this.matchRegex}"
 				@click="${this.handleMatchCase}"
 			>
@@ -1685,12 +1875,12 @@ export class GlSearchInput extends GlElement {
 				appearance="input"
 				role="checkbox"
 				aria-checked="${this.matchWholeWordOverride}"
-				tooltip="Match Whole Word${this.matchWholeWordOverride && !this.matchWholeWord
-					? ' (requires regular expressions)'
-					: ''}"
-				aria-label="Match Whole Word${this.matchWholeWordOverride && !this.matchWholeWord
-					? ' (requires regular expressions)'
-					: ''}"
+				tooltip="Match Whole Word${
+					this.matchWholeWordOverride && !this.matchWholeWord ? ' (requires regular expressions)' : ''
+				}"
+				aria-label="Match Whole Word${
+					this.matchWholeWordOverride && !this.matchWholeWord ? ' (requires regular expressions)' : ''
+				}"
 				?disabled="${!this.matchRegex}"
 				@click="${this.handleMatchWholeWord}"
 			>
@@ -1700,7 +1890,12 @@ export class GlSearchInput extends GlElement {
 				appearance="input"
 				role="checkbox"
 				aria-checked="${this.matchRegex}"
-				tooltip="Use Regular Expression"
+				variant="${ifDefined(this.fallbackActive ? 'warning' : undefined)}"
+				tooltip="${
+					this.fallbackActive
+						? `Pattern isn't valid regex — matching literally${this.fallbackDetail ? `: ${this.fallbackDetail}` : ''}`
+						: 'Use Regular Expression'
+				}"
 				aria-label="Use Regular Expression"
 				@click="${this.handleMatchRegex}"
 			>

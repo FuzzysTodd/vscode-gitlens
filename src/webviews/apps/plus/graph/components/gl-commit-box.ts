@@ -1,12 +1,20 @@
 import { html, LitElement, nothing } from 'lit';
-import { customElement, property } from 'lit/decorators.js';
+import { customElement, property, query } from 'lit/decorators.js';
 import { isMac } from '@env/platform.js';
+import type { WipSigning } from '../../../../plus/graph/detailsProtocol.js';
+import type { AiModelInfo } from '../../../../rpc/services/types.js';
+import type { GlMenuPopoverItem } from '../../../shared/components/menu/menu-popover.js';
 import { elementBase, scrollableBase } from '../../../shared/components/styles/lit/base.css.js';
+import { splitButtonStyles } from '../../../shared/components/styles/lit/split-button.css.js';
+import type { FixupTarget } from '../utils/fixup.utils.js';
 import { commitBoxStyles } from './gl-commit-box.css.js';
 import '../../../shared/components/button.js';
 import '../../../shared/components/branch-name.js';
 import '../../../shared/components/checkbox/checkbox.js';
 import '../../../shared/components/code-icon.js';
+import '../../../shared/components/gl-ai-model-chip.js';
+import '../../../shared/components/menu/menu-popover.js';
+import '../../../shared/components/overlays/popover.js';
 import '../../../shared/components/overlays/tooltip.js';
 
 // Register as a typed custom property so it can be animated/transitioned. @property in a
@@ -26,7 +34,7 @@ if (typeof CSS !== 'undefined' && 'registerProperty' in CSS) {
 
 @customElement('gl-commit-box')
 export class GlCommitBox extends LitElement {
-	static override styles = [elementBase, commitBoxStyles, scrollableBase];
+	static override styles = [elementBase, splitButtonStyles, commitBoxStyles, scrollableBase];
 
 	@property()
 	message = '';
@@ -55,18 +63,55 @@ export class GlCommitBox extends LitElement {
 	@property()
 	commitError?: string;
 
+	@property({ type: Object })
+	signing?: WipSigning;
+
+	@property({ type: Object })
+	aiModel?: AiModelInfo;
+
+	@property({ type: Object })
+	fixupTarget?: FixupTarget;
+
+	@query('.textarea')
+	private readonly _textareaEl?: HTMLTextAreaElement;
+
+	/** Focuses the message textarea — used to focus a box a host action just seeded (e.g. Fixup
+	 *  Commit, Undo Commit, Add Co-authors). Assumes the caller has already waited for this element
+	 *  to be mounted (e.g. via `updateComplete`). */
+	focusMessage(): void {
+		this._textareaEl?.focus({ preventScroll: true });
+	}
+
 	override render() {
 		return html`
 			<div class="options">
 				${this.renderAmendToggle()}
-				${this.aiEnabled
-					? html`<gl-button appearance="secondary" @click=${this.onCompose}>
-							<code-icon class="compose-icon" icon="wand" slot="prefix"></code-icon>
-							Compose
-						</gl-button>`
-					: nothing}
+				<div class="options-group">
+					${this.renderSigningIndicator()}
+					${
+						this.aiEnabled
+							? html`<gl-button appearance="secondary" @click=${this.onCompose}>
+									<code-icon class="compose-icon" icon="wand" slot="prefix"></code-icon>
+									Compose
+								</gl-button>`
+							: nothing
+					}
+				</div>
 			</div>
 			${this.renderTextarea()} ${this.renderActionBar()}
+		`;
+	}
+
+	private renderSigningIndicator() {
+		if (!this.signing?.enabled) return nothing;
+
+		const label = `Commits will be signed using ${getSigningFormatLabel(this.signing.format)}`;
+		return html`
+			<gl-tooltip content=${label} placement="bottom">
+				<span class="signing-indicator" tabindex="0" role="img" aria-label=${label}>
+					<code-icon icon="key"></code-icon>
+				</span>
+			</gl-tooltip>
 		`;
 	}
 
@@ -90,12 +135,14 @@ export class GlCommitBox extends LitElement {
 
 		return html`
 			<div class="message">
-				${this.aiEnabled
-					? html`<svg class="working-ring" aria-hidden="true">
-							<rect class="working-ring-base" pathLength="100"></rect>
-							<rect class="working-ring-highlight" pathLength="100"></rect>
-						</svg>`
-					: nothing}
+				${
+					this.aiEnabled
+						? html`<svg class="working-ring" aria-hidden="true">
+								<rect class="working-ring-base" pathLength="100"></rect>
+								<rect class="working-ring-highlight" pathLength="100"></rect>
+							</svg>`
+						: nothing
+				}
 				<textarea
 					class="textarea ${this.commitError ? 'has-error' : ''}"
 					.value=${this.message}
@@ -105,22 +152,7 @@ export class GlCommitBox extends LitElement {
 					@input=${this.onMessageInput}
 					@keydown=${this.onMessageKeydown}
 				></textarea>
-				${this.aiEnabled
-					? html`<div class="controls">
-							<gl-button
-								class="sparkle"
-								appearance="toolbar"
-								density="compact"
-								tooltip=${this.generating ? 'Cancel' : 'Generate Commit Message'}
-								aria-busy=${this.generating ? 'true' : 'false'}
-								@click=${this.onGenerateMessage}
-							>
-								${this.generating
-									? html`<code-icon icon="loading" modifier="spin"></code-icon>`
-									: html`<code-icon icon="sparkle"></code-icon>`}
-							</gl-button>
-						</div>`
-					: nothing}
+				${this.aiEnabled ? html`<div class="controls">${this.renderGenerateButton()}</div>` : nothing}
 				<div class="controls controls-bottom">
 					${len > 50 ? html`<span class="char-count">${len}</span>` : nothing}
 					<gl-button
@@ -139,6 +171,41 @@ export class GlCommitBox extends LitElement {
 		`;
 	}
 
+	private renderGenerateButton() {
+		const label = this.generating ? 'Cancel' : 'Generate Commit Message';
+		// `gl-tooltip` is non-interactive (pointer-events: none), so use `gl-popover` to show
+		// the current model as a clickable chip. `trigger="hover focus-visible"` (no `click`, and
+		// `focus-visible` rather than `focus`) keeps the sparkle's own click firing generate without
+		// showing the popover — the popover only opens on hover or keyboard focus, not click-induced focus.
+		return html`
+			<gl-popover placement="bottom" trigger="hover focus-visible">
+				<gl-button
+					slot="anchor"
+					class="sparkle"
+					appearance="toolbar"
+					density="compact"
+					aria-label=${label}
+					aria-busy=${this.generating ? 'true' : 'false'}
+					@click=${this.onGenerateMessage}
+				>
+					${
+						this.generating
+							? html`<code-icon icon="loading" modifier="spin"></code-icon>`
+							: html`<code-icon icon="sparkle"></code-icon>`
+					}
+				</gl-button>
+				<div slot="content" class="generate-popover">
+					<span class="generate-popover__action">${label}</span>
+					${
+						!this.generating && this.aiModel != null
+							? html`<gl-ai-model-chip .model=${this.aiModel}></gl-ai-model-chip>`
+							: nothing
+					}
+				</div>
+			</gl-popover>
+		`;
+	}
+
 	private renderActionBar() {
 		const label = this.amend ? 'Amend Commit on' : 'Commit to';
 		const action = this.amend ? 'amend commit on' : 'commit to';
@@ -150,6 +217,10 @@ export class GlCommitBox extends LitElement {
 				: this.disabledReason === 'no-staged'
 					? `Stage changes above to ${action} ${branch}`
 					: '';
+
+		if (this.fixupTarget != null && !this.amend) {
+			return this.renderFixupActionBar(disabledTooltip);
+		}
 
 		return html`
 			<gl-tooltip
@@ -167,10 +238,60 @@ export class GlCommitBox extends LitElement {
 						tooltip=${this.canCommit && !this.committing ? enabledTooltip : ''}
 						@click=${this.onCommit}
 					>
-						${this.committing
-							? html`<code-icon icon="loading" modifier="spin" slot="prefix"></code-icon>Committing…`
-							: html`${label}&nbsp;<gl-branch-name .name=${branch}></gl-branch-name>`}
+						${
+							this.committing
+								? html`<code-icon icon="loading" modifier="spin" slot="prefix"></code-icon>Committing…`
+								: html`${label}&nbsp;<gl-branch-name .name=${branch}></gl-branch-name>`
+						}
 					</gl-button>
+				</span>
+			</gl-tooltip>
+		`;
+	}
+
+	private renderFixupActionBar(disabledTooltip: string) {
+		const target = this.fixupTarget!;
+		const disabled = !this.canCommit || this.committing;
+		const enabledTooltip = `Commits a fixup of '${target.subject}'`;
+		const menuItems: GlMenuPopoverItem[] = [
+			{ label: 'Commit Fixup & Squash', value: 'squash', disabled: disabled },
+		];
+
+		return html`
+			<gl-tooltip
+				content=${disabledTooltip}
+				?disabled=${this.canCommit || this.committing || !disabledTooltip}
+				placement="bottom"
+			>
+				<span class="commit-btn-wrapper split-btn">
+					<gl-button
+						class="commit-btn split-btn__main"
+						full
+						?disabled=${disabled}
+						aria-busy=${this.committing ? 'true' : 'false'}
+						tooltip=${this.canCommit && !this.committing ? enabledTooltip : ''}
+						@click=${this.onCommit}
+					>
+						${
+							this.committing
+								? html`<code-icon icon="loading" modifier="spin" slot="prefix"></code-icon>Committing…`
+								: html`Commit Fixup`
+						}
+					</gl-button>
+					<gl-menu-popover
+						.items=${menuItems}
+						?disabled=${disabled}
+						@gl-menu-select=${this.onCommitSquashSelect}
+					>
+						<gl-button
+							class="split-btn__menu"
+							slot="anchor"
+							aria-label="Fixup Options"
+							?disabled=${disabled}
+						>
+							<code-icon icon="chevron-down"></code-icon>
+						</gl-button>
+					</gl-menu-popover>
 				</span>
 			</gl-tooltip>
 		`;
@@ -212,6 +333,12 @@ export class GlCommitBox extends LitElement {
 		this.dispatchEvent(new CustomEvent('commit', { bubbles: true, composed: true }));
 	}
 
+	private onCommitSquashSelect(e: CustomEvent<{ value: string }>) {
+		if (this.committing || e.detail.value !== 'squash') return;
+
+		this.dispatchEvent(new CustomEvent('commit-squash', { bubbles: true, composed: true }));
+	}
+
 	private onGenerateMessage() {
 		this.dispatchEvent(new CustomEvent('generate-message', { bubbles: true, composed: true }));
 	}
@@ -224,6 +351,19 @@ export class GlCommitBox extends LitElement {
 
 	private onCompose() {
 		this.dispatchEvent(new CustomEvent('compose', { bubbles: true, composed: true }));
+	}
+}
+
+function getSigningFormatLabel(format: WipSigning['format']): string {
+	switch (format) {
+		case 'ssh':
+			return 'SSH';
+		case 'x509':
+			return 'X.509';
+		case 'openpgp':
+			return 'OpenPGP';
+		default:
+			return 'GPG';
 	}
 }
 

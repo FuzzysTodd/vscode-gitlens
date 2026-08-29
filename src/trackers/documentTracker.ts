@@ -14,6 +14,7 @@ import type { Deferrable } from '@gitlens/utils/debounce.js';
 import { debounce } from '@gitlens/utils/debounce.js';
 import { trace } from '@gitlens/utils/decorators/log.js';
 import { once } from '@gitlens/utils/event.js';
+import type { ResourceUsage } from '@gitlens/utils/resourceUsage.js';
 import type { Container } from '../container.js';
 import type { RepositoriesChangeEvent } from '../git/gitProviderService.js';
 import type { GitUri } from '../git/gitUri.js';
@@ -70,6 +71,11 @@ export class GitDocumentTracker implements Disposable {
 		return this._onDidTriggerDirtyIdle.event;
 	}
 
+	/** Resource usage retained by tracked documents. */
+	getResourceUsage(): ResourceUsage {
+		return { 'documents.tracked.count': this._documentMap.size };
+	}
+
 	private _dirtyIdleTriggerDelay: number;
 	private _dirtyIdleTriggeredDebounced: Deferrable<(e: DocumentDirtyIdleTriggerEvent) => void> | undefined;
 	private _dirtyStateChangedDebounced: Deferrable<(e: DocumentDirtyStateChangeEvent) => void> | undefined;
@@ -110,9 +116,11 @@ export class GitDocumentTracker implements Disposable {
 
 		const docs = workspace.textDocuments
 			.filter(d => this.container.git.supportedSchemes.has(d.uri.scheme))
-			.map<
-				[TextDocument, visible: boolean, active: boolean]
-			>(d => [d, isVisibleTextDocument(d), activeDocument === d]);
+			.map<[TextDocument, visible: boolean, active: boolean]>(d => [
+				d,
+				isVisibleTextDocument(d),
+				activeDocument === d,
+			]);
 
 		// Sort by active and then by visible
 		docs.sort(([, aVisible, aActive], [, bVisible, bActive]) => {
@@ -139,7 +147,7 @@ export class GitDocumentTracker implements Disposable {
 
 	private onConfigurationChanged(e?: ConfigurationChangeEvent) {
 		// Only rest the cached state if we aren't initializing
-		if (e != null && configuration.changed(e, 'blame.ignoreWhitespace')) {
+		if (e != null && configuration.changed(e, ['blame.ignoreWhitespace', 'advanced.blame.customArguments'])) {
 			void this.refreshDocuments();
 		}
 
@@ -162,7 +170,8 @@ export class GitDocumentTracker implements Disposable {
 
 	private onRepositoryChanged(e: RepositoryChangeEvent) {
 		if (e.changed('index', 'heads', 'pausedOp', 'unknown')) {
-			void this.refreshDocuments({ addedOrChangedRepoPaths: new Set([e.repository.path]) });
+			// Lowercased to match `refreshDocuments`, which compares against a lowercased repo path
+			void this.refreshDocuments({ addedOrChangedRepoPaths: new Set([e.repository.path.toLowerCase()]) });
 		}
 	}
 
@@ -272,6 +281,28 @@ export class GitDocumentTracker implements Disposable {
 	}
 
 	private onVisibleTextEditorsChanged(editors: readonly TextEditor[]) {
+		// Sweep tracked documents whose underlying TextDocument has been closed without us having
+		// received an onDidCloseTextDocument event yet — VS Code defers document disposal (and thus
+		// that event) while anything holds a reference, and we hold one as our map key, so relying
+		// on the event alone lets tracked documents (and their blame snapshots, which pin whole
+		// file contents via sliced strings) accumulate for the life of the session.
+		// Sweep tracked documents that are no longer open in any visible editor. VS Code defers
+		// TextDocument disposal after an editor closes (isClosed stays false, and our map key holds
+		// a reference), so onDidCloseTextDocument alone lets tracked documents accumulate for the
+		// life of the session — each pinning its blame snapshot, which holds the file's full text.
+		if (this._documentMap.size > 0) {
+			const visibleUris = new Set<string>();
+			for (const editor of editors) {
+				visibleUris.add(editor.document.uri.toString());
+			}
+
+			for (const [document] of [...this._documentMap]) {
+				if (document.isClosed || !visibleUris.has(document.uri.toString())) {
+					void this.remove(document);
+				}
+			}
+		}
+
 		const docPromises = [];
 		for (const editor of editors) {
 			const document = editor.document;
@@ -333,6 +364,8 @@ export class GitDocumentTracker implements Disposable {
 
 	@trace()
 	private async addCore(document: TextDocument, visible?: boolean): Promise<TrackedGitDocument> {
+		// Note: no isClosed guard here — a stale re-add gets swept by onVisibleTextEditorsChanged,
+		// which disposes documents whose TextDocument.isClosed has flipped true.
 		const doc = createTrackedGitDocument(
 			this.container,
 			this,
@@ -487,12 +520,13 @@ export class GitDocumentTracker implements Disposable {
 
 		for (const d of this._documentMap.values()) {
 			const doc = await d;
-			const repoPath = doc.uri.repoPath?.toLocaleLowerCase();
+			// `toLowerCase` (not `toLocaleLowerCase`) to match the producers — a Turkish locale maps `I` to `ı`
+			const repoPath = doc.uri.repoPath?.toLowerCase();
 			if (repoPath == null) continue;
 
 			if (changed?.removedRepoPaths?.has(repoPath)) {
 				void this.remove(doc.document, doc);
-			} else if (changed?.addedOrChangedRepoPaths?.has(repoPath)) {
+			} else if (changed == null ? true : changed.addedOrChangedRepoPaths?.has(repoPath)) {
 				doc.refresh('repositoryChanged');
 			}
 		}

@@ -57,6 +57,12 @@ const test = base.extend({
 // and ensures consistent teardown/setup across the describe groups.
 test.describe.configure({ mode: 'serial' });
 
+// These smoke tests drive GitLens through the activity bar. Some VS Code forks (e.g. Cursor)
+// replace it with a bespoke UI that has no activity bar to target, so skip there.
+test.beforeEach(async ({ vscode }) => {
+	test.skip(!(await vscode.gitlens.hasActivityBar()), 'Editor has no standard activity bar (e.g. Cursor)');
+});
+
 test.describe('Smoke Tests — Core', () => {
 	test.describe.configure({ mode: 'serial' });
 	test.afterEach(async ({ vscode }) => {
@@ -64,8 +70,14 @@ test.describe('Smoke Tests — Core', () => {
 	});
 
 	test('should contain GitLens & GitLens Inspect icons in activity bar', async ({ vscode }) => {
-		const tabCount = await vscode.gitlens.getActivityBarTabCount();
-		expect(tabCount).toBeGreaterThanOrEqual(1);
+		await expect(vscode.gitlens.gitlensTab).toBeVisible({ timeout: MaxTimeout });
+
+		// GitLens Inspect is its own view container, and VS Code registers a container the first time
+		// one of its views is shown — so the tab is simply absent on a freshly launched instance. Show
+		// an Inspect view here: this used to assert that at least one tab matched /GitLens/, which the
+		// GitLens tab satisfied alone, so it passed without ever seeing the second icon it is named for.
+		await vscode.gitlens.executeCommand('gitlens.showCommitDetailsView');
+		await expect(vscode.gitlens.gitlensInspectTab).toBeVisible({ timeout: MaxTimeout });
 	});
 
 	test('should show GitLens status bar items', async ({ vscode }) => {
@@ -199,6 +211,18 @@ test.describe('Smoke Tests — GitLens Inspect views', () => {
 	});
 
 	test('should show GitLens Inspect views when clicking GitLens Inspect icon', async ({ vscode }) => {
+		// Register the Inspect view container and wait for its tab before clicking it. Opening the file
+		// above happens to register it too, but relying on that side effect is what made this spec fail
+		// on Positron in CI: the tab had not appeared yet, so the click below spent its full actionability
+		// timeout waiting for an element that nothing had asked VS Code to create.
+		await vscode.gitlens.executeCommand('gitlens.showCommitDetailsView');
+		await expect(vscode.gitlens.gitlensInspectTab).toBeVisible({ timeout: MaxTimeout });
+
+		// Showing the view also makes Inspect the active container, and clicking the active tab collapses
+		// the sidebar. Go back to Explorer so the click below is what opens Inspect — which is the whole
+		// subject of this test.
+		await vscode.gitlens.executeCommand('workbench.view.explorer');
+
 		// open inspect
 		await vscode.gitlens.openGitLensInspect();
 		await expect(vscode.gitlens.inspectViewSection).toBeVisible({ timeout: MaxTimeout });
@@ -207,6 +231,19 @@ test.describe('Smoke Tests — GitLens Inspect views', () => {
 		expect(inspectWebview).not.toBeNull();
 		// Verify the Inspect webview has loaded with the commit details app
 		await expect(inspectWebview!.locator('gl-commit-details-app')).toBeVisible({ timeout: MaxTimeout });
+	});
+
+	test('should keep GitLens Inspect open when it is already the active container', async ({ vscode }) => {
+		// `openTab` is meant to skip the click when the container is already active, because clicking the
+		// active tab collapses the side bar. Nothing exercised that: every caller reached it from another
+		// container, so the click always did the right thing by accident and a broken guard looked fine.
+		await vscode.gitlens.executeCommand('gitlens.showCommitDetailsView');
+		await expect(vscode.gitlens.inspectViewSection).toBeVisible({ timeout: MaxTimeout });
+
+		await vscode.gitlens.openGitLensInspect();
+
+		// Still open — asking for a container that is already showing is not a request to hide it
+		await expect(vscode.gitlens.inspectViewSection).toBeVisible({ timeout: MaxTimeout });
 	});
 
 	test('should show File History view', async ({ vscode }) => {
@@ -311,12 +348,21 @@ test.describe('Smoke Tests — Commit Graph view', () => {
 		const graphWebview = await vscode.gitlens.getGitLensWebview('Graph', 'webviewView', 30000);
 		expect(graphWebview).not.toBeNull();
 
-		// For Community users, expect the Pro gate (feature-gate component with Try GitLens Pro)
-		const featureGate = graphWebview!.locator('gl-feature-gate');
+		// A user without a Pro subscription is gated out of the graph. Depending on account state this
+		// is either the Pro feature-gate ("Try GitLens Pro" / "Continue") for a signed-in Community user,
+		// or — for a signed-out user (the harness default) — the account-access gate ("Get Started with
+		// GitLens" with "Create Free Account" / "Sign In"). Accept any of them.
+		// Match only a *visible* gate (`:not([hidden])`): a hidden `gl-feature-gate` can sit in the DOM
+		// ahead of the account-access affordances, and `.or(...).first()` would otherwise resolve to that
+		// hidden element and fail the visibility assertion even though a later alternative is showing.
+		const featureGate = graphWebview!.locator('gl-feature-gate:not([hidden])');
 		const tryProButton = graphWebview!.getByRole('button', { name: /Try GitLens Pro/i });
 		const continueButton = graphWebview!.getByRole('button', { name: /Continue/i });
-		// Could be "Try GitLens Pro" for Community, or "Continue" for feature preview
-		await expect(featureGate.or(tryProButton).or(continueButton).first()).toBeVisible({ timeout: 30000 });
+		const getStartedHeading = graphWebview!.getByRole('heading', { name: /Get Started with GitLens/i });
+		const accountLink = graphWebview!.getByRole('link', { name: /Create Free Account|Sign In/i });
+		await expect(
+			featureGate.or(tryProButton).or(continueButton).or(getStartedHeading).or(accountLink).first(),
+		).toBeVisible({ timeout: 30000 });
 	});
 
 	test('should show commit graph content (Pro - with simulated Pro subscription)', async ({ vscode }) => {
@@ -333,9 +379,9 @@ test.describe('Smoke Tests — Commit Graph view', () => {
 		// Use a longer timeout for webview discovery under parallel load
 		const graphWebview = await vscode.gitlens.getGitLensWebview('Graph', 'webviewView', 30000);
 		expect(graphWebview).not.toBeNull();
-		// Graph may take longer to load and render
-		await expect(graphWebview!.getByText('BRANCH / TAG').first()).toBeVisible({ timeout: 30000 });
-		await expect(graphWebview!.getByText('COMMIT MESSAGE').first()).toBeVisible({ timeout: MaxTimeout });
+		// Graph may take longer to load and render. The new Lit engine renders it as a role="tree"
+		// ("Commit graph"); its presence (with Pro) means the gate is not blocking the view.
+		await expect(graphWebview!.getByRole('tree', { name: 'Commit graph' })).toBeVisible({ timeout: MaxTimeout });
 
 		// Verify that the Pro gate is NOT visible
 		const featureGate = graphWebview!.locator('gl-feature-gate:not([hidden])');

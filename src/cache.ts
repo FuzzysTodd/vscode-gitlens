@@ -6,12 +6,13 @@ import type { IssueOrPullRequest, IssueOrPullRequestType } from '@gitlens/git/mo
 import type { PullRequest } from '@gitlens/git/models/pullRequest.js';
 import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
 import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
+import type { GitHostIntegration } from '@gitlens/integrations/models/gitHostIntegration.js';
+import type { IntegrationBase } from '@gitlens/integrations/models/integration.js';
 import { isPromise } from '@gitlens/utils/promise.js';
 import { CacheController } from '@gitlens/utils/promiseCache.js';
+import type { ResourceUsage, ResourceUsageMetric } from '@gitlens/utils/resourceUsage.js';
 import type { Disposable } from './api/gitlens.d.js';
 import type { Container } from './container.js';
-import type { GitHostIntegration } from './plus/integrations/models/gitHostIntegration.js';
-import type { IntegrationBase } from './plus/integrations/models/integration.js';
 
 type Caches = {
 	defaultBranch: { key: `repo:${string}`; value: DefaultBranch };
@@ -52,15 +53,48 @@ type ExpiryOptions = { expiryOverride?: boolean | number; expireOnError?: boolea
 export class CacheProvider implements Disposable {
 	private readonly _cache = new Map<`${Cache}:${CacheKey<Cache>}`, Cached<CacheResult<CacheValue<Cache>>>>();
 
-	// eslint-disable-next-line @typescript-eslint/no-useless-constructor
+	// oxlint-disable-next-line typescript/no-useless-constructor
 	constructor(_container: Container) {}
 
 	dispose(): void {
 		this._cache.clear();
 	}
 
+	/** Resource usage per cache type (plus total). Expired entries are included
+	 *  — they are only evicted on access, so they still count as retained memory. */
+	getResourceUsage(): ResourceUsage {
+		const usage: ResourceUsage = { 'entries.total.count': this._cache.size };
+		for (const key of this._cache.keys()) {
+			const cacheType = key.split(':', 1)[0];
+			const metric: ResourceUsageMetric = `entries.${cacheType}.count`;
+			usage[metric] = (usage[metric] ?? 0) + 1;
+		}
+		return usage;
+	}
+
 	delete<T extends Cache>(cache: T, key: CacheKey<T>): void {
 		this._cache.delete(`${cache}:${key}`);
+	}
+
+	/** Evicts every cached pull request — by branch, by sha, by id, and the pull request entries in the
+	 *  shared issue-or-pr caches (their keys carry a `pullrequest` type segment; issues stay). A merge
+	 *  invalidates more than the merged pull request alone — a stacked merge lands every layer below it
+	 *  and retargets every layer above — and no caller can name that full set, so the whole class of
+	 *  entries is the correct blast radius. Merges are rare; the cost is a refetch on next demand. */
+	deletePullRequests(): void {
+		for (const key of this._cache.keys()) {
+			if (key.startsWith('prByBranch:') || key.startsWith('prsById:') || key.startsWith('prsBySha:')) {
+				this._cache.delete(key);
+				continue;
+			}
+
+			if (
+				(key.startsWith('issuesOrPrsById:') || key.startsWith('issuesOrPrsByIdAndRepo:')) &&
+				key.includes(`:${'pullrequest' satisfies IssueOrPullRequestType}`)
+			) {
+				this._cache.delete(key);
+			}
+		}
 	}
 
 	/** Returns the resolved cached value without triggering a fetch on cache miss */
@@ -112,10 +146,12 @@ export class CacheProvider implements Disposable {
 	getCurrentAccount(
 		integration: IntegrationBase,
 		cacheable: Cacheable<Account>,
-		options?: ExpiryOptions,
+		options?: ExpiryOptions & { connectionId?: string; etag?: string },
 	): CacheResult<Account> {
+		const { connectionId, etag: etagOverride, ...cacheOptions } = options ?? {};
 		const { key, etag } = this.getIntegrationKeyAndEtag(integration);
-		return this.get('currentAccount', `id:${key}`, etag, cacheable, options);
+		const connectionKey = connectionId ? `:${connectionId}` : '';
+		return this.get('currentAccount', `id:${key}${connectionKey}`, etagOverride ?? etag, cacheable, cacheOptions);
 	}
 
 	// getEnrichedAutolinks(
@@ -353,9 +389,10 @@ export class CacheProvider implements Disposable {
 	}
 
 	private getIntegrationKeyAndEtag(integration: IntegrationBase) {
+		const key = this.getIntegrationCacheKey(integration);
 		return {
-			key: integration.id,
-			etag: `${integration.id}:${integration.maybeConnected ?? false}:${integration.sessionFingerprint ?? ''}`,
+			key: key,
+			etag: `${key}:${integration.maybeConnected ?? false}:${integration.sessionFingerprint ?? ''}`,
 		};
 	}
 
@@ -363,13 +400,17 @@ export class CacheProvider implements Disposable {
 	private getResourceKeyAndEtag(resource: ResourceDescriptor, integration?: GitHostIntegration | IntegrationBase) {
 		let fingerprint = '';
 		if (integration != null) {
-			fingerprint =
-				this.peek('currentAccount', `id:${integration.id}`)?.id ?? integration.sessionFingerprint ?? '';
+			const { key } = this.getIntegrationKeyAndEtag(integration);
+			fingerprint = this.peek('currentAccount', `id:${key}`)?.id ?? integration.sessionFingerprint ?? '';
 		}
 		return {
 			key: resource.key,
 			etag: `${resource.key}:${integration?.maybeConnected ?? false}:${fingerprint}`,
 		};
+	}
+
+	private getIntegrationCacheKey(integration: IntegrationBase): string {
+		return `${integration.id}:${integration.domain}`;
 	}
 }
 
@@ -409,7 +450,7 @@ function getExpiresAt<T extends Cache>(cache: T, value: CacheValue<T> | undefine
 		case 'prByBranch':
 		case 'prsById':
 		case 'prsBySha': {
-			if (value == null) return cache === 'prByBranch' ? defaultExpiresAt : 0 /* Never expires */;
+			if (value == null) return cache === 'prByBranch' ? defaultExpiresAt : 0; /* Never expires */
 
 			// Open prs expire after 1 hour, but closed/merge prs expire after 12 hours unless recently updated and then expire in 1 hour
 

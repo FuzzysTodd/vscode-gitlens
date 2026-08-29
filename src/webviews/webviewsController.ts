@@ -43,7 +43,6 @@ export interface WebviewPanelProxy<
 	): boolean | undefined;
 	close(): void;
 	refresh(force?: boolean): Promise<void>;
-	maximize(): Promise<void>;
 	show(options?: WebviewPanelShowOptions, ...args: WebviewShowingArgs<ShowingArgs, SerializedState>): Promise<void>;
 }
 
@@ -289,6 +288,17 @@ export class WebviewsController implements Disposable {
 
 					panel = serializedPanel;
 					serializedPanel = undefined;
+
+					// VS Code restores the serialized `localResourceRoots`, which still name the extension folder of the
+					// version that saved them. After an update that folder is gone, so every resource request falls
+					// outside the allowed roots and 401s, leaving the panel blank -- reset them to the current folder.
+					// See https://github.com/microsoft/vscode/issues/197103
+					panel.webview.options = {
+						enableCommandUris: true,
+						enableScripts: true,
+						localResourceRoots: [Uri.file(container.context.extensionPath)],
+						...descriptor.webviewOptions,
+					};
 				} else {
 					scope?.trace('Creating panel');
 
@@ -463,9 +473,6 @@ function convertToWebviewPanelProxy<
 		},
 		show: function (options?: WebviewPanelShowOptions, ...args: WebviewShowingArgs<ShowingArgs, SerializedState>) {
 			return controller.show(false, options, ...args);
-		},
-		maximize: function () {
-			return controller.maximize();
 		},
 	};
 }

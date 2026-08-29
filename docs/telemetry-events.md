@@ -32,6 +32,8 @@
   // Cohort number between 1 and 100 to use for percentage-based rollouts
   'global.device.cohort': number,
   'global.enabled': boolean,
+  // JSON map of feature flags as fetched — except `glensGraphGateIntroVideo`, which reports the variant the last RENDERED sign-in gate showed
+  'global.featureFlags': string,
   'global.folders.count': number,
   'global.folders.schemes': string,
   'global.gk.mcp.registrationCompleted': boolean,
@@ -118,6 +120,20 @@
 }
 ```
 
+### agents/hooks/setup/completed
+
+> Sent when an install-all/uninstall-all hooks operation (`gitlens.agents.installHooks` /
+`uninstallHooks` / the per-agent variants) completes across its target agents
+
+```typescript
+{
+  'agents.failed': string,
+  'agents.succeeded': string,
+  'operation': 'install' | 'uninstall',
+  'source': 'account' | 'subscription' | 'graph' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'agents' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'auto-rebase' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'terminal' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
+}
+```
+
 ### agents/hookUninstalled
 
 > Sent when an agent hook is uninstalled
@@ -137,6 +153,16 @@
   'agent.provider': string,
   'permission.decision': string,
   'permission.tool': string
+}
+```
+
+### agents/session/archived
+
+> Sent when an ended agent session is archived (dismissed) via the CLI
+
+```typescript
+{
+  'agent.provider': string
 }
 ```
 
@@ -160,6 +186,63 @@
 }
 ```
 
+### agents/session/syncDiscrepancy
+
+> Sent when a reconciliation poll (`list-sessions`) finds the polled session set differs from
+what the live IPC hook path had already tracked. In a single window this should be rare and
+usually means a hook event was dropped; a nonzero `sync.discovered` is expected in multi-window
+setups, where the machine-wide poll can surface a session owned by another window that never
+routed its hook events here — so don't treat every event as a dropped IPC signal
+
+```typescript
+{
+  'agent.provider': string,
+  // Sessions the poll reported alive that the live IPC path had not tracked.
+  'sync.discovered': number,
+  // Tracked sessions the poll no longer reports alive (teardown the live path missed).
+  'sync.missing': number,
+  // Total alive sessions reported by the poll.
+  'sync.polled': number,
+  // Total sessions tracked (from the live path) before the poll reconciled.
+  'sync.tracked': number
+}
+```
+
+### agents/sessionResumed
+
+> Sent when a past agent session is resumed from its transcript
+
+```typescript
+{
+  'agent.provider': string,
+  // Where the resume was invoked from.
+  'agent.resume.source': 'webview' | 'quickpick',
+  // Where it landed — a terminal, or the agent's own editor extension.
+  'agent.resume.target': 'terminal' | 'extension'
+}
+```
+
+### ai/credits/addOnClicked
+
+> Sent when the user takes the AI credit add-on purchase path — "Get More Credits" on the weekly AI
+usage-limit notification, or "Get more AI credits" on the Settings account panel's AI usage card
+
+```typescript
+{
+  'organization.role': 'owner' | 'admin' | 'billing' | 'user'
+}
+```
+
+### ai/credits/addOnDismissed
+
+> Sent when the user dismisses the weekly AI usage-limit notification
+
+```typescript
+{
+  'organization.role': 'owner' | 'admin' | 'billing' | 'user'
+}
+```
+
 ### ai/enabled
 
 > Sent when AI is enabled
@@ -177,6 +260,8 @@ void
   'changeType': 'wip' | 'stash' | 'commit' | 'branch' | 'compare' | 'draft-stash' | 'draft-patch' | 'draft-suggested_pr_change',
   'config.largePromptThreshold': number,
   'config.usedCustomInstructions': boolean,
+  // Groups every request of one AI session — the whole user-facing task. Set by conflict resolution (`type: 'resolveConflicts'`) and by Graph compose (`type: 'commits'`, and `'commitMessage'` for a message regenerated inside a compose); absent on every other feature, whose requests are one-per-task anyway. Counting distinct IDs (filtered by `type`) is how usage is measured for both — the event count itself can't be, since one session is many round-trips: an agentic loop for resolution, and the library's validation retries plus the user's refines and per-commit message regenerations for compose. Note a compose session's IDs therefore span two `type`s, so counting sessions means counting distinct IDs across both rather than per `type`. For per-operation counts use `autoRebase/step/resolved` (automatic resolution), `graphDetails/resolve/generateResolutions/completed` (the resolve panel), and `graphDetails/compose/applyPlan/completed` (compose). Two caveats. An escalated rebase's ID is deliberately adopted by the resolve panel that finishes it, so a single ID can carry requests from both paths and distinct-ID counts can't be split cleanly on `source.detail`. And a compose ID survives a generate that errored or was cancelled, so the user's retry continues it — a distinct ID counts one compose session, not one plan produced.
+  'conversationId': string,
   'correlationId': string,
   'customInstructions.commitMessage.setting.length': number,
   'customInstructions.commitMessage.setting.used': boolean,
@@ -193,11 +278,11 @@ void
   'failed.cancelled.reason': 'large-prompt',
   'failed.error': string,
   'failed.error.detail': string,
-  'failed.reason': 'user-declined' | 'user-cancelled' | 'error',
+  'failed.reason': 'user-cancelled' | 'error',
   'id': string,
   'input.length': number,
   'model.id': string,
-  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
   'model.provider.name': string,
   'output.length': number,
   'retry.count': number,
@@ -222,11 +307,11 @@ void
   'feature': string,
   'id': string,
   'model.id': string,
-  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
   'model.provider.name': string,
   'sentiment': 'helpful' | 'unhelpful',
   // The AI feature that feedback was submitted for
-  'type': 'explain-changes' | 'review-changes' | 'generate-commitMessage' | 'generate-stashMessage' | 'generate-changelog' | 'generate-create-cloudPatch' | 'generate-create-codeSuggestion' | 'generate-create-pullRequest' | 'generate-commits' | 'generate-searchQuery',
+  'type': 'explain-changes' | 'review-changes' | 'generate-commitMessage' | 'generate-stashMessage' | 'generate-changelog' | 'generate-create-cloudPatch' | 'generate-create-pullRequest' | 'generate-commits' | 'conflict-resolution' | 'generate-searchQuery',
   // Custom feedback provided (if any)
   'unhelpful.custom': string,
   // Unhelpful reasons selected (if any) - comma-separated list of AIFeedbackUnhelpfulReasons values
@@ -248,6 +333,8 @@ void
 {
   'config.largePromptThreshold': number,
   'config.usedCustomInstructions': boolean,
+  // Groups every request of one AI session — the whole user-facing task. Set by conflict resolution (`type: 'resolveConflicts'`) and by Graph compose (`type: 'commits'`, and `'commitMessage'` for a message regenerated inside a compose); absent on every other feature, whose requests are one-per-task anyway. Counting distinct IDs (filtered by `type`) is how usage is measured for both — the event count itself can't be, since one session is many round-trips: an agentic loop for resolution, and the library's validation retries plus the user's refines and per-commit message regenerations for compose. Note a compose session's IDs therefore span two `type`s, so counting sessions means counting distinct IDs across both rather than per `type`. For per-operation counts use `autoRebase/step/resolved` (automatic resolution), `graphDetails/resolve/generateResolutions/completed` (the resolve panel), and `graphDetails/compose/applyPlan/completed` (compose). Two caveats. An escalated rebase's ID is deliberately adopted by the resolve panel that finishes it, so a single ID can carry requests from both paths and distinct-ID counts can't be split cleanly on `source.detail`. And a compose ID survives a generate that errored or was cancelled, so the user's retry continues it — a distinct ID counts one compose session, not one plan produced.
+  'conversationId': string,
   'correlationId': string,
   'customInstructions.commitMessage.setting.length': number,
   'customInstructions.commitMessage.setting.used': boolean,
@@ -264,11 +351,11 @@ void
   'failed.cancelled.reason': 'large-prompt',
   'failed.error': string,
   'failed.error.detail': string,
-  'failed.reason': 'user-declined' | 'user-cancelled' | 'error',
+  'failed.reason': 'user-cancelled' | 'error',
   'id': string,
   'input.length': number,
   'model.id': string,
-  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
   'model.provider.name': string,
   'output.length': number,
   'retry.count': number,
@@ -290,6 +377,8 @@ or
 {
   'config.largePromptThreshold': number,
   'config.usedCustomInstructions': boolean,
+  // Groups every request of one AI session — the whole user-facing task. Set by conflict resolution (`type: 'resolveConflicts'`) and by Graph compose (`type: 'commits'`, and `'commitMessage'` for a message regenerated inside a compose); absent on every other feature, whose requests are one-per-task anyway. Counting distinct IDs (filtered by `type`) is how usage is measured for both — the event count itself can't be, since one session is many round-trips: an agentic loop for resolution, and the library's validation retries plus the user's refines and per-commit message regenerations for compose. Note a compose session's IDs therefore span two `type`s, so counting sessions means counting distinct IDs across both rather than per `type`. For per-operation counts use `autoRebase/step/resolved` (automatic resolution), `graphDetails/resolve/generateResolutions/completed` (the resolve panel), and `graphDetails/compose/applyPlan/completed` (compose). Two caveats. An escalated rebase's ID is deliberately adopted by the resolve panel that finishes it, so a single ID can carry requests from both paths and distinct-ID counts can't be split cleanly on `source.detail`. And a compose ID survives a generate that errored or was cancelled, so the user's retry continues it — a distinct ID counts one compose session, not one plan produced.
+  'conversationId': string,
   'correlationId': string,
   'customInstructions.commitMessage.setting.length': number,
   'customInstructions.commitMessage.setting.used': boolean,
@@ -306,11 +395,11 @@ or
   'failed.cancelled.reason': 'large-prompt',
   'failed.error': string,
   'failed.error.detail': string,
-  'failed.reason': 'user-declined' | 'user-cancelled' | 'error',
+  'failed.reason': 'user-cancelled' | 'error',
   'id': string,
   'input.length': number,
   'model.id': string,
-  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
   'model.provider.name': string,
   'output.length': number,
   'retry.count': number,
@@ -332,6 +421,8 @@ or
 {
   'config.largePromptThreshold': number,
   'config.usedCustomInstructions': boolean,
+  // Groups every request of one AI session — the whole user-facing task. Set by conflict resolution (`type: 'resolveConflicts'`) and by Graph compose (`type: 'commits'`, and `'commitMessage'` for a message regenerated inside a compose); absent on every other feature, whose requests are one-per-task anyway. Counting distinct IDs (filtered by `type`) is how usage is measured for both — the event count itself can't be, since one session is many round-trips: an agentic loop for resolution, and the library's validation retries plus the user's refines and per-commit message regenerations for compose. Note a compose session's IDs therefore span two `type`s, so counting sessions means counting distinct IDs across both rather than per `type`. For per-operation counts use `autoRebase/step/resolved` (automatic resolution), `graphDetails/resolve/generateResolutions/completed` (the resolve panel), and `graphDetails/compose/applyPlan/completed` (compose). Two caveats. An escalated rebase's ID is deliberately adopted by the resolve panel that finishes it, so a single ID can carry requests from both paths and distinct-ID counts can't be split cleanly on `source.detail`. And a compose ID survives a generate that errored or was cancelled, so the user's retry continues it — a distinct ID counts one compose session, not one plan produced.
+  'conversationId': string,
   'correlationId': string,
   'customInstructions.commitMessage.setting.length': number,
   'customInstructions.commitMessage.setting.used': boolean,
@@ -349,11 +440,11 @@ or
   'failed.cancelled.reason': 'large-prompt',
   'failed.error': string,
   'failed.error.detail': string,
-  'failed.reason': 'user-declined' | 'user-cancelled' | 'error',
+  'failed.reason': 'user-cancelled' | 'error',
   'id': string,
   'input.length': number,
   'model.id': string,
-  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
   'model.provider.name': string,
   'output.length': number,
   'retry.count': number,
@@ -375,6 +466,8 @@ or
 {
   'config.largePromptThreshold': number,
   'config.usedCustomInstructions': boolean,
+  // Groups every request of one AI session — the whole user-facing task. Set by conflict resolution (`type: 'resolveConflicts'`) and by Graph compose (`type: 'commits'`, and `'commitMessage'` for a message regenerated inside a compose); absent on every other feature, whose requests are one-per-task anyway. Counting distinct IDs (filtered by `type`) is how usage is measured for both — the event count itself can't be, since one session is many round-trips: an agentic loop for resolution, and the library's validation retries plus the user's refines and per-commit message regenerations for compose. Note a compose session's IDs therefore span two `type`s, so counting sessions means counting distinct IDs across both rather than per `type`. For per-operation counts use `autoRebase/step/resolved` (automatic resolution), `graphDetails/resolve/generateResolutions/completed` (the resolve panel), and `graphDetails/compose/applyPlan/completed` (compose). Two caveats. An escalated rebase's ID is deliberately adopted by the resolve panel that finishes it, so a single ID can carry requests from both paths and distinct-ID counts can't be split cleanly on `source.detail`. And a compose ID survives a generate that errored or was cancelled, so the user's retry continues it — a distinct ID counts one compose session, not one plan produced.
+  'conversationId': string,
   'correlationId': string,
   'customInstructions.commitMessage.setting.length': number,
   'customInstructions.commitMessage.setting.used': boolean,
@@ -391,11 +484,11 @@ or
   'failed.cancelled.reason': 'large-prompt',
   'failed.error': string,
   'failed.error.detail': string,
-  'failed.reason': 'user-declined' | 'user-cancelled' | 'error',
+  'failed.reason': 'user-cancelled' | 'error',
   'id': string,
   'input.length': number,
   'model.id': string,
-  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
   'model.provider.name': string,
   'output.length': number,
   'retry.count': number,
@@ -417,6 +510,8 @@ or
 {
   'config.largePromptThreshold': number,
   'config.usedCustomInstructions': boolean,
+  // Groups every request of one AI session — the whole user-facing task. Set by conflict resolution (`type: 'resolveConflicts'`) and by Graph compose (`type: 'commits'`, and `'commitMessage'` for a message regenerated inside a compose); absent on every other feature, whose requests are one-per-task anyway. Counting distinct IDs (filtered by `type`) is how usage is measured for both — the event count itself can't be, since one session is many round-trips: an agentic loop for resolution, and the library's validation retries plus the user's refines and per-commit message regenerations for compose. Note a compose session's IDs therefore span two `type`s, so counting sessions means counting distinct IDs across both rather than per `type`. For per-operation counts use `autoRebase/step/resolved` (automatic resolution), `graphDetails/resolve/generateResolutions/completed` (the resolve panel), and `graphDetails/compose/applyPlan/completed` (compose). Two caveats. An escalated rebase's ID is deliberately adopted by the resolve panel that finishes it, so a single ID can carry requests from both paths and distinct-ID counts can't be split cleanly on `source.detail`. And a compose ID survives a generate that errored or was cancelled, so the user's retry continues it — a distinct ID counts one compose session, not one plan produced.
+  'conversationId': string,
   'correlationId': string,
   'customInstructions.commitMessage.setting.length': number,
   'customInstructions.commitMessage.setting.used': boolean,
@@ -433,11 +528,11 @@ or
   'failed.cancelled.reason': 'large-prompt',
   'failed.error': string,
   'failed.error.detail': string,
-  'failed.reason': 'user-declined' | 'user-cancelled' | 'error',
+  'failed.reason': 'user-cancelled' | 'error',
   'id': string,
   'input.length': number,
   'model.id': string,
-  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
   'model.provider.name': string,
   'output.length': number,
   'retry.count': number,
@@ -459,6 +554,8 @@ or
 {
   'config.largePromptThreshold': number,
   'config.usedCustomInstructions': boolean,
+  // Groups every request of one AI session — the whole user-facing task. Set by conflict resolution (`type: 'resolveConflicts'`) and by Graph compose (`type: 'commits'`, and `'commitMessage'` for a message regenerated inside a compose); absent on every other feature, whose requests are one-per-task anyway. Counting distinct IDs (filtered by `type`) is how usage is measured for both — the event count itself can't be, since one session is many round-trips: an agentic loop for resolution, and the library's validation retries plus the user's refines and per-commit message regenerations for compose. Note a compose session's IDs therefore span two `type`s, so counting sessions means counting distinct IDs across both rather than per `type`. For per-operation counts use `autoRebase/step/resolved` (automatic resolution), `graphDetails/resolve/generateResolutions/completed` (the resolve panel), and `graphDetails/compose/applyPlan/completed` (compose). Two caveats. An escalated rebase's ID is deliberately adopted by the resolve panel that finishes it, so a single ID can carry requests from both paths and distinct-ID counts can't be split cleanly on `source.detail`. And a compose ID survives a generate that errored or was cancelled, so the user's retry continues it — a distinct ID counts one compose session, not one plan produced.
+  'conversationId': string,
   'correlationId': string,
   'customInstructions.commitMessage.setting.length': number,
   'customInstructions.commitMessage.setting.used': boolean,
@@ -475,11 +572,55 @@ or
   'failed.cancelled.reason': 'large-prompt',
   'failed.error': string,
   'failed.error.detail': string,
-  'failed.reason': 'user-declined' | 'user-cancelled' | 'error',
+  'failed.reason': 'user-cancelled' | 'error',
   'id': string,
   'input.length': number,
   'model.id': string,
-  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'model.provider.name': string,
+  'output.length': number,
+  'retry.count': number,
+  'type': 'resolveConflicts',
+  'usage.completionTokens': number,
+  'usage.limits.limit': number,
+  'usage.limits.resetsOn': string,
+  'usage.limits.used': number,
+  'usage.promptTokens': number,
+  'usage.totalTokens': number,
+  'warning.exceededLargePromptThreshold': boolean,
+  'warning.promptTruncated': boolean
+}
+```
+
+or
+
+```typescript
+{
+  'config.largePromptThreshold': number,
+  'config.usedCustomInstructions': boolean,
+  // Groups every request of one AI session — the whole user-facing task. Set by conflict resolution (`type: 'resolveConflicts'`) and by Graph compose (`type: 'commits'`, and `'commitMessage'` for a message regenerated inside a compose); absent on every other feature, whose requests are one-per-task anyway. Counting distinct IDs (filtered by `type`) is how usage is measured for both — the event count itself can't be, since one session is many round-trips: an agentic loop for resolution, and the library's validation retries plus the user's refines and per-commit message regenerations for compose. Note a compose session's IDs therefore span two `type`s, so counting sessions means counting distinct IDs across both rather than per `type`. For per-operation counts use `autoRebase/step/resolved` (automatic resolution), `graphDetails/resolve/generateResolutions/completed` (the resolve panel), and `graphDetails/compose/applyPlan/completed` (compose). Two caveats. An escalated rebase's ID is deliberately adopted by the resolve panel that finishes it, so a single ID can carry requests from both paths and distinct-ID counts can't be split cleanly on `source.detail`. And a compose ID survives a generate that errored or was cancelled, so the user's retry continues it — a distinct ID counts one compose session, not one plan produced.
+  'conversationId': string,
+  'correlationId': string,
+  'customInstructions.commitMessage.setting.length': number,
+  'customInstructions.commitMessage.setting.used': boolean,
+  'customInstructions.length': number,
+  'customInstructions.setting.length': number,
+  'customInstructions.setting.used': boolean,
+  'customInstructions.used': boolean,
+  'diff.files.count': number,
+  'diff.hash': string,
+  'diff.hunks.count': number,
+  'diff.lines.count': number,
+  'duration': number,
+  'failed': boolean,
+  'failed.cancelled.reason': 'large-prompt',
+  'failed.error': string,
+  'failed.error.detail': string,
+  'failed.reason': 'user-cancelled' | 'error',
+  'id': string,
+  'input.length': number,
+  'model.id': string,
+  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
   'model.provider.name': string,
   'output.length': number,
   'retry.count': number,
@@ -501,6 +642,8 @@ or
 {
   'config.largePromptThreshold': number,
   'config.usedCustomInstructions': boolean,
+  // Groups every request of one AI session — the whole user-facing task. Set by conflict resolution (`type: 'resolveConflicts'`) and by Graph compose (`type: 'commits'`, and `'commitMessage'` for a message regenerated inside a compose); absent on every other feature, whose requests are one-per-task anyway. Counting distinct IDs (filtered by `type`) is how usage is measured for both — the event count itself can't be, since one session is many round-trips: an agentic loop for resolution, and the library's validation retries plus the user's refines and per-commit message regenerations for compose. Note a compose session's IDs therefore span two `type`s, so counting sessions means counting distinct IDs across both rather than per `type`. For per-operation counts use `autoRebase/step/resolved` (automatic resolution), `graphDetails/resolve/generateResolutions/completed` (the resolve panel), and `graphDetails/compose/applyPlan/completed` (compose). Two caveats. An escalated rebase's ID is deliberately adopted by the resolve panel that finishes it, so a single ID can carry requests from both paths and distinct-ID counts can't be split cleanly on `source.detail`. And a compose ID survives a generate that errored or was cancelled, so the user's retry continues it — a distinct ID counts one compose session, not one plan produced.
+  'conversationId': string,
   'correlationId': string,
   'customInstructions.commitMessage.setting.length': number,
   'customInstructions.commitMessage.setting.used': boolean,
@@ -517,11 +660,11 @@ or
   'failed.cancelled.reason': 'large-prompt',
   'failed.error': string,
   'failed.error.detail': string,
-  'failed.reason': 'user-declined' | 'user-cancelled' | 'error',
+  'failed.reason': 'user-cancelled' | 'error',
   'id': string,
   'input.length': number,
   'model.id': string,
-  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
   'model.provider.name': string,
   'output.length': number,
   'retry.count': number,
@@ -545,6 +688,8 @@ or
 {
   'config.largePromptThreshold': number,
   'config.usedCustomInstructions': boolean,
+  // Groups every request of one AI session — the whole user-facing task. Set by conflict resolution (`type: 'resolveConflicts'`) and by Graph compose (`type: 'commits'`, and `'commitMessage'` for a message regenerated inside a compose); absent on every other feature, whose requests are one-per-task anyway. Counting distinct IDs (filtered by `type`) is how usage is measured for both — the event count itself can't be, since one session is many round-trips: an agentic loop for resolution, and the library's validation retries plus the user's refines and per-commit message regenerations for compose. Note a compose session's IDs therefore span two `type`s, so counting sessions means counting distinct IDs across both rather than per `type`. For per-operation counts use `autoRebase/step/resolved` (automatic resolution), `graphDetails/resolve/generateResolutions/completed` (the resolve panel), and `graphDetails/compose/applyPlan/completed` (compose). Two caveats. An escalated rebase's ID is deliberately adopted by the resolve panel that finishes it, so a single ID can carry requests from both paths and distinct-ID counts can't be split cleanly on `source.detail`. And a compose ID survives a generate that errored or was cancelled, so the user's retry continues it — a distinct ID counts one compose session, not one plan produced.
+  'conversationId': string,
   'correlationId': string,
   'customInstructions.commitMessage.setting.length': number,
   'customInstructions.commitMessage.setting.used': boolean,
@@ -561,11 +706,11 @@ or
   'failed.cancelled.reason': 'large-prompt',
   'failed.error': string,
   'failed.error.detail': string,
-  'failed.reason': 'user-declined' | 'user-cancelled' | 'error',
+  'failed.reason': 'user-cancelled' | 'error',
   'id': string,
   'input.length': number,
   'model.id': string,
-  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
   'model.provider.name': string,
   'output.length': number,
   'retry.count': number,
@@ -590,7 +735,7 @@ or
 ```typescript
 {
   'model.id': string,
-  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
   'model.provider.name': string
 }
 ```
@@ -625,6 +770,45 @@ void
 
 ```typescript
 void
+```
+
+### allowedSigners/closed
+
+```typescript
+{
+  [`context.${string}`]: string | number | boolean,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### allowedSigners/showAborted
+
+```typescript
+{
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'duration': number,
+  'loading': boolean
+}
+```
+
+### allowedSigners/shown
+
+```typescript
+{
+  [`context.${string}`]: string | number | boolean,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'duration': number,
+  'loading': boolean
+}
 ```
 
 ### associateIssueWithBranch/action
@@ -742,6 +926,161 @@ void
 }
 ```
 
+### autoRebase/cancelled
+
+> Sent when the user cancels an automatic rebase (the rebase is aborted)
+
+```typescript
+{
+  // Time from run start in milliseconds
+  'duration': number,
+  // Conflicted steps recorded so far
+  'steps.count': number,
+  // `true` when the run took over an already-paused rebase
+  'takeover': boolean
+}
+```
+
+### autoRebase/completed
+
+> Sent when an automatic rebase runs to completion
+
+```typescript
+{
+  // What happened to the autostash at the end of the run
+  'autostash': 'none' | 'reapplied' | 'left-in-stash',
+  // Time from run start in milliseconds
+  'duration': number,
+  // Total conflicted files resolved across the run
+  'files.count': number,
+  // Conflicted steps recorded so far
+  'steps.count': number,
+  // Steps whose commit git dropped for being empty — the resolution left nothing to commit
+  'steps.emptied.count': number,
+  // `true` when the run took over an already-paused rebase
+  'takeover': boolean
+}
+```
+
+### autoRebase/escalated
+
+> Sent when automation stops and hands off to the Resolve panel (low confidence, non-conflict pause, etc.)
+
+```typescript
+{
+  // The configured minimum confidence for auto-applying
+  'confidence.threshold': number,
+  // Time from run start in milliseconds
+  'duration': number,
+  'reason': 'low-confidence' | 'resolve-errors' | 'ai-unavailable' | 'skipped-files' | 'non-conflict-pause' | 'message-edit' | 'edit-step' | 'external-modification' | 'step-cap' | 'continue-error' | 'stopped' | 'unexpected-error',
+  // The step automation stopped at, when known
+  'step': number,
+  // Conflicted steps recorded so far
+  'steps.count': number,
+  // `true` when the run took over an already-paused rebase
+  'takeover': boolean
+}
+```
+
+### autoRebase/failed
+
+> Sent when an automatic rebase fails unexpectedly
+
+```typescript
+{
+  // Time from run start in milliseconds
+  'duration': number,
+  // Conflicted steps recorded so far
+  'steps.count': number,
+  // `true` when the run took over an already-paused rebase
+  'takeover': boolean
+}
+```
+
+### autoRebase/resumed
+
+> Sent when the user re-engages automation on an escalated run, resuming the same session
+
+```typescript
+{
+  // The escalated step being resumed, when known
+  'step': number
+}
+```
+
+### autoRebase/started
+
+> Sent when an automatic (AI conflict resolution) rebase run starts — fresh or as a takeover of a paused rebase
+
+```typescript
+{
+  // How the run was engaged: fresh rebase, takeover of a paused one, or a pre-start handoff from the Interactive Rebase Editor
+  'mode': 'started' | 'takeover' | 'handoff',
+  'takeover': boolean
+}
+```
+
+### autoRebase/step/resolved
+
+> Sent each time the automatic rebase resolves, applies, and stages a conflicted step
+
+```typescript
+{
+  // Lowest AI confidence among the step's resolutions
+  'confidence.min': number,
+  'files.count': number,
+  // Resolutions using the AI-merged strategy
+  'result.strategy.ai.count': number,
+  // Resolutions resolved as a deletion
+  'result.strategy.deleted.count': number,
+  // Resolutions resolved by taking the current/ours side
+  'result.strategy.takeOurs.count': number,
+  // Resolutions resolved by taking the incoming/theirs side
+  'result.strategy.takeTheirs.count': number,
+  // The rebase step (msgnum) that was resolved
+  'step': number,
+  'steps.total': number,
+  // Repo-inspection tool calls the AI made across the step's resolutions
+  'tools.calls.count': number,
+  // Model round-trips across the step's resolutions (tool calls plus validation re-prompts)
+  'tools.steps.count': number
+}
+```
+
+### autoRebase/summary/shown
+
+> Sent when the end-of-run summary is fetched for display
+
+```typescript
+{
+  // Time from run start in milliseconds
+  'duration': number,
+  // Conflicted steps recorded so far
+  'steps.count': number,
+  // `true` when the run took over an already-paused rebase
+  'takeover': boolean
+}
+```
+
+### autoRebase/undo/completed
+
+> Sent when a completed automatic rebase is rolled back
+
+```typescript
+void
+```
+
+### autoRebase/undo/refused
+
+> Sent when an undo is refused (branch moved, dirty working tree, etc.)
+
+```typescript
+{
+  // Why the undo was refused
+  'reason': 'no-record' | 'unavailable' | 'operation-in-progress' | 'branch-changed' | 'branch-moved' | 'dirty'
+}
+```
+
 ### cli/discoveryFile/failed
 
 > Sent when the CLI integration discovery file fails to be created
@@ -762,7 +1101,7 @@ void
   'autoInstall': boolean,
   'error.message': string,
   'insiders': boolean,
-  'source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
+  'source': 'account' | 'subscription' | 'graph' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'agents' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'auto-rebase' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'terminal' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
 }
 ```
 
@@ -775,7 +1114,7 @@ void
   'attempts': number,
   'autoInstall': boolean,
   'insiders': boolean,
-  'source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
+  'source': 'account' | 'subscription' | 'graph' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'agents' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'auto-rebase' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'terminal' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
 }
 ```
 
@@ -788,7 +1127,7 @@ void
   'attempts': number,
   'autoInstall': boolean,
   'insiders': boolean,
-  'source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
+  'source': 'account' | 'subscription' | 'graph' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'agents' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'auto-rebase' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'terminal' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
   'version': string
 }
 ```
@@ -885,7 +1224,7 @@ void
 ```typescript
 {
   'hostingProvider.key': string,
-  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'github-enterprise' | 'cloud-github-enterprise' | 'gitlab-self-hosted' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello'
+  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello'
 }
 ```
 
@@ -896,7 +1235,7 @@ void
 ```typescript
 {
   'hostingProvider.key': string,
-  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'github-enterprise' | 'cloud-github-enterprise' | 'gitlab-self-hosted' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello'
+  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello'
 }
 ```
 
@@ -907,7 +1246,7 @@ void
 ```typescript
 {
   'issueProvider.key': string,
-  'issueProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'github-enterprise' | 'cloud-github-enterprise' | 'gitlab-self-hosted' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello'
+  'issueProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello'
 }
 ```
 
@@ -918,7 +1257,7 @@ void
 ```typescript
 {
   'issueProvider.key': string,
-  'issueProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'github-enterprise' | 'cloud-github-enterprise' | 'gitlab-self-hosted' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello'
+  'issueProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello'
 }
 ```
 
@@ -952,7 +1291,7 @@ or when connection refresh is skipped due to being a non-cloud session
 
 ```typescript
 {
-  'integration.id': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'github-enterprise' | 'cloud-github-enterprise' | 'gitlab-self-hosted' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello'
+  'integration.id': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello'
 }
 ```
 
@@ -1099,48 +1438,6 @@ or
 }
 ```
 
-### commitDetails/mode/changed
-
-> Sent when the user changes the selected tab (mode) on the Graph Details view
-
-```typescript
-{
-  'context.autolinks': number,
-  'context.codeSuggestions': number,
-  'context.inReview': boolean,
-  'context.mode': 'wip',
-  'context.repository.closed': boolean,
-  'context.repository.folder.scheme': string,
-  'context.repository.id': string,
-  'context.repository.provider.id': string,
-  'context.repository.scheme': string,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'mode.new': 'wip' | 'commit',
-  'mode.old': 'wip' | 'commit'
-}
-```
-
-or
-
-```typescript
-{
-  'context.autolinks': number,
-  'context.mode': 'commit',
-  'context.pinned': boolean,
-  'context.type': 'stash' | 'commit',
-  'context.uncommitted': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'mode.new': 'wip' | 'commit',
-  'mode.old': 'wip' | 'commit'
-}
-```
-
 ### commitDetails/reachability/failed
 
 > Sent when commit reachability fails to load
@@ -1184,36 +1481,6 @@ or
 ```typescript
 {
   'context.autolinks': number,
-  'context.codeSuggestions': number,
-  'context.config.autolinks.enabled': boolean,
-  'context.config.autolinks.enhanced': boolean,
-  'context.config.avatars': boolean,
-  'context.config.files.compact': boolean,
-  'context.config.files.icon': 'status' | 'type',
-  'context.config.files.layout': 'auto' | 'list' | 'tree',
-  'context.config.files.threshold': number,
-  'context.config.pullRequests.enabled': boolean,
-  'context.inReview': boolean,
-  'context.mode': 'wip',
-  'context.repository.closed': boolean,
-  'context.repository.folder.scheme': string,
-  'context.repository.id': string,
-  'context.repository.provider.id': string,
-  'context.repository.scheme': string,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'duration': number,
-  'loading': boolean
-}
-```
-
-or
-
-```typescript
-{
-  'context.autolinks': number,
   'context.config.autolinks.enabled': boolean,
   'context.config.autolinks.enhanced': boolean,
   'context.config.avatars': boolean,
@@ -1235,1169 +1502,6 @@ or
 }
 ```
 
-### composer/action/changeAiModel
-
-> Sent when the user changes the AI model in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string
-}
-```
-
-### composer/action/compose
-
-> Sent when the user uses auto-compose in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'customInstructions.commitMessage.setting.length': number,
-  'customInstructions.commitMessage.setting.used': boolean,
-  'customInstructions.hash': string,
-  'customInstructions.length': number,
-  'customInstructions.setting.length': number,
-  'customInstructions.setting.used': boolean,
-  'customInstructions.used': boolean
-}
-```
-
-### composer/action/compose/failed
-
-> Sent when the user fails an auto-compose operation in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'customInstructions.commitMessage.setting.length': number,
-  'customInstructions.commitMessage.setting.used': boolean,
-  'customInstructions.hash': string,
-  'customInstructions.length': number,
-  'customInstructions.setting.length': number,
-  'customInstructions.setting.used': boolean,
-  'customInstructions.used': boolean,
-  'failure.reason': 'cancelled'
-}
-```
-
-or
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'customInstructions.commitMessage.setting.length': number,
-  'customInstructions.commitMessage.setting.used': boolean,
-  'customInstructions.hash': string,
-  'customInstructions.length': number,
-  'customInstructions.setting.length': number,
-  'customInstructions.setting.used': boolean,
-  'customInstructions.used': boolean,
-  'failure.error.message': string,
-  'failure.reason': 'error'
-}
-```
-
-### composer/action/finishAndCommit
-
-> Sent when the user finishes and commits in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string
-}
-```
-
-### composer/action/finishAndCommit/failed
-
-> Sent when the user fails to finish and commit in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'failure.error.message': string,
-  'failure.reason': 'error'
-}
-```
-
-### composer/action/generateCommitMessage
-
-> Sent when the user uses generate commit message in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'customInstructions.setting.length': number,
-  'customInstructions.setting.used': boolean,
-  'overwriteExistingMessage': boolean
-}
-```
-
-### composer/action/generateCommitMessage/failed
-
-> Sent when the user fails a generate commit message operation in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'customInstructions.setting.length': number,
-  'customInstructions.setting.used': boolean,
-  'failure.reason': 'cancelled',
-  'overwriteExistingMessage': boolean
-}
-```
-
-or
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'customInstructions.setting.length': number,
-  'customInstructions.setting.used': boolean,
-  'failure.error.message': string,
-  'failure.reason': 'error',
-  'overwriteExistingMessage': boolean
-}
-```
-
-### composer/action/includedUnstagedChanges
-
-> Sent when the user adds unstaged changes to draft commits in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string
-}
-```
-
-### composer/action/recompose
-
-> Sent when the user uses recompose in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'customInstructions.commitMessage.setting.length': number,
-  'customInstructions.commitMessage.setting.used': boolean,
-  'customInstructions.hash': string,
-  'customInstructions.length': number,
-  'customInstructions.setting.length': number,
-  'customInstructions.setting.used': boolean,
-  'customInstructions.used': boolean
-}
-```
-
-### composer/action/recompose/failed
-
-> Sent when the user fails a recompose operation in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'customInstructions.commitMessage.setting.length': number,
-  'customInstructions.commitMessage.setting.used': boolean,
-  'customInstructions.hash': string,
-  'customInstructions.length': number,
-  'customInstructions.setting.length': number,
-  'customInstructions.setting.used': boolean,
-  'customInstructions.used': boolean,
-  'failure.reason': 'cancelled'
-}
-```
-
-or
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'customInstructions.commitMessage.setting.length': number,
-  'customInstructions.commitMessage.setting.used': boolean,
-  'customInstructions.hash': string,
-  'customInstructions.length': number,
-  'customInstructions.setting.length': number,
-  'customInstructions.setting.used': boolean,
-  'customInstructions.used': boolean,
-  'failure.error.message': string,
-  'failure.reason': 'error'
-}
-```
-
-### composer/action/reset
-
-> Sent when the user uses the reset button in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string
-}
-```
-
-### composer/action/undo
-
-> Sent when the user uses the undo button in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string
-}
-```
-
-### composer/closed
-
-```typescript
-{
-  [`context.${string}`]: string | number | boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string
-}
-```
-
-### composer/loaded
-
-> Sent when the Commit Composer is first loaded with repo data
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'failure.error.message': string,
-  'failure.reason': 'error'
-}
-```
-
-### composer/reloaded
-
-> Sent when the Commit Composer is reloaded
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'failure.error.message': string,
-  'failure.reason': 'error'
-}
-```
-
-### composer/showAborted
-
-```typescript
-{
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'duration': number,
-  'loading': boolean
-}
-```
-
-### composer/shown
-
-```typescript
-{
-  [`context.${string}`]: string | number | boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'duration': number,
-  'loading': boolean
-}
-```
-
-### composer/warning/indexChanged
-
-> Sent when the user is warned that the index has changed in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string
-}
-```
-
-### composer/warning/workingDirectoryChanged
-
-> Sent when the user is warned that the working directory has changed in the Commit Composer
-
-```typescript
-{
-  'context.ai.enabled.config': boolean,
-  'context.ai.enabled.org': boolean,
-  'context.ai.model.default': boolean,
-  'context.ai.model.hidden': boolean,
-  'context.ai.model.id': string,
-  'context.ai.model.maxTokens.input': number,
-  'context.ai.model.maxTokens.output': number,
-  'context.ai.model.name': string,
-  'context.ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'github' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
-  'context.ai.model.temperature': number,
-  'context.commits.autoComposedCount': number,
-  'context.commits.composedCount': number,
-  'context.commits.finalCount': number,
-  'context.commits.initialCount': number,
-  'context.diff.files.count': number,
-  'context.diff.hash': string,
-  'context.diff.hunks.count': number,
-  'context.diff.lines.count': number,
-  'context.diff.staged.exists': boolean,
-  'context.diff.unstaged.exists': boolean,
-  'context.diff.unstaged.included': boolean,
-  'context.errors.operation.count': number,
-  'context.errors.safety.count': number,
-  'context.mode': 'experimental' | 'preview',
-  'context.onboarding.dismissed': boolean,
-  'context.onboarding.stepReached': number,
-  'context.operations.finishAndCommit.error.count': number,
-  'context.operations.generateCommitMessage.cancelled.count': number,
-  'context.operations.generateCommitMessage.count': number,
-  'context.operations.generateCommitMessage.error.count': number,
-  'context.operations.generateCommits.cancelled.count': number,
-  'context.operations.generateCommits.count': number,
-  'context.operations.generateCommits.error.count': number,
-  'context.operations.generateCommits.feedback.downvote.count': number,
-  'context.operations.generateCommits.feedback.upvote.count': number,
-  'context.operations.redo.count': number,
-  'context.operations.reset.count': number,
-  'context.operations.undo.count': number,
-  'context.session.duration': number,
-  'context.session.start': string,
-  'context.source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees',
-  'context.warnings.indexChanged': boolean,
-  'context.warnings.workingDirectoryChanged': boolean,
-  'context.webview.host': 'view' | 'editor' | 'panel',
-  'context.webview.id': string,
-  'context.webview.instanceId': string,
-  'context.webview.type': string
-}
-```
-
 ### extension/chunkLoad/failed
 
 > Sent when a lazily-loaded webpack chunk fails to load — typically because VS Code
@@ -2407,6 +1511,18 @@ background-upgraded the extension while the host kept running the old build
 {
   'error.code': string,
   'error.message': string
+}
+```
+
+### extension/resourceUsage
+
+> Hourly sampled resource usage, only while the window is focused
+
+```typescript
+{
+  [`${string}.bytes`]: number,
+  [`${string}.count`]: number,
+  'extensionHost.memory.heapUsed.bytes': number
 }
 ```
 
@@ -2430,9 +1546,136 @@ background-upgraded the extension while the host kept running the old build
 }
 ```
 
+### gitHealth/probe
+
+> Sent when the Git Health cheap shape probe runs for a repo
+
+```typescript
+{
+  // Whether the repo is "clearly large" per the banner gate
+  'clearlyLarge': boolean,
+  // Whether a commit-graph is present
+  'commitGraph.present': boolean,
+  // Extrapolated loose-object count
+  'estimate.looseObjects': number,
+  // Tracked-file count — a full/sparse index-entry count when usable, else the index-bytes proxy
+  'estimate.trackedFiles': number,
+  // Whether `estimate.trackedFiles` is the exact repository-wide count from a normal index
+  'estimate.trackedFilesExact': boolean,
+  // Number of ask-tier findings
+  'findings.ask': number,
+  // Number of auto-tier findings
+  'findings.auto': number,
+  // Total number of findings the report produced
+  'findings.total': number,
+  // Whether the repo is registered for system-scheduled maintenance
+  'maintenanceRegistered': boolean,
+  // Whether a multi-pack-index is present
+  'multiPackIndex': boolean,
+  // Whether Git is configured to use the multi-pack-index
+  'multiPackIndex.enabled': boolean,
+  // Total bytes of all pack files
+  'packs.bytes': number,
+  // Number of `*.pack` files in the object store
+  'packs.count': number,
+  // Number of pack files not represented by the active multi-pack-index
+  'packs.outsideMultiPackIndex': number,
+  // Loose refs found by the bounded files-backend probe
+  'refs.loose': number,
+  // Whether `refs.loose` is the complete count rather than the probe cap
+  'refs.looseExact': boolean,
+  // Whether the repository uses a promisor remote; undefined when unreadable
+  'repository.partial': boolean,
+  // Repository reference-storage backend
+  'repository.refFormat': 'unknown' | 'files' | 'reftable',
+  // Whether the local repository has an intentional shallow-history boundary; undefined when unreadable
+  'repository.shallow': boolean,
+  // Whether sparse checkout is enabled; undefined when config was unreadable
+  'repository.sparseCheckout': boolean,
+  // Whether sparse-index writes are enabled; undefined when config was unreadable
+  'repository.sparseIndex': boolean,
+  // Whether this worktree uses a split index; undefined when detection failed
+  'repository.splitIndex': boolean,
+  // Count of slow git commands observed for this repo — persisted across sessions, pruned after 30 days idle
+  'slowness.count': number,
+  // Slow history commands observed
+  'slowness.history': number,
+  // Slow object-lookup commands observed
+  'slowness.objects': number,
+  // Slow reference-iteration commands observed
+  'slowness.refs': number,
+  // Slow working-tree commands observed
+  'slowness.worktree': number
+}
+```
+
+### gitOptimizations/commitGraph/toggled
+
+> Sent when the per-repo commit-graph maintenance toggle is switched from the Repository Health view
+
+```typescript
+{
+  // The toggle's new state — `false` means the user opted this repo out of automatic commit-graph maintenance
+  'enabled': boolean
+}
+```
+
+### gitOptimizations/maintenance/run
+
+> Sent when the auto-tier runs a `git maintenance run --task=…` one-shot (or "Run Maintenance Now")
+
+```typescript
+{
+  // Whether Git's native auto condition was allowed to skip the task
+  'auto': boolean,
+  // Duration of the run in ms
+  'duration': number,
+  // Coarse duration bucket
+  'duration.bucket': '<1s' | '1-5s' | '5-15s' | '15-60s' | '>60s',
+  // The maintenance task that was invoked
+  'task': 'commit-graph' | 'loose-objects' | 'incremental-repack' | 'pack-refs'
+}
+```
+
+### gitOptimizations/optimization/applied
+
+> Sent when a config-lever optimization is actually applied to a repo (auto tier or user-initiated)
+
+```typescript
+{
+  // Duration of the apply in ms
+  'duration': number,
+  // Coarse duration bucket
+  'duration.bucket': '<1s' | '1-5s' | '5-15s' | '15-60s' | '>60s',
+  // The config lever that was applied
+  'optimization': 'untrackedCache' | 'fsmonitor' | 'backgroundMaintenance' | 'manyFiles' | 'sparseIndex',
+  // Which tier applied it — `auto` is the silent daily pass, `ask` is user-initiated
+  'tier': 'ask' | 'auto'
+}
+```
+
 ### graph/action/jumpTo
 
-> Sent when the user clicks on the Jump to HEAD/Reference (alt) header button on the Commit Graph
+> Sent when the user clicks the Focus Branch header button on the Commit Graph (plain-click focuses the current branch; alt-click opens the branch picker)
+
+```typescript
+{
+  'alt': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/action/openRepoOnRemote
+
+> Sent when the user lands on a reference with the Commit Graph's type-ahead reference finder
 
 ```typescript
 {
@@ -2444,12 +1687,11 @@ background-upgraded the extension while the host kept running the old build
   'context.webview.host': 'view' | 'editor' | 'panel',
   'context.webview.id': string,
   'context.webview.instanceId': string,
-  'context.webview.type': string,
-  'target': 'HEAD' | 'choose'
+  'context.webview.type': string
 }
 ```
 
-### graph/action/openRepoOnRemote
+### graph/action/refFind
 
 > Sent when the user clicks on the "Jump to HEAD"/"Jump to Reference" (alt) header button on the Commit Graph
 
@@ -2463,7 +1705,17 @@ background-upgraded the extension while the host kept running the old build
   'context.webview.host': 'view' | 'editor' | 'panel',
   'context.webview.id': string,
   'context.webview.instanceId': string,
-  'context.webview.type': string
+  'context.webview.type': string,
+  // Which kind of reference was landed on.
+  'kind': 'wip' | 'head' | 'remote' | 'tag',
+  // Whether the reference's commit had to be paged in first (the Enter-to-fetch path).
+  'loaded': boolean,
+  // Whether the query used `/` path segments (e.g. `d/f/foo`) rather than a plain substring.
+  'segmented': boolean,
+  // How the finder was opened — tells us whether the header button is carrying its own discovery.
+  'source': 'shortcut' | 'button',
+  // Terms in the query, as a proxy for how much typing it took to converge. NOT the query itself.
+  'terms': number
 }
 ```
 
@@ -2483,6 +1735,174 @@ background-upgraded the extension while the host kept running the old build
   'context.webview.id': string,
   'context.webview.instanceId': string,
   'context.webview.type': string
+}
+```
+
+### graph/agents/filtered
+
+> Sent when the sidebar agents filter toggles between empty and non-empty (not on every keystroke)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'filter.length': number,
+  'hasFilter': boolean,
+  'sessions.count': number
+}
+```
+
+### graph/agents/headerAction
+
+> Sent when the user clicks a header action (Start Work, Start Review, Refresh) in the sidebar agents panel
+
+```typescript
+{
+  'action': 'startReview' | 'startWork' | 'refresh',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/agents/layoutToggled
+
+> Sent when the user toggles the tree/list layout in the sidebar agents panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'layout': 'list' | 'tree',
+  'sessions.count': number
+}
+```
+
+### graph/agents/permissionResolved
+
+> Sent when the user resolves a permission (Allow/Deny/Always Allow) from the sidebar agents panel
+
+```typescript
+{
+  'alwaysAllow': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'decision': 'allow' | 'deny',
+  'permission.kind': string
+}
+```
+
+### graph/agents/sessionAction
+
+> Sent when the user clicks Open/Resume Session or View Plan on a session, or Open Terminal on a worktree group, in the sidebar agents panel
+
+```typescript
+{
+  'action': 'openSession' | 'resumeSession' | 'openPlanFile' | 'openTerminal',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/agents/sessionSelected
+
+> Sent when the user clicks an agent session leaf in the sidebar agents panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'layout': 'list' | 'tree',
+  'session.category': 'working' | 'needs-input' | 'idle' | 'ended',
+  'session.hasPendingPermission': boolean,
+  'session.phase': string,
+  'session.sameRepo': boolean
+}
+```
+
+### graph/agents/showEndedToggled
+
+> Sent when the user toggles ended (past) sessions on/off in the sidebar agents panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'enabled': boolean,
+  // Ended session count BEFORE the toggle takes effect
+  'sessions.ended.count': number
+}
+```
+
+### graph/agents/shown
+
+> Sent when the Agents sidebar panel becomes visible
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'layout': 'list' | 'tree',
+  'sessions.count': number,
+  'sessions.ended.count': number,
+  'sessions.idle.count': number,
+  'sessions.needsInput.count': number,
+  'sessions.working.count': number
 }
 ```
 
@@ -2506,14 +1926,160 @@ background-upgraded the extension while the host kept running the old build
 }
 ```
 
+### graph/branches/branchAction
+
+> Sent when the user invokes an action on a branch item, via inline hover-icon or right-click context menu (see `location`)
+
+```typescript
+{
+  'action': 'merge' | 'switch' | 'fetch' | 'pull' | 'push' | 'compareWithHead' | 'compareWithWorking' | 'openWorktree' | 'openWorktreeInNewWindow' | 'delete' | 'rename' | 'rebaseOntoBranch' | 'rebaseOntoUpstream' | 'reset' | 'publish' | 'setUpstream' | 'changeUpstream',
+  'alt': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Where the action was invoked from — hover-icon (inline) vs the right-click context menu
+  'location': 'inline' | 'contextMenu'
+}
+```
+
+### graph/branches/branchSelected
+
+> Sent when the user clicks a branch leaf in the sidebar branches panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'hasUpstream': boolean,
+  'hasWorktree': boolean,
+  'isCurrent': boolean,
+  'isStarred': boolean
+}
+```
+
+### graph/branches/filtered
+
+> Sent when the user types in the filter box in the sidebar branches panel
+
+```typescript
+{
+  // Total branches in the panel (the filter corpus), NOT the number of matches — matching happens inside the tree component and the match count isn't surfaced.
+  'branches.count': number,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'filter.length': number,
+  'hasFilter': boolean
+}
+```
+
+### graph/branches/headerAction
+
+> Sent when the user clicks a header action (Switch to Branch, Create Branch, Refresh) in the sidebar branches panel
+
+```typescript
+{
+  'action': 'refresh' | 'switchToBranch' | 'createBranch',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/branches/layoutToggled
+
+> Sent when the user toggles the tree/list layout in the sidebar branches panel
+
+```typescript
+{
+  'branches.count': number,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'layout': 'list' | 'tree'
+}
+```
+
+### graph/branches/shown
+
+> Sent when the Branches sidebar panel becomes visible
+
+```typescript
+{
+  'branches.count': number,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'layout': 'list' | 'tree'
+}
+```
+
+### graph/branches/showRemoteBranchesToggled
+
+> Sent when the user toggles remote branches on/off in the sidebar branches panel
+
+```typescript
+{
+  // Branch count BEFORE the toggle takes effect — the panel refetches asynchronously
+  'branches.count': number,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'enabled': boolean
+}
+```
+
 ### graph/branchesVisibility/changed
 
 > Sent when the user changes the "branches visibility" on the Commit Graph
 
 ```typescript
 {
-  'branchesVisibility.new': 'all' | 'smart' | 'current' | 'favorited' | 'agents',
-  'branchesVisibility.old': 'all' | 'smart' | 'current' | 'favorited' | 'agents',
+  'branchesVisibility.new': 'agents' | 'all' | 'smart' | 'current' | 'favorited',
+  'branchesVisibility.old': 'agents' | 'all' | 'smart' | 'current' | 'favorited',
   'context.repository.closed': boolean,
   'context.repository.folder.scheme': string,
   'context.repository.id': string,
@@ -2538,14 +2104,38 @@ background-upgraded the extension while the host kept running the old build
 }
 ```
 
+### graph/coachMark
+
+> Sent when a contextual coach mark (feature how-to) is shown or dismissed on the Commit Graph
+
+```typescript
+{
+  'action': 'shown' | 'dismissed' | 'actioned',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Which coach mark (`GraphCoachMarkType`)
+  'key': string,
+  // How the mark was shown — state-triggered (`auto`) or re-opened from its lightbulb (`lightbulb`)
+  'trigger': 'auto' | 'lightbulb'
+}
+```
+
 ### graph/columns/changed
 
 > Sent when the user changes the columns on the Commit Graph
 
 ```typescript
 {
+  [`column.${string}.grouped`]: string | boolean,
   [`column.${string}.isHidden`]: boolean,
-  [`column.${string}.mode`]: string,
+  [`column.${string}.mode`]: 'compact' | 'numbers' | 'squares' | 'bar' | 'bipolar',
   [`column.${string}.order`]: number,
   [`column.${string}.width`]: number,
   'context.repository.closed': boolean,
@@ -2613,6 +2203,238 @@ background-upgraded the extension while the host kept running the old build
 }
 ```
 
+### graph/gitHealth/banner/dismissed
+
+> Sent when the user dismisses the Git Health banner strip
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Count of suggested optimizations advertised
+  'findings.suggested': number,
+  // Which evidence family armed the banner
+  'reason': 'slowness' | 'large'
+}
+```
+
+### graph/gitHealth/banner/opened
+
+> Sent when the user opens Repository Health from the banner strip
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Count of suggested optimizations advertised
+  'findings.suggested': number,
+  // Which evidence family armed the banner
+  'reason': 'slowness' | 'large'
+}
+```
+
+### graph/gitHealth/banner/shown
+
+> Sent when the Git Health banner strip is shown in the Commit Graph
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Count of suggested optimizations advertised
+  'findings.suggested': number,
+  // Which evidence family armed the banner
+  'reason': 'slowness' | 'large'
+}
+```
+
+### graph/intro/shown
+
+> Sent when the one-time Graph intro (welcome + optional layout prompt) is shown on first entry
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // True when the layout sub-section (Side Bar vs. Bottom Panel) was shown alongside the welcome
+  'withLayoutOptions': boolean
+}
+```
+
+### graph/jump/failed
+
+> Sent when a Commit Graph jump (a ref pill, sidebar/overview select, search step, host-initiated
+reveal, …) settles without landing on its row and shows the jump-feedback toast
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // The classified failure kind — a hidden row's sub-reason when applicable, else the top-level kind (`not-found`, `invalid-ref`, `first-parent`, `timeout`, `error`).
+  'reason': string,
+  // Diagnostic origin of the navigation that failed (a `GraphNavigationSource`, or `'host'` for a host-initiated reveal that never resolved its ref).
+  'source': string
+}
+```
+
+### graph/kanban/closed
+
+> Sent when the Graph leaves Kanban display mode (close button, sidebar rail, etc.)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/kanban/permissionResolved
+
+> Sent when the user resolves a permission (Allow/Deny or Approve/Reject) from a kanban session card
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'decision': 'allow' | 'deny',
+  'permission.kind': string
+}
+```
+
+### graph/kanban/sessionAction
+
+> Sent when the user clicks Open/Resume Session or View Plan on a kanban session card
+
+```typescript
+{
+  'action': 'openSession' | 'resumeSession' | 'openPlanFile',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/kanban/sessionSelected
+
+> Sent when the user clicks a session card in the Agent Kanban to open its worktree WIP
+
+```typescript
+{
+  'column': 'working' | 'needs-input' | 'idle' | 'inactive',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'session.category': 'working' | 'needs-input' | 'idle' | 'ended',
+  'session.hasPendingPermission': boolean,
+  'session.phase': string,
+  'session.sameRepo': boolean
+}
+```
+
+### graph/kanban/shown
+
+> Sent when the Agent Kanban becomes visible
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'sessions.count': number,
+  'sessions.idle.count': number,
+  'sessions.inactive.count': number,
+  'sessions.needsInput.count': number,
+  'sessions.working.count': number
+}
+```
+
+### graph/layoutPrompt/choice
+
+> Sent when the user answers (or closes) the one-time layout-choice prompt
+
+```typescript
+{
+  // `dismissed` = closed the prompt without choosing (keeps the current layout, never re-asks)
+  'choice': 'panel' | 'dismissed' | 'sidebar',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
 ### graph/minimap/day/selected
 
 > Sent when the user selects (clicks on) a day on the minimap on the Commit Graph
@@ -2650,13 +2472,117 @@ background-upgraded the extension while the host kept running the old build
   'context.webview.type': string,
   // Where on the card the action was invoked
   'location': 'inline' | 'hover',
-  'name': 'pull' | 'push' | 'fetch' | 'publishBranch' | 'switch' | 'openWorktree' | 'compareWithHead' | 'compareWithWorking' | 'compareWithPr' | 'other'
+  'name': 'switch' | 'fetch' | 'pull' | 'push' | 'compareWithHead' | 'compareWithWorking' | 'openWorktree' | 'publishBranch' | 'compareWithPr' | 'openPrChanges' | 'openChanges' | 'other',
+  // Which surface the hover was anchored on (always `overview` for `location: 'inline'`)
+  'surface': 'overview' | 'wip-bar'
+}
+```
+
+### graph/overview/branchSelected
+
+> Sent when the user clicks a branch card to scope the graph to that branch
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether the branch has associated issues or autolinks
+  'hasIssues': boolean,
+  // Whether the branch has an associated pull request
+  'hasPr': boolean,
+  // Whether the branch has uncommitted working tree changes
+  'hasWip': boolean,
+  // Whether the branch is the currently opened (active) branch
+  'isActive': boolean,
+  // Whether the branch is checked out in a worktree
+  'isWorktree': boolean
+}
+```
+
+### graph/overview/hoverShown
+
+> Sent when the rich hover popover opens for the first time on a branch card
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether the branch has active agent sessions
+  'hasAgents': boolean,
+  // Whether the branch has associated issues or autolinks
+  'hasIssues': boolean,
+  // Whether the branch has an associated pull request
+  'hasPr': boolean,
+  // Whether the branch has uncommitted working tree changes
+  'hasWip': boolean,
+  // Whether the branch is the currently opened (active) branch
+  'isActive': boolean,
+  // Whether the branch is checked out in a worktree
+  'isWorktree': boolean,
+  // Which surface the hover was anchored on
+  'surface': 'overview' | 'wip-bar'
+}
+```
+
+### graph/overview/linkClicked
+
+> Sent when the user clicks a PR or issue link in the Graph Overview hover popover
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Which surface the hover was anchored on
+  'surface': 'overview' | 'wip-bar',
+  // Type of external link clicked
+  'type': 'pullrequest' | 'issue' | 'autolink'
+}
+```
+
+### graph/overview/recentThresholdChanged
+
+> Sent when the user changes the Recent timeframe threshold in the Graph Overview
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // New threshold value selected by the user
+  'threshold': 'OneDay' | 'OneWeek' | 'OneMonth'
 }
 ```
 
 ### graph/overview/shown
 
-> Sent when the Graph Overview panel becomes visible (mounted in the active sidebar slot)
+> Sent when the Graph Overview panel becomes visible
 
 ```typescript
 {
@@ -2672,7 +2598,246 @@ background-upgraded the extension while the host kept running the old build
   'context.webview.host': 'view' | 'editor' | 'panel',
   'context.webview.id': string,
   'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Active Recent timeframe threshold at the time of show
+  'recentThreshold': 'OneDay' | 'OneWeek' | 'OneMonth'
+}
+```
+
+### graph/pullRequests/filtered
+
+> Sent when the user types in the filter box in the sidebar pull requests panel
+
+```typescript
+{
+  // Whether the query named a specific pull request (a pasted URL or `#123`) rather than free text
+  'byIdentity': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'filter.length': number,
+  'hasFilter': boolean,
+  'pullRequests.count': number
+}
+```
+
+### graph/pullRequests/headerAction
+
+> Sent when the user clicks a header action (Create Pull Request, Refresh) in the sidebar pull requests panel
+
+```typescript
+{
+  'action': 'createPullRequest' | 'refresh',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
   'context.webview.type': string
+}
+```
+
+### graph/pullRequests/pullRequestAction
+
+> Sent when the user invokes an action on a pull request item, via inline hover-icon or right-click context menu (see `location`)
+
+```typescript
+{
+  'action': 'switch' | 'openChanges' | 'openOnRemote' | 'openInWorktree' | 'openComparison' | 'openPullRequest' | 'copy' | 'copyUrl',
+  // True when invoked via a chip's alt (Alt-click) variant — `openInWorktree` is `switch`'s alt and `copyUrl` is `openOnRemote`'s. `openInWorktree` also reports `alt: false`, as the primary chip when the head already has a worktree and as a context-menu entry.
+  'alt': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Where the action was invoked from — hover-icon (inline) vs the right-click context menu
+  'location': 'inline' | 'contextMenu'
+}
+```
+
+### graph/pullRequests/pullRequestSelected
+
+> Sent when the user clicks a pull request leaf in the sidebar pull requests panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'draft': boolean,
+  // Whether the row's head resolved to a ref in this repository (false for a fork)
+  'reachable': boolean
+}
+```
+
+### graph/pullRequests/searched
+
+> Sent when the user looks up a pull request the loaded list doesn't hold, from a pasted URL or number
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether the provider had a pull request with that number
+  'found': boolean
+}
+```
+
+### graph/pullRequests/shown
+
+> Sent when the Pull Requests sidebar panel becomes visible
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Why the panel is empty, when the reason isn't "no open pull requests" — set only when the panel shows a connect pitch, a no-remotes notice, or a not-supported notice (`unsupported`, a host with no repo-scoped pull request query) instead of a list
+  'emptyReason': 'no-remotes' | 'no-supported-remote' | 'integration-disconnected' | 'unsupported',
+  'pullRequests.count': number,
+  // Number of drafts, which are listed but rarely the reason the panel was opened
+  'pullRequests.draft.count': number,
+  // Number whose head lives in a fork — these carry no ref the graph can scope to, so they have no Focus action
+  'pullRequests.fork.count': number
+}
+```
+
+### graph/remotes/filtered
+
+> Sent when the user types in the filter box in the sidebar remotes panel (debounced, not on every keystroke)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'filter.length': number,
+  'hasFilter': boolean,
+  // Total remotes in the panel (the filter corpus), NOT the number of matches — matching happens inside the tree component and the match count isn't surfaced.
+  'remotes.count': number
+}
+```
+
+### graph/remotes/headerAction
+
+> Sent when the user clicks a header action (Add Remote, Refresh) in the sidebar remotes panel
+
+```typescript
+{
+  'action': 'refresh' | 'addRemote',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/remotes/layoutToggled
+
+> Sent when the user toggles the tree/list layout in the sidebar remotes panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'layout': 'list' | 'tree',
+  'remotes.count': number
+}
+```
+
+### graph/remotes/remoteAction
+
+> Sent when the user invokes an action on a remote item, via inline hover-icon or right-click context menu (see `location`)
+
+```typescript
+{
+  'action': 'fetch' | 'openOnRemote' | 'copyUrl' | 'connectIntegration' | 'disconnectIntegration' | 'openBranchesOnRemote' | 'copyBranchesUrl' | 'prune' | 'remove' | 'setDefault' | 'unsetDefault',
+  'alt': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Where the action was invoked from — hover-icon (inline) vs the right-click context menu
+  'location': 'inline' | 'contextMenu'
+}
+```
+
+### graph/remotes/shown
+
+> Sent when the Remotes sidebar panel becomes visible
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'hasMultipleRemotes': boolean,
+  'layout': 'list' | 'tree',
+  // Remotes whose integration is connected
+  'remotes.connected.count': number,
+  'remotes.count': number
 }
 ```
 
@@ -2778,7 +2943,7 @@ background-upgraded the extension while the host kept running the old build
   // Whether the scoped branch has a tracked upstream resolved at the time of the scope change
   'scope.hasUpstream': boolean,
   // Where the user initiated the scope change
-  'source': 'popover' | 'overview-card'
+  'source': 'sidebar' | 'popover' | 'overview-card' | 'wip-row'
 }
 ```
 
@@ -2820,7 +2985,17 @@ background-upgraded the extension while the host kept running the old build
   'failed.error': string,
   'failed.error.detail': string,
   'failed.reason': 'cancelled' | 'error',
+  // Whether the pattern failed to compile as a regex and was silently retried as a literal search
+  'fallback.literal': boolean,
   'matches': number,
+  // The AI-routed search intent for a natural-language search, when present
+  'nl.mode': 'highlight' | 'filter' | 'select',
+  // Count of counted relaxation offers shown for a zero-result NL search (0 = none survived probing)
+  'nl.relaxations.offered': number,
+  // Whether an NL-converted query git rejected went through the AI repair path
+  'nl.repair.attempted': boolean,
+  // Whether the AI repair path produced a query that git accepted
+  'nl.repair.succeeded': boolean,
   'types': string
 }
 ```
@@ -2849,28 +3024,44 @@ background-upgraded the extension while the host kept running the old build
   'context.config.allowMultiple': boolean,
   'context.config.autoFetch.enabled': boolean,
   'context.config.avatars': boolean,
-  'context.config.branchesVisibility': 'all' | 'smart' | 'current' | 'favorited' | 'agents',
+  'context.config.branchesVisibility': 'agents' | 'all' | 'smart' | 'current' | 'favorited',
+  'context.config.changesColumn.enabled': boolean,
+  'context.config.changesColumn.mode': 'numbers' | 'squares' | 'bar' | 'bipolar',
   'context.config.commitOrdering': 'date' | 'author-date' | 'topo',
   'context.config.dateFormat': string,
   'context.config.dateStyle': 'absolute' | 'relative',
   'context.config.defaultItemLimit': number,
-  'context.config.details.location': 'right' | 'bottom',
+  'context.config.details.location': 'auto' | 'right' | 'bottom',
+  'context.config.details.maximizeOnMode': boolean,
   'context.config.dimMergeCommits': boolean,
   'context.config.editorOpeningBehavior': 'active' | 'auto',
   'context.config.experimental.kanban.enabled': boolean,
+  'context.config.experimental.visualizations.activityDecay': '30s' | '1m' | '2m' | '5m' | '10m' | '30m',
   'context.config.experimental.visualizations.enabled': boolean,
-  'context.config.highlightRowsOnRefHover': boolean,
+  'context.config.followTerminal.allowRepositorySwitching': boolean,
+  'context.config.followTerminal.enabled': boolean,
   'context.config.initialRowSelection': 'wip' | 'head',
   'context.config.issues.enabled': boolean,
+  'context.config.lanes.density': 'compact' | 'expanded',
+  'context.config.lanes.folding.default': 'none' | 'auto' | 'all',
+  'context.config.lanes.folding.enabled': boolean,
+  'context.config.lanes.grouped.max': number,
+  'context.config.lanes.grouped.min': number,
   'context.config.layout': 'editor' | 'panel',
   'context.config.minimap.additionalTypes': string,
   'context.config.minimap.dataType': 'commits' | 'lines',
+  'context.config.minimap.defaultVisibility': 'hidden' | 'onSearch' | 'always',
   'context.config.minimap.enabled': boolean,
   'context.config.minimap.reversed': boolean,
   'context.config.multiselect': boolean | 'topological',
   'context.config.onlyFollowFirstParent': boolean,
+  'context.config.overviewBar.visibility': 'worktrees' | 'always' | 'dirtyWorktrees' | 'never',
   'context.config.pageItemLimit': number,
   'context.config.pullRequests.enabled': boolean,
+  'context.config.refFindAutoHide': boolean,
+  'context.config.refs.layout': 'inline' | 'stacked',
+  'context.config.refs.maxInline': number | 'auto',
+  'context.config.refs.maxStacked': number | 'auto',
   'context.config.scrollMarkers.additionalTypes': string,
   'context.config.scrollMarkers.enabled': boolean,
   'context.config.scrollRowPadding': number,
@@ -2879,11 +3070,14 @@ background-upgraded the extension while the host kept running the old build
   'context.config.showGhostRefsOnRowHover': boolean,
   'context.config.showRemoteNames': boolean,
   'context.config.showUpstreamStatus': boolean,
+  'context.config.showWorkingTreeBadge': boolean,
   'context.config.showWorktreeWipStats': boolean,
   'context.config.sidebar.enabled': boolean,
   'context.config.sidebar.pinned': boolean,
   'context.config.statusBar.enabled': boolean,
   'context.config.stickyTimeline': boolean,
+  'context.config.style': 'auto' | 'list' | 'table',
+  'context.config.timelineSeparators': boolean,
   'context.repository.closed': boolean,
   'context.repository.folder.scheme': string,
   'context.repository.id': string,
@@ -2895,6 +3089,479 @@ background-upgraded the extension while the host kept running the old build
   'context.webview.type': string,
   'duration': number,
   'loading': boolean
+}
+```
+
+### graph/signin/introVideo/clicked
+
+> Sent when the user clicks the intro-video thumbnail on the sign-in gate (intro-video A/B variant)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/signin/shown
+
+> Sent when the sign-in gate is shown (once per Graph instance) — base of the intro-video A/B funnel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Which sign-in gate variant rendered — `unassigned` = no cohort, rendered as the default gate but excluded from arm comparisons
+  'variant': 'default' | 'intro-video' | 'unassigned'
+}
+```
+
+### graph/stashes/filtered
+
+> Sent when the user types in the filter box in the sidebar stashes panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'filter.length': number,
+  'hasFilter': boolean,
+  'stashes.count': number
+}
+```
+
+### graph/stashes/headerAction
+
+> Sent when the user clicks a header action (Stash All, Apply/Pop Stash, Refresh) in the sidebar stashes panel
+
+```typescript
+{
+  'action': 'refresh' | 'stashAll' | 'applyStash',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/stashes/shown
+
+> Sent when the Stashes sidebar panel becomes visible
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'stashes.count': number
+}
+```
+
+### graph/stashes/stashAction
+
+> Sent when the user invokes an action on a stash item, via inline hover-icon or right-click context menu (see `location`)
+
+```typescript
+{
+  'action': 'delete' | 'rename' | 'apply',
+  // Reserved for parity with other panels' item actions — no stash inline action defines an alt variant yet, so always false today
+  'alt': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Where the action was invoked from — hover-icon (inline) vs the right-click context menu
+  'location': 'inline' | 'contextMenu'
+}
+```
+
+### graph/stashes/stashSelected
+
+> Sent when the user clicks a stash leaf in the sidebar stashes panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether the stash carries the branch ref it was created on
+  'hasStashOnRef': boolean
+}
+```
+
+### graph/tags/filtered
+
+> Sent when the user types in the filter box in the sidebar tags panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'filter.length': number,
+  'hasFilter': boolean,
+  'tags.count': number
+}
+```
+
+### graph/tags/headerAction
+
+> Sent when the user clicks a header action (Create Tag, Refresh) in the sidebar tags panel
+
+```typescript
+{
+  'action': 'refresh' | 'createTag',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/tags/layoutToggled
+
+> Sent when the user toggles the tree/list layout in the sidebar tags panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'layout': 'list' | 'tree',
+  'tags.count': number
+}
+```
+
+### graph/tags/shown
+
+> Sent when the Tags sidebar panel becomes visible
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'layout': 'list' | 'tree',
+  // Number of annotated tags (tag objects with their own metadata) vs lightweight refs
+  'tags.annotated.count': number,
+  'tags.count': number
+}
+```
+
+### graph/tags/tagAction
+
+> Sent when the user invokes an action on a tag item, via inline hover-icon or right-click context menu (see `location`)
+
+```typescript
+{
+  'action': 'push' | 'delete' | 'reset' | 'createBranch' | 'switchTo',
+  // Reserved for parity with other panels' item actions — no tag inline action defines an alt variant yet, so always false today
+  'alt': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Where the action was invoked from — hover-icon (inline) vs the right-click context menu
+  'location': 'inline' | 'contextMenu'
+}
+```
+
+### graph/tags/tagSelected
+
+> Sent when the user clicks a tag leaf in the sidebar tags panel
+
+```typescript
+{
+  // Whether the selected tag is annotated (a tag object) vs a lightweight ref
+  'annotated': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/timeline/commitSelected
+
+> Sent when the user selects a commit in the embedded Visual History chart (first-paint auto-selections excluded)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'shift': boolean
+}
+```
+
+### graph/timeline/periodChanged
+
+> Sent when the user changes the period in the embedded Visual History header
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'period.new': string,
+  'period.old': string
+}
+```
+
+### graph/timeline/scopeChanged
+
+> Sent when the user changes the file/folder scope of the embedded Visual History (path picker, clear, or breadcrumb)
+
+```typescript
+{
+  'action': 'choose' | 'clear' | 'breadcrumb',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'scope.type': 'file' | 'folder',
+  // Whether a file/folder scope is active AFTER this change
+  'scoped': boolean
+}
+```
+
+### graph/timeline/shown
+
+> Sent when the embedded Visual History (timeline) visualization becomes visible
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'period': string,
+  'scoped': boolean,
+  'sliceBy': 'branch' | 'author'
+}
+```
+
+### graph/timeline/sliceByChanged
+
+> Sent when the user changes the slice-by axis in the embedded Visual History header
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'sliceBy.new': 'branch' | 'author',
+  'sliceBy.old': 'branch' | 'author'
+}
+```
+
+### graph/treemap/decayChanged
+
+> Sent when the user changes the activity decay window in the Agent Activity Treemap
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'decay.new': string,
+  'decay.old': string
+}
+```
+
+### graph/treemap/fileClicked
+
+> Sent when the user clicks a file leaf in the treemap
+
+```typescript
+{
+  'action': 'open' | 'history',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'mode': 'commits' | 'files' | 'activity',
+  // Only set in `activity` mode — whether the click also focused an agent session that touched the file
+  'session.focused': boolean
+}
+```
+
+### graph/treemap/periodChanged
+
+> Sent when the user changes the period in the Commits Treemap
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'period.new': string,
+  'period.old': string
+}
+```
+
+### graph/treemap/shown
+
+> Sent when a treemap visualization becomes visible for a repo + mode and its data has loaded
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'files.count': number,
+  'mode': 'commits' | 'files' | 'activity',
+  // Only set in `commits` mode — the other modes have no period axis
+  'period': string
+}
+```
+
+### graph/treemap/zoomed
+
+> Sent when the user zooms the treemap in or out (folder drill-down or breadcrumb)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Folder depth of the zoom target; 0 = back at the root
+  'depth': number,
+  'direction': 'in' | 'out',
+  'mode': 'commits' | 'files' | 'activity'
 }
 ```
 
@@ -2943,13 +3610,118 @@ background-upgraded the extension while the host kept running the old build
 }
 ```
 
+### graph/visualizations/closed
+
+> Sent when the Graph leaves Visualizations display mode (close button, sidebar rail, external search request, etc.)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'mode': 'timeline' | 'treemap-files' | 'treemap-commits' | 'treemap-activity' | 'health'
+}
+```
+
+### graph/visualizations/modeChanged
+
+> Sent when the user switches the active visualization via the switcher, or when a virtual repo forces a fallback from the Commits Treemap to the Files Treemap
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'mode.new': 'timeline' | 'treemap-files' | 'treemap-commits' | 'treemap-activity' | 'health',
+  'mode.old': 'timeline' | 'treemap-files' | 'treemap-commits' | 'treemap-activity' | 'health',
+  // `fallback` when a virtual repo forced Commits → Files on mount (not a user action)
+  'reason': 'user' | 'fallback'
+}
+```
+
+### graph/wip/action
+
+> Sent when the user triggers a branch action from the WIP panel header or next-steps
+
+```typescript
+{
+  // Which action was triggered
+  'action': 'startReview' | 'startWork' | 'createPullRequest' | 'fetch' | 'pull' | 'push' | 'createBranch' | 'publishBranch' | 'applyStash' | 'forcePush' | 'switchBranch' | 'createPullRequestWithAI' | 'rebaseOntoMergeTarget' | 'mergeMergeTarget' | 'shareAsCloudPatch' | 'copyPatch' | 'stashSave' | 'stashSaveStaged' | 'stashSaveFiles' | 'createWorktree',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/wip/commit/amendToggled
+
+> Sent when the user toggles the "Amend Previous Commit" checkbox in the WIP panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // New state of the amend toggle (true = amend on)
+  'enabled': boolean,
+  // Whether the commit box had text when toggled
+  'hasMessage': boolean
+}
+```
+
+### graph/wip/commit/coauthorsAdded
+
+> Sent when the user completes the co-author picker and trailers are appended to the commit message
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Number of co-authors selected
+  'count': number
+}
+```
+
 ### graph/wip/commit/failed
 
 > Sent when a commit from the Graph's WIP panel fails (e.g. a hook rejection or signing failure)
 
 ```typescript
 {
-  // Whether the failed commit was an amend
+  // Whether smart-commit committed everything (`-a`) because nothing was explicitly staged
+  'all': boolean,
+  // Whether the commit was an amend
   'amend': boolean,
   'context.repository.closed': boolean,
   'context.repository.folder.scheme': string,
@@ -2960,9 +3732,413 @@ background-upgraded the extension while the host kept running the old build
   'context.webview.id': string,
   'context.webview.instanceId': string,
   'context.webview.type': string,
+  // Number of staged files
+  'files.staged.count': number,
+  // Total number of changed files in the working tree
+  'files.total.count': number,
   // Whether raw output (hook/git stderr) was captured and surfaced via "View Full Output"
   'hasOutput': boolean,
-  'reason': 'unknown' | 'hookRejected' | 'signingFailed' | 'nothingToCommit' | 'conflicts' | 'identityMissing'
+  // Whether any files were staged at commit time
+  'hasStagedFiles': boolean,
+  // Length of the commit message (characters, not content)
+  'message.length': number,
+  'reason': 'unknown' | 'hookRejected' | 'signingFailed' | 'nothingToCommit' | 'conflicts' | 'identityMissing',
+  // Whether the `git.enableSmartCommit` preference was on at commit time
+  'smartCommit': boolean
+}
+```
+
+### graph/wip/commit/succeeded
+
+> Sent when a commit from the Graph's WIP panel succeeds (commit or amend)
+
+```typescript
+{
+  // Whether smart-commit committed everything (`-a`) because nothing was explicitly staged
+  'all': boolean,
+  // Whether the commit was an amend
+  'amend': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Number of staged files
+  'files.staged.count': number,
+  // Total number of changed files in the working tree
+  'files.total.count': number,
+  // Whether any files were staged at commit time
+  'hasStagedFiles': boolean,
+  // Length of the commit message (characters, not content)
+  'message.length': number,
+  // Whether the `git.enableSmartCommit` preference was on at commit time
+  'smartCommit': boolean
+}
+```
+
+### graph/wip/generateMessage/cancelled
+
+> Sent when the user cancels an in-flight AI commit message generation
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Milliseconds from start to cancellation; undefined if startedAt was missing
+  'duration': number
+}
+```
+
+### graph/wip/generateMessage/failed
+
+> Sent when AI commit message generation fails or returns an empty message
+
+```typescript
+{
+  // Whether amend mode was on
+  'amend': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Milliseconds until failure; undefined if startedAt was missing
+  'duration': number,
+  // Error message text describing why the generation failed; undefined for the 'empty' case
+  'failure.error.message': string,
+  // Whether there was prior text
+  'hasExistingMessage': boolean,
+  // Why the generation failed: 'error' = RPC/AI threw, 'empty' = AI returned an empty message
+  'reason': 'error' | 'empty'
+}
+```
+
+### graph/wip/generateMessage/started
+
+> Sent when the user clicks the sparkle button to generate an AI commit message
+
+```typescript
+{
+  // Whether amend mode was on at generation time
+  'amend': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Count of staged files
+  'files.staged.count': number,
+  // Total changed files in the working tree
+  'files.total.count': number,
+  // Whether the commit box already had text (AI refine vs. blank-slate)
+  'hasExistingMessage': boolean,
+  // Whether files were staged
+  'hasStagedFiles': boolean,
+  // Length of existing message (0 if blank)
+  'message.length': number
+}
+```
+
+### graph/wip/generateMessage/succeeded
+
+> Sent when AI commit message generation completes with a non-empty message
+
+```typescript
+{
+  // Whether amend mode was on
+  'amend': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Wall-clock milliseconds from start to settlement; undefined if startedAt was missing
+  'duration': number,
+  // Whether there was prior text (refine flow)
+  'hasExistingMessage': boolean,
+  // Character length of the generated message
+  'result.length': number
+}
+```
+
+### graph/wip/staging/discard
+
+> Sent when the user discards file changes from the Graph's WIP panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Number of files affected (available for file/files scope)
+  'files.count': number,
+  // Whether a single file, multi-select, discard-all-staged, or discard-all-unstaged
+  'scope': 'files' | 'file' | 'staged' | 'unstaged'
+}
+```
+
+### graph/wip/staging/failed
+
+> Sent when any staging operation fails in the Graph's WIP panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Which staging operation failed
+  'operation': 'stash' | 'stage' | 'unstage' | 'discard' | 'resolveConflict',
+  // Scope of the failed operation
+  'scope': string
+}
+```
+
+### graph/wip/staging/resolveConflict
+
+> Sent when the user resolves conflict(s) by taking a side in the Graph's WIP panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether a single-file side pick or resolve-all-conflicts
+  'scope': 'all' | 'file',
+  // Which side was chosen
+  'side': 'current' | 'incoming'
+}
+```
+
+### graph/wip/staging/stage
+
+> Sent when the user stages file(s) in the Graph's WIP panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Number of files being staged
+  'files.count': number,
+  // Whether the repo has conflicts at the time (stage-all prompts about conflict markers)
+  'hasConflicts': boolean,
+  // Whether a single file, multi-select batch, or stage-all
+  'scope': 'files' | 'all' | 'file'
+}
+```
+
+### graph/wip/staging/stash
+
+> Sent when the user stashes specific file(s) from the Graph's WIP panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Number of files being stashed
+  'files.count': number,
+  // Whether a single file or multi-select batch
+  'scope': 'files' | 'file'
+}
+```
+
+### graph/wip/staging/unstage
+
+> Sent when the user unstages file(s) in the Graph's WIP panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Number of files being unstaged
+  'files.count': number,
+  // Whether a single file, multi-select batch, or unstage-all
+  'scope': 'files' | 'all' | 'file'
+}
+```
+
+### graph/worktrees/filtered
+
+> Sent when the user types in the filter box in the sidebar worktrees panel (debounced, not on every keystroke)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'filter.length': number,
+  'hasFilter': boolean,
+  'worktrees.count': number
+}
+```
+
+### graph/worktrees/headerAction
+
+> Sent when the user clicks a header action (Create Worktree, Refresh) in the sidebar worktrees panel
+
+```typescript
+{
+  'action': 'refresh' | 'createWorktree',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graph/worktrees/layoutToggled
+
+> Sent when the user toggles the tree/list layout in the sidebar worktrees panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'layout': 'list' | 'tree',
+  'worktrees.count': number
+}
+```
+
+### graph/worktrees/shown
+
+> Sent when the Worktrees sidebar panel becomes visible
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'layout': 'list' | 'tree',
+  'worktrees.count': number
+}
+```
+
+### graph/worktrees/worktreeAction
+
+> Sent when the user invokes an action on a worktree item, via inline hover-icon or right-click context menu (see `location`)
+
+```typescript
+{
+  'action': 'fetch' | 'pull' | 'push' | 'openWorktree' | 'openWorktreeInNewWindow' | 'delete' | 'rename' | 'rebaseOntoUpstream' | 'reset' | 'publish' | 'setUpstream' | 'changeUpstream' | 'revealInExplorer' | 'openInTerminal' | 'copyWorkingChanges',
+  'alt': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Where the action was invoked from — hover-icon (inline) vs the right-click context menu
+  'location': 'inline' | 'contextMenu'
+}
+```
+
+### graph/worktrees/worktreeSelected
+
+> Sent when the user clicks a worktree leaf in the sidebar worktrees panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'hasChanges': boolean,
+  'hasUpstream': boolean,
+  'isActive': boolean,
+  'isDefault': boolean
 }
 ```
 
@@ -2975,7 +4151,673 @@ background-upgraded the extension while the host kept running the old build
   // How long the panel was open in milliseconds
   'duration': number,
   // Active panel mode at time of close
-  'mode': 'wip' | 'commit' | 'compare' | 'review' | 'multicommit' | 'compose' | 'none'
+  'mode': 'wip' | 'commit' | 'compare' | 'review' | 'none' | 'multicommit' | 'compose' | 'resolve'
+}
+```
+
+### graphDetails/commit/explain
+
+> Sent when the user runs AI explain on a single commit in Graph Details
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether the user supplied custom guidance
+  'hasCustomPrompt': boolean,
+  // Whether the target is a stash entry rather than a regular commit
+  'isStash': boolean
+}
+```
+
+### graphDetails/commit/explain/completed
+
+> Sent when a single-commit AI explain completes successfully in Graph Details
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether the user supplied custom guidance
+  'hasCustomPrompt': boolean,
+  // Whether the target is a stash entry rather than a regular commit
+  'isStash': boolean
+}
+```
+
+### graphDetails/commit/explain/failed
+
+> Sent when a single-commit AI explain fails in Graph Details
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether the user supplied custom guidance
+  'hasCustomPrompt': boolean,
+  // Whether the target is a stash entry rather than a regular commit
+  'isStash': boolean
+}
+```
+
+### graphDetails/compare/explain
+
+> Sent when the user runs AI explain on a comparison in Graph Details
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether the user supplied custom guidance
+  'hasCustomPrompt': boolean,
+  'includeWorkingTree': boolean,
+  // Active tab driving the diff direction (branch-compare only; undefined otherwise)
+  'tab': 'all' | 'ahead' | 'behind',
+  // Single-commit/range compare vs branch-compare tabs
+  'variant': 'compare' | 'branchCompare'
+}
+```
+
+### graphDetails/compare/explain/completed
+
+> Sent when a comparison AI explain completes successfully in Graph Details
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether the user supplied custom guidance
+  'hasCustomPrompt': boolean,
+  'includeWorkingTree': boolean,
+  // Active tab driving the diff direction (branch-compare only; undefined otherwise)
+  'tab': 'all' | 'ahead' | 'behind',
+  // Single-commit/range compare vs branch-compare tabs
+  'variant': 'compare' | 'branchCompare'
+}
+```
+
+### graphDetails/compare/explain/failed
+
+> Sent when a comparison AI explain fails in Graph Details
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether the user supplied custom guidance
+  'hasCustomPrompt': boolean,
+  'includeWorkingTree': boolean,
+  // Active tab driving the diff direction (branch-compare only; undefined otherwise)
+  'tab': 'all' | 'ahead' | 'behind',
+  // Single-commit/range compare vs branch-compare tabs
+  'variant': 'compare' | 'branchCompare'
+}
+```
+
+### graphDetails/compare/generateChangelog
+
+> Sent when the user generates an AI changelog for a comparison in Graph Details
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'includeWorkingTree': boolean,
+  'tab': 'all' | 'ahead' | 'behind',
+  'variant': 'compare' | 'branchCompare'
+}
+```
+
+### graphDetails/compare/openedInSearchAndCompare
+
+> Sent when the user opens the current comparison in the Search & Compare view
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'includeWorkingTree': boolean,
+  'tab': 'all' | 'ahead' | 'behind'
+}
+```
+
+### graphDetails/compare/refChanged
+
+> Sent when the user changes the base/compare ref in Graph Details compare mode
+
+```typescript
+{
+  // Whether a new ref was picked (false = picker cancelled)
+  'changed': boolean,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Type of the newly picked ref (e.g. branch/tag/revision); undefined when cancelled
+  'refType': string,
+  // Which side's ref the user changed (left = Base, right = Compare)
+  'side': 'right' | 'left'
+}
+```
+
+### graphDetails/compare/tabChanged
+
+> Sent when the user switches the Ahead/Behind/All tab in Graph Details compare mode
+
+```typescript
+{
+  // Commits ahead at switch time
+  'ahead.count': number,
+  // Commits behind at switch time
+  'behind.count': number,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'tab.new': 'all' | 'ahead' | 'behind',
+  'tab.old': 'all' | 'ahead' | 'behind'
+}
+```
+
+### graphDetails/compose/applyPlan/completed
+
+> Sent when a compose plan is applied (commits created) successfully
+
+```typescript
+{
+  // Number of commits actually committed (post-exclusion)
+  'commits.count': number,
+  // Number of commits excluded by the user before apply
+  'commits.excluded.count': number,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Time from apply click to settlement in milliseconds
+  'duration': number,
+  // Total commits in the proposed plan
+  'plan.commits.count': number,
+  // Whether the plan was stale (working changes diverged since it was generated) at apply time
+  'stale': boolean
+}
+```
+
+### graphDetails/compose/applyPlan/failed
+
+> Sent when applying a compose plan fails
+
+```typescript
+{
+  // Number of commits actually committed (post-exclusion)
+  'commits.count': number,
+  // Number of commits excluded by the user before apply
+  'commits.excluded.count': number,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Time from apply click to settlement in milliseconds
+  'duration': number,
+  // Error message text describing why the apply failed
+  'failure.error.message': string,
+  // Total commits in the proposed plan
+  'plan.commits.count': number,
+  // Whether the plan was stale (working changes diverged since it was generated) at apply time
+  'stale': boolean
+}
+```
+
+### graphDetails/compose/changeAiModel
+
+> Sent when the user switches the AI model from the compose-mode chip in the Graph Details panel
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  // Previously-selected model id (undefined when no model was set)
+  'ai.model.previous.id': string,
+  // Previously-selected model name
+  'ai.model.previous.name': string,
+  // Previously-selected model provider id
+  'ai.model.previous.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  // Previously-selected model provider name
+  'ai.model.previous.provider.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graphDetails/compose/closed
+
+> Sent when the user exits compose mode in the Graph Details panel (toggled off or destroyed)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graphDetails/compose/generatePlan/cancelled
+
+> Sent when a compose plan generation is cancelled (user-clicked Cancel or host-side abort)
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'customInstructions.length': number,
+  'customInstructions.used': boolean,
+  // Time from dispatch to settlement in milliseconds
+  'duration': number,
+  // True when this generation refined a prior plan; false on the initial compose
+  'refine': boolean,
+  // Number of commits included in the scope
+  'scope.commits.count': number,
+  // Effective number of files in the scope (post AI-ignore, pre user-exclusion)
+  'scope.files.count': number,
+  // Number of files the user has excluded from the scope
+  'scope.files.excluded.count': number,
+  // Whether staged changes were included (wip scope only)
+  'scope.includeStaged': boolean,
+  // Whether unstaged changes were included (wip scope only)
+  'scope.includeUnstaged': boolean,
+  // Compose/review scope shape: working-changes only, mixed, or existing-commits only (wip scope).
+  'scope.kind': 'wip-only' | 'wip+commits' | 'commits-only',
+  // Scope type at the time of the event
+  'scope.type': 'wip' | 'commit' | 'compare'
+}
+```
+
+### graphDetails/compose/generatePlan/completed
+
+> Sent when a compose plan generation completes successfully (initial or refine/recompose)
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'customInstructions.length': number,
+  'customInstructions.used': boolean,
+  // Time from dispatch to settlement in milliseconds
+  'duration': number,
+  // True when this generation refined a prior plan; false on the initial compose
+  'refine': boolean,
+  // Sum of additions across all proposed commits
+  'result.additions.count': number,
+  // Number of proposed commits in the resulting plan
+  'result.commits.count': number,
+  // Sum of deletions across all proposed commits
+  'result.deletions.count': number,
+  // Sum of file changes across all proposed commits
+  'result.files.count': number,
+  // Number of commits included in the scope
+  'scope.commits.count': number,
+  // Effective number of files in the scope (post AI-ignore, pre user-exclusion)
+  'scope.files.count': number,
+  // Number of files the user has excluded from the scope
+  'scope.files.excluded.count': number,
+  // Whether staged changes were included (wip scope only)
+  'scope.includeStaged': boolean,
+  // Whether unstaged changes were included (wip scope only)
+  'scope.includeUnstaged': boolean,
+  // Compose/review scope shape: working-changes only, mixed, or existing-commits only (wip scope).
+  'scope.kind': 'wip-only' | 'wip+commits' | 'commits-only',
+  // Scope type at the time of the event
+  'scope.type': 'wip' | 'commit' | 'compare'
+}
+```
+
+### graphDetails/compose/generatePlan/failed
+
+> Sent when a compose plan generation fails
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'customInstructions.length': number,
+  'customInstructions.used': boolean,
+  // Time from dispatch to settlement in milliseconds
+  'duration': number,
+  // Error message text describing why the generation failed
+  'failure.error.message': string,
+  // Why the run failed. `invalid-scope` = the selected scope cannot be rewritten, so an identical retry fails too — distinguishing user-scope errors from host/AI errors. Cancellation has its own `/cancelled` event and never lands here.
+  'failure.reason': 'error' | 'invalid-scope',
+  // True when this generation refined a prior plan; false on the initial compose
+  'refine': boolean,
+  // Number of commits included in the scope
+  'scope.commits.count': number,
+  // Effective number of files in the scope (post AI-ignore, pre user-exclusion)
+  'scope.files.count': number,
+  // Number of files the user has excluded from the scope
+  'scope.files.excluded.count': number,
+  // Whether staged changes were included (wip scope only)
+  'scope.includeStaged': boolean,
+  // Whether unstaged changes were included (wip scope only)
+  'scope.includeUnstaged': boolean,
+  // Compose/review scope shape: working-changes only, mixed, or existing-commits only (wip scope).
+  'scope.kind': 'wip-only' | 'wip+commits' | 'commits-only',
+  // Scope type at the time of the event
+  'scope.type': 'wip' | 'commit' | 'compare'
+}
+```
+
+### graphDetails/compose/moveFile/completed
+
+> Sent when the user drags a file from one draft commit to another and the host re-derive completes
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Time from the drop to host-re-derive settlement in milliseconds
+  'duration': number,
+  // Number of proposed commits in the plan after the move (an emptied source commit is dropped)
+  'plan.commits.count': number
+}
+```
+
+### graphDetails/compose/moveFile/failed
+
+> Sent when moving a file between draft commits fails (e.g. stale plan)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Time from the drop to failure in milliseconds
+  'duration': number,
+  // Error message text describing why the move failed
+  'failure.error.message': string
+}
+```
+
+### graphDetails/compose/opened
+
+> Sent when the user enters compose mode in the Graph Details panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graphDetails/compose/regenerateMessage/completed
+
+> Sent when a per-commit message regeneration completes successfully (icon button next to a draft commit)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Time from icon click to settlement in milliseconds
+  'duration': number
+}
+```
+
+### graphDetails/compose/regenerateMessage/failed
+
+> Sent when a per-commit message regeneration fails or is cancelled
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Time from icon click to settlement in milliseconds
+  'duration': number,
+  // Error message text — present only when `failure.reason` is `'error'`
+  'failure.error.message': string,
+  // Why the run did not complete successfully
+  'failure.reason': 'cancelled' | 'error'
+}
+```
+
+### graphDetails/compose/reorder/completed
+
+> Sent when the user reorders draft commits in the plan (drag-and-drop or keyboard) and the host sync completes
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Time from reorder gesture to host-sync settlement in milliseconds
+  'duration': number,
+  // Number of proposed commits in the plan being reordered
+  'plan.commits.count': number
+}
+```
+
+### graphDetails/compose/reorder/failed
+
+> Sent when reordering draft commits fails to sync to the host (e.g. stale plan)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Time from reorder gesture to host-sync settlement in milliseconds
+  'duration': number,
+  // Error message text describing why the host sync failed
+  'failure.error.message': string,
+  // Number of proposed commits in the plan being reordered
+  'plan.commits.count': number
+}
+```
+
+### graphDetails/compose/restarted
+
+> Sent when the user restarts a completed compose run (Back from result)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graphDetails/file/opened
+
+> Sent when the user opens or diffs a file from a real (non-virtual) commit/compare in Graph Details
+
+```typescript
+{
+  // Which file open/diff operation was triggered
+  'action': 'openOnRemote' | 'open' | 'comparePrevious' | 'multiDiff' | 'compareWorking' | 'compareWip' | 'compareBetween' | 'defaultAction',
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Number of files opened (1 for single-file actions, N for multiDiff)
+  'files.count': number
 }
 ```
 
@@ -2994,8 +4836,8 @@ background-upgraded the extension while the host kept running the old build
   'context.webview.id': string,
   'context.webview.instanceId': string,
   'context.webview.type': string,
-  'mode.new': 'wip' | 'commit' | 'compare' | 'review' | 'multicommit' | 'compose' | 'none',
-  'mode.old': 'wip' | 'commit' | 'compare' | 'review' | 'multicommit' | 'compose' | 'none'
+  'mode.new': 'wip' | 'commit' | 'compare' | 'review' | 'none' | 'multicommit' | 'compose' | 'resolve',
+  'mode.old': 'wip' | 'commit' | 'compare' | 'review' | 'none' | 'multicommit' | 'compose' | 'resolve'
 }
 ```
 
@@ -3022,18 +4864,692 @@ background-upgraded the extension while the host kept running the old build
 }
 ```
 
+### graphDetails/resolve/applyResolutions/completed
+
+> Sent when AI conflict resolutions are applied to the working tree successfully
+
+```typescript
+{
+  // Number of resolutions actually applied (post user file-exclusion)
+  'applied.count': number,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Time from apply click to settlement in milliseconds
+  'duration': number,
+  // Number of resolutions excluded by the user before apply
+  'excluded.count': number,
+  'refine.count': number,
+  // Total resolutions in the pending set
+  'resolutions.count': number,
+  'retryFile.count': number,
+  'retryFromError.count': number
+}
+```
+
+### graphDetails/resolve/applyResolutions/failed
+
+> Sent when applying AI conflict resolutions fails
+
+```typescript
+{
+  // Number of resolutions actually applied (post user file-exclusion)
+  'applied.count': number,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Time from apply click to settlement in milliseconds
+  'duration': number,
+  // Number of resolutions excluded by the user before apply
+  'excluded.count': number,
+  // Error message text describing why the apply failed
+  'failure.error.message': string,
+  'refine.count': number,
+  // Total resolutions in the pending set
+  'resolutions.count': number,
+  'retryFile.count': number,
+  'retryFromError.count': number
+}
+```
+
+### graphDetails/resolve/changeAiModel
+
+> Sent when the user switches the AI model from the resolve-mode chip in the Graph Details panel
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  // Previously-selected model id (undefined when no model was set)
+  'ai.model.previous.id': string,
+  // Previously-selected model name
+  'ai.model.previous.name': string,
+  // Previously-selected model provider id
+  'ai.model.previous.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  // Previously-selected model provider name
+  'ai.model.previous.provider.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graphDetails/resolve/closed
+
+> Sent when the user exits resolve mode in the Graph Details panel (toggled off or destroyed)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graphDetails/resolve/discarded
+
+> Sent when the user discards pending AI conflict resolutions without applying them
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'refine.count': number,
+  // Number of pending resolutions that were discarded
+  'resolutions.count': number,
+  'retryFile.count': number,
+  'retryFromError.count': number
+}
+```
+
+### graphDetails/resolve/generateResolutions/cancelled
+
+> Sent when an AI conflict-resolution run is cancelled (user-clicked Cancel or host-side abort)
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'customInstructions.length': number,
+  'customInstructions.used': boolean,
+  // Time from dispatch to settlement in milliseconds
+  'duration': number,
+  // Number of conflicted files the run was focused on (0 when resolving all)
+  'files.focused.count': number,
+  // Whether the run was scoped to a focused subset of conflicted files rather than all
+  'focused': boolean,
+  // True when this run refined/retried a prior result; false on the initial resolve
+  'refine': boolean,
+  'refine.count': number,
+  'retryFile.count': number,
+  'retryFromError.count': number,
+  // How the run was dispatched. `refine` above is `run.kind !== 'start'`; this splits the two non-cold cases, so a retry-after-error is no longer indistinguishable from a fresh resolve.
+  'run.kind': 'start' | 'refine' | 'retry'
+}
+```
+
+### graphDetails/resolve/generateResolutions/completed
+
+> Sent when an AI conflict-resolution run completes successfully (initial or refine/retry)
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'customInstructions.length': number,
+  'customInstructions.used': boolean,
+  // Time from dispatch to settlement in milliseconds
+  'duration': number,
+  // Number of conflicted files the run was focused on (0 when resolving all)
+  'files.focused.count': number,
+  // Whether the run was scoped to a focused subset of conflicted files rather than all
+  'focused': boolean,
+  // True when this run refined/retried a prior result; false on the initial resolve
+  'refine': boolean,
+  'refine.count': number,
+  // Number of files the resolver errored on
+  'result.errors.count': number,
+  // Number of files the AI produced a resolution for
+  'result.resolutions.count': number,
+  // Number of files skipped (couldn't be auto-resolved, e.g. binary/marker-less)
+  'result.skipped.count': number,
+  // Resolutions using the AI-merged strategy
+  'result.strategy.ai.count': number,
+  // Resolutions resolved as a deletion
+  'result.strategy.deleted.count': number,
+  // Resolutions left as skipped
+  'result.strategy.skipped.count': number,
+  // Resolutions resolved by taking the current/ours side
+  'result.strategy.takeOurs.count': number,
+  // Resolutions resolved by taking the incoming/theirs side
+  'result.strategy.takeTheirs.count': number,
+  'retryFile.count': number,
+  'retryFromError.count': number,
+  // How the run was dispatched. `refine` above is `run.kind !== 'start'`; this splits the two non-cold cases, so a retry-after-error is no longer indistinguishable from a fresh resolve.
+  'run.kind': 'start' | 'refine' | 'retry',
+  // Repo-consultation tool calls summed over the run
+  'tools.calls.count': number,
+  // Resolver steps summed over the run — one model round-trip each, mirroring `autoRebase/step/resolved` so both paths are comparable
+  'tools.steps.count': number
+}
+```
+
+### graphDetails/resolve/generateResolutions/failed
+
+> Sent when an AI conflict-resolution run fails
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'customInstructions.length': number,
+  'customInstructions.used': boolean,
+  // Time from dispatch to settlement in milliseconds
+  'duration': number,
+  // Error message text describing why the run failed. Cancellation has its own `/cancelled` event and never lands here.
+  'failure.error.message': string,
+  // Number of conflicted files the run was focused on (0 when resolving all)
+  'files.focused.count': number,
+  // Whether the run was scoped to a focused subset of conflicted files rather than all
+  'focused': boolean,
+  // True when this run refined/retried a prior result; false on the initial resolve
+  'refine': boolean,
+  'refine.count': number,
+  'retryFile.count': number,
+  'retryFromError.count': number,
+  // How the run was dispatched. `refine` above is `run.kind !== 'start'`; this splits the two non-cold cases, so a retry-after-error is no longer indistinguishable from a fresh resolve.
+  'run.kind': 'start' | 'refine' | 'retry'
+}
+```
+
+### graphDetails/resolve/opened
+
+> Sent when the user enters resolve (AI conflict-resolution) mode in the Graph Details panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graphDetails/resolve/retryFile/completed
+
+> Sent when a per-file "retry with feedback" re-resolution succeeds
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'customInstructions.length': number,
+  'customInstructions.used': boolean,
+  // Time from dispatch to settlement in milliseconds
+  'duration': number,
+  // Only on `/failed` — `cancelled` is the host reporting the session went away mid-flight
+  'failed.reason': 'cancelled' | 'error',
+  // Only on `/failed` when `failed.reason` is `'error'` — undefined when cancelled
+  'failure.error.message': string,
+  'refine.count': number,
+  'retryFile.count': number,
+  'retryFromError.count': number
+}
+```
+
+### graphDetails/resolve/retryFile/failed
+
+> Sent when a per-file "retry with feedback" re-resolution fails or is cancelled
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'customInstructions.length': number,
+  'customInstructions.used': boolean,
+  // Time from dispatch to settlement in milliseconds
+  'duration': number,
+  // Only on `/failed` — `cancelled` is the host reporting the session went away mid-flight
+  'failed.reason': 'cancelled' | 'error',
+  // Only on `/failed` when `failed.reason` is `'error'` — undefined when cancelled
+  'failure.error.message': string,
+  'refine.count': number,
+  'retryFile.count': number,
+  'retryFromError.count': number
+}
+```
+
+### graphDetails/review/changeAiModel
+
+> Sent when the user switches the AI model from the review-mode chip in the Graph Details panel
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  // Previously-selected model id (undefined when no model was set)
+  'ai.model.previous.id': string,
+  // Previously-selected model name
+  'ai.model.previous.name': string,
+  // Previously-selected model provider id
+  'ai.model.previous.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  // Previously-selected model provider name
+  'ai.model.previous.provider.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graphDetails/review/closed
+
+> Sent when the user exits review mode in the Graph Details panel (toggled off or destroyed)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graphDetails/review/copied
+
+> Sent when the user copies all or part of a review to clipboard
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether the action targeted the whole review, a focus area, or a single finding
+  'granularity': 'review' | 'focusArea' | 'finding'
+}
+```
+
+### graphDetails/review/discarded
+
+> Sent when the user discards a completed review from the ready-state footer
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graphDetails/review/generateFocusArea/completed
+
+> Sent when a per-focus-area review (two-pass) generation completes successfully
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'duration': number,
+  // Findings produced for this focus area
+  'findings.count': number,
+  'findings.severity.critical.count': number,
+  'findings.severity.suggestion.count': number,
+  'findings.severity.warning.count': number
+}
+```
+
+### graphDetails/review/generateFocusArea/failed
+
+> Sent when a per-focus-area review (two-pass) generation fails
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'duration': number,
+  // Error message text describing why the focus-area generation failed
+  'failure.error.message': string
+}
+```
+
+### graphDetails/review/generateReview/cancelled
+
+> Sent when a review generation is cancelled (user-clicked Cancel or host-side abort)
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'customInstructions.length': number,
+  'customInstructions.used': boolean,
+  // Time from dispatch to settlement in milliseconds
+  'duration': number,
+  // Number of commits included in the scope
+  'scope.commits.count': number,
+  // Effective number of files in the scope (post AI-ignore, pre user-exclusion)
+  'scope.files.count': number,
+  // Number of files the user has excluded from the scope
+  'scope.files.excluded.count': number,
+  // Whether staged changes were included (wip scope only)
+  'scope.includeStaged': boolean,
+  // Whether unstaged changes were included (wip scope only)
+  'scope.includeUnstaged': boolean,
+  // Compose/review scope shape: working-changes only, mixed, or existing-commits only (wip scope).
+  'scope.kind': 'wip-only' | 'wip+commits' | 'commits-only',
+  // Scope type at the time of the event
+  'scope.type': 'wip' | 'commit' | 'compare'
+}
+```
+
+### graphDetails/review/generateReview/completed
+
+> Sent when a review generation completes successfully
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'customInstructions.length': number,
+  'customInstructions.used': boolean,
+  // Time from dispatch to settlement in milliseconds
+  'duration': number,
+  // Total findings across all focus areas (single-pass only; two-pass enriches later)
+  'result.findings.count': number,
+  // Number of focus areas produced by the run
+  'result.focusAreas.count': number,
+  // Whether the review used the single-pass or two-pass mode
+  'result.mode': 'single-pass' | 'two-pass',
+  'result.severity.critical.count': number,
+  'result.severity.suggestion.count': number,
+  'result.severity.warning.count': number,
+  // Number of commits included in the scope
+  'scope.commits.count': number,
+  // Effective number of files in the scope (post AI-ignore, pre user-exclusion)
+  'scope.files.count': number,
+  // Number of files the user has excluded from the scope
+  'scope.files.excluded.count': number,
+  // Whether staged changes were included (wip scope only)
+  'scope.includeStaged': boolean,
+  // Whether unstaged changes were included (wip scope only)
+  'scope.includeUnstaged': boolean,
+  // Compose/review scope shape: working-changes only, mixed, or existing-commits only (wip scope).
+  'scope.kind': 'wip-only' | 'wip+commits' | 'commits-only',
+  // Scope type at the time of the event
+  'scope.type': 'wip' | 'commit' | 'compare'
+}
+```
+
+### graphDetails/review/generateReview/failed
+
+> Sent when a review generation fails
+
+```typescript
+{
+  'ai.model.id': string,
+  'ai.model.name': string,
+  'ai.model.provider.id': 'anthropic' | 'azure' | 'deepseek' | 'gemini' | 'gitkraken' | 'huggingface' | 'mistral' | 'ollama' | 'openai' | 'openaicompatible' | 'openrouter' | 'simulator' | 'vscode' | 'xai',
+  'ai.model.provider.name': string,
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  'customInstructions.length': number,
+  'customInstructions.used': boolean,
+  // Time from dispatch to settlement in milliseconds
+  'duration': number,
+  // Error message text describing why the generation failed. Unlike compose/resolve, `ReviewResult` has no `cancelled` sentinel, so only a user-clicked Cancel (aborted signal) reaches `/cancelled` — a host-side cancellation such as an escaped model picker arrives as an error and lands here reading `Review was cancelled.`, so treat that text as a cancel, not a failure.
+  'failure.error.message': string,
+  // Number of commits included in the scope
+  'scope.commits.count': number,
+  // Effective number of files in the scope (post AI-ignore, pre user-exclusion)
+  'scope.files.count': number,
+  // Number of files the user has excluded from the scope
+  'scope.files.excluded.count': number,
+  // Whether staged changes were included (wip scope only)
+  'scope.includeStaged': boolean,
+  // Whether unstaged changes were included (wip scope only)
+  'scope.includeUnstaged': boolean,
+  // Compose/review scope shape: working-changes only, mixed, or existing-commits only (wip scope).
+  'scope.kind': 'wip-only' | 'wip+commits' | 'commits-only',
+  // Scope type at the time of the event
+  'scope.type': 'wip' | 'commit' | 'compare'
+}
+```
+
+### graphDetails/review/opened
+
+> Sent when the user enters review mode in the Graph Details panel
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graphDetails/review/restarted
+
+> Sent when the user restarts a completed review (Back from result)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### graphDetails/review/sentToAgent
+
+> Sent when the user sends all or part of a review to an AI agent
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whether the action targeted the whole review, a focus area, or a single finding
+  'granularity': 'review' | 'focusArea' | 'finding'
+}
+```
+
 ### graphDetails/shown
 
 > Sent when the integrated graph details panel is expanded
 
 ```typescript
 {
-  // Which graph host the panel is in: editor area or bottom panel
-  'host': 'editor' | 'panel',
+  // Which graph host the panel is in: an editor tab, or the side bar or bottom panel view
+  'host': 'view' | 'editor',
   // Where the details panel is anchored relative to the graph
   'location': 'right' | 'bottom',
   // Active panel mode at time of show
-  'mode': 'wip' | 'commit' | 'compare' | 'review' | 'multicommit' | 'compose' | 'none',
+  'mode': 'wip' | 'commit' | 'compare' | 'review' | 'none' | 'multicommit' | 'compose' | 'resolve',
   // Split-pane position percentage from the closed edge (0–100)
   'position': number,
   // Number of rows currently selected in the graph (0, 1, or N)
@@ -3041,7 +5557,7 @@ background-upgraded the extension while the host kept running the old build
   // Whether the active selection is the WIP / uncommitted row
   'selection.uncommitted': boolean,
   // What caused the panel to be shown
-  'trigger': 'toggle' | 'auto-restore'
+  'trigger': 'toggle' | 'placement' | 'request-compare' | 'request-mode' | 'request-agents' | 'request-graph-wip-bar' | 'auto-restore'
 }
 ```
 
@@ -3139,7 +5655,7 @@ void
 {
   'instance': number,
   'items.error': string,
-  'action': 'soft-open' | 'code-suggest' | 'merge' | 'switch' | 'open' | 'open-worktree' | 'switch-and-code-suggest' | 'show-overview' | 'open-changes' | 'open-in-graph' | 'pin' | 'unpin' | 'snooze' | 'unsnooze' | 'open-suggestion' | 'open-suggestion-browser',
+  'action': 'soft-open' | 'merge' | 'switch' | 'open' | 'open-worktree' | 'start-review' | 'show-overview' | 'open-changes' | 'open-in-graph' | 'pin' | 'unpin' | 'snooze' | 'unsnooze',
   'groups.blocked.collapsed': boolean,
   'groups.blocked.count': number,
   'groups.count': number,
@@ -3165,7 +5681,82 @@ void
   'initialState.selectTopItem': boolean,
   [`item.${string}`]: string | number | boolean,
   'items.count': number,
-  'items.timings.codeSuggestionCounts': number,
+  'items.timings.enrichedItems': number,
+  'items.timings.prs': number
+}
+```
+
+### launchpad/agent/resolved
+
+> Sent when the manual-vs-agent flow resolves for a launchpad _Start Review with an Agent_ action
+
+```typescript
+{
+  'instance': number,
+  'items.error': string,
+  'agent.resolution': 'manual' | 'cancel',
+  'groups.blocked.collapsed': boolean,
+  'groups.blocked.count': number,
+  'groups.count': number,
+  'groups.current-branch.collapsed': boolean,
+  'groups.current-branch.count': number,
+  'groups.draft.collapsed': boolean,
+  'groups.draft.count': number,
+  'groups.follow-up.collapsed': boolean,
+  'groups.follow-up.count': number,
+  'groups.mergeable.collapsed': boolean,
+  'groups.mergeable.count': number,
+  'groups.needs-review.collapsed': boolean,
+  'groups.needs-review.count': number,
+  'groups.other.collapsed': boolean,
+  'groups.other.count': number,
+  'groups.pinned.collapsed': boolean,
+  'groups.pinned.count': number,
+  'groups.snoozed.collapsed': boolean,
+  'groups.snoozed.count': number,
+  'groups.waiting-for-review.collapsed': boolean,
+  'groups.waiting-for-review.count': number,
+  'initialState.group': string,
+  'initialState.selectTopItem': boolean,
+  'items.count': number,
+  'items.timings.enrichedItems': number,
+  'items.timings.prs': number
+}
+```
+
+or
+
+```typescript
+{
+  'instance': number,
+  'items.error': string,
+  'agent.id': string,
+  'agent.kind': 'ide-chat' | 'claude-extension' | 'cli',
+  'agent.resolution': 'agent',
+  'groups.blocked.collapsed': boolean,
+  'groups.blocked.count': number,
+  'groups.count': number,
+  'groups.current-branch.collapsed': boolean,
+  'groups.current-branch.count': number,
+  'groups.draft.collapsed': boolean,
+  'groups.draft.count': number,
+  'groups.follow-up.collapsed': boolean,
+  'groups.follow-up.count': number,
+  'groups.mergeable.collapsed': boolean,
+  'groups.mergeable.count': number,
+  'groups.needs-review.collapsed': boolean,
+  'groups.needs-review.count': number,
+  'groups.other.collapsed': boolean,
+  'groups.other.count': number,
+  'groups.pinned.collapsed': boolean,
+  'groups.pinned.count': number,
+  'groups.snoozed.collapsed': boolean,
+  'groups.snoozed.count': number,
+  'groups.waiting-for-review.collapsed': boolean,
+  'groups.waiting-for-review.count': number,
+  'initialState.group': string,
+  'initialState.selectTopItem': boolean,
+  'items.count': number,
   'items.timings.enrichedItems': number,
   'items.timings.prs': number
 }
@@ -3225,7 +5816,6 @@ void
   'initialState.group': string,
   'initialState.selectTopItem': boolean,
   'items.count': number,
-  'items.timings.codeSuggestionCounts': number,
   'items.timings.enrichedItems': number,
   'items.timings.prs': number
 }
@@ -3292,7 +5882,6 @@ void
   'initialState.group': string,
   'initialState.selectTopItem': boolean,
   'items.count': number,
-  'items.timings.codeSuggestionCounts': number,
   'items.timings.enrichedItems': number,
   'items.timings.prs': number
 }
@@ -3305,7 +5894,7 @@ void
 ```typescript
 {
   'duration': number,
-  'operation': 'getPullRequest' | 'searchPullRequests' | 'getMyPullRequests' | 'getCodeSuggestions' | 'getEnrichedItems' | 'getCodeSuggestionCounts',
+  'operation': 'getPullRequest' | 'searchPullRequests' | 'getMyPullRequests' | 'getEnrichedItems',
   'timeout': number
 }
 ```
@@ -3343,7 +5932,6 @@ void
   'initialState.group': string,
   'initialState.selectTopItem': boolean,
   'items.count': number,
-  'items.timings.codeSuggestionCounts': number,
   'items.timings.enrichedItems': number,
   'items.timings.prs': number
 }
@@ -3383,7 +5971,6 @@ void
   'initialState.selectTopItem': boolean,
   [`item.${string}`]: string | number | boolean,
   'items.count': number,
-  'items.timings.codeSuggestionCounts': number,
   'items.timings.enrichedItems': number,
   'items.timings.prs': number
 }
@@ -3422,7 +6009,6 @@ void
   'initialState.group': string,
   'initialState.selectTopItem': boolean,
   'items.count': number,
-  'items.timings.codeSuggestionCounts': number,
   'items.timings.enrichedItems': number,
   'items.timings.prs': number
 }
@@ -3436,7 +6022,7 @@ void
 {
   'instance': number,
   'items.error': string,
-  'action': 'settings' | 'connect' | 'feedback' | 'open-on-gkdev' | 'refresh',
+  'action': 'settings' | 'connect' | 'refresh' | 'feedback' | 'open-on-gkdev',
   'groups.blocked.collapsed': boolean,
   'groups.blocked.count': number,
   'groups.count': number,
@@ -3461,21 +6047,19 @@ void
   'initialState.group': string,
   'initialState.selectTopItem': boolean,
   'items.count': number,
-  'items.timings.codeSuggestionCounts': number,
   'items.timings.enrichedItems': number,
   'items.timings.prs': number
 }
 ```
 
-### mcp/agents/selected
+### mcp/agent/uninstalled
 
-> Sent when user selects agents for MCP installation
+> Sent when the user uninstalls GitKraken MCP for a single agent
 
 ```typescript
 {
-  'agents.count': number,
-  'agents.ids': string,
-  'source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
+  'agent.id': string,
+  'source': 'account' | 'subscription' | 'graph' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'agents' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'auto-rebase' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'terminal' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
 }
 ```
 
@@ -3489,7 +6073,7 @@ void
   'cli.version': string,
   'error.message': string,
   'reason': string,
-  'source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
+  'source': 'account' | 'subscription' | 'graph' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'agents' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'auto-rebase' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'terminal' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
 }
 ```
 
@@ -3504,7 +6088,7 @@ void
   'agents.userAction': string,
   'cli.version': string,
   'requiresUserCompletion': boolean,
-  'source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
+  'source': 'account' | 'subscription' | 'graph' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'agents' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'auto-rebase' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'terminal' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
 }
 ```
 
@@ -3518,7 +6102,7 @@ void
   'cli.version': string,
   'error.message': string,
   'reason': string,
-  'source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
+  'source': 'account' | 'subscription' | 'graph' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'agents' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'auto-rebase' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'terminal' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
 }
 ```
 
@@ -3528,7 +6112,7 @@ void
 
 ```typescript
 {
-  'source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
+  'source': 'account' | 'subscription' | 'graph' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'agents' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'auto-rebase' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'terminal' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
 }
 ```
 
@@ -3587,22 +6171,6 @@ void
   'queued.normal': number,
   // Time in ms the command waited in the queue before executing
   'waitTime': number
-}
-```
-
-### openReviewMode
-
-> Sent when a PR review was started in the inspect overview
-
-```typescript
-{
-  'filesChanged': number,
-  'provider': string,
-  // Provided for compatibility with other GK surfaces
-  'repoPrivacy': 'private' | 'public' | 'local',
-  'repository.visibility': 'private' | 'public' | 'local',
-  // Provided for compatibility with other GK surfaces
-  'source': 'account' | 'subscription' | 'graph' | 'composer' | 'patchDetails' | 'settings' | 'timeline' | 'home' | 'welcome' | 'rebaseEditor' | 'ai' | 'ai:markdown-preview' | 'ai:markdown-editor' | 'ai:picker' | 'associateIssueWithBranch' | 'cloud-patches' | 'code-suggest' | 'commandPalette' | 'deeplink' | 'editor:hover' | 'feature-badge' | 'feature-gate' | 'gk-cli-integration' | 'gk-mcp-provider' | 'graph-details' | 'graph-header' | 'graph-kanban' | 'graph-sidebar' | 'graph-treemap' | 'inspect' | 'inspect-overview' | 'integrations' | 'launchpad' | 'launchpad-indicator' | 'launchpad-view' | 'mcp' | 'mcp-welcome-message' | 'merge-target' | 'notification' | 'prompt' | 'quick-wizard' | 'remoteProvider' | 'scm' | 'scm-input' | 'startReview' | 'startWork' | 'statusbar:hover' | 'trial-indicator' | 'view' | 'view:hover' | 'walkthrough' | 'whatsnew' | 'worktrees'
 }
 ```
 
@@ -3758,6 +6326,27 @@ void
 }
 ```
 
+### rebaseEditor/action/continueWithAi
+
+> Sent when the user hands a paused rebase over to automatic (AI) conflict resolution
+
+```typescript
+{
+  'context.ascending': boolean,
+  'context.done.count': number,
+  'context.hasConflicts': boolean,
+  'context.isPaused': boolean,
+  'context.isRebasing': boolean,
+  'context.preservesMerges': boolean,
+  'context.session.start': string,
+  'context.todo.count': number,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
 ### rebaseEditor/action/openConflictChanges
 
 > Sent when the user opens current or incoming changes for a conflict file
@@ -3806,7 +6395,7 @@ void
 
 ### rebaseEditor/action/recompose
 
-> Sent when the user opens the Commit Composer from the rebase editor
+> Sent when the user aborts the rebase to recompose its commits inline in the Commit Graph
 
 ```typescript
 {
@@ -3869,6 +6458,27 @@ void
   'conflict.resolution': 'current' | 'incoming',
   // Two-character conflict status (e.g. 'UU', 'AU')
   'conflict.status': string,
+  'context.ascending': boolean,
+  'context.done.count': number,
+  'context.hasConflicts': boolean,
+  'context.isPaused': boolean,
+  'context.isRebasing': boolean,
+  'context.preservesMerges': boolean,
+  'context.session.start': string,
+  'context.todo.count': number,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### rebaseEditor/action/resolveConflictsInGraph
+
+> Sent when the user opens the Commit Graph resolve mode from the conflict panel
+
+```typescript
+{
   'context.ascending': boolean,
   'context.done.count': number,
   'context.hasConflicts': boolean,
@@ -3979,6 +6589,28 @@ void
 ### rebaseEditor/action/start
 
 > Sent when the user starts a rebase (clicks "Start Rebase")
+
+```typescript
+{
+  'context.ascending': boolean,
+  'context.done.count': number,
+  'context.hasConflicts': boolean,
+  'context.isPaused': boolean,
+  'context.isRebasing': boolean,
+  'context.preservesMerges': boolean,
+  'context.session.duration': number,
+  'context.session.start': string,
+  'context.todo.count': number,
+  'context.webview.host': 'view' | 'editor' | 'panel',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string
+}
+```
+
+### rebaseEditor/action/startWithAi
+
+> Sent when the user hands a pending rebase off to automatic (AI) conflict resolution
 
 ```typescript
 {
@@ -4181,7 +6813,7 @@ void
   'context.ascending': boolean,
   'context.config.density': 'compact' | 'comfortable',
   'context.config.openBehavior': 'auto' | 'beside',
-  'context.config.openOnPausedRebase': boolean | 'interactive',
+  'context.config.openOnPausedRebase': boolean | 'auto' | 'interactive',
   'context.config.ordering': 'asc' | 'desc',
   'context.config.revealBehavior': 'onDoubleClick' | 'onSelection',
   'context.config.revealLocation': 'graph' | 'inspect',
@@ -4208,7 +6840,7 @@ void
 ```typescript
 {
   'hostingProvider.key': string,
-  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'github-enterprise' | 'cloud-github-enterprise' | 'gitlab-self-hosted' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello',
+  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello',
   // @deprecated: true
   'remoteProviders.key': string
 }
@@ -4221,7 +6853,7 @@ void
 ```typescript
 {
   'hostingProvider.key': string,
-  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'github-enterprise' | 'cloud-github-enterprise' | 'gitlab-self-hosted' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello',
+  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello',
   // @deprecated: true
   'remoteProviders.key': string
 }
@@ -4694,6 +7326,17 @@ or
 
 ```typescript
 {
+  // One-time out-of-window trial reset, attempted from Graph state builds; `failed` may repeat within a session (retries), paid accounts emit no event
+  'action': 'auto-reset-trial',
+  // `refused` = the reset 409'd an account the eligibility check approved (e.g. paid-org members); `failed-shape` = the eligibility payload no longer matches what the client reads
+  'outcome': 'reset' | 'not-eligible' | 'refused' | 'failed' | 'failed-shape'
+}
+```
+
+or
+
+```typescript
+{
   'action': 'start-preview-trial:graph',
   'day': number,
   [`day.${number}.startedOn`]: string,
@@ -4960,7 +7603,7 @@ or
 
 ```typescript
 {
-  'context.key': 'homeView' | 'gettingStarted' | 'visualizeCodeHistory' | 'gitBlame' | 'prReviews' | 'mcpFeatures' | 'aiFeatures' | 'graphAgentMonitoring' | 'graphParallelWork' | 'graphAiReview' | 'graphCompose' | 'graphCompare' | 'graphNextSteps'
+  'context.key': 'gettingStarted' | 'visualizeCodeHistory' | 'gitBlame' | 'prReviews' | 'kepler' | 'mcpFeatures' | 'aiFeatures' | 'graphAgentMonitoring' | 'graphParallelWork' | 'graphAiReview' | 'graphCompose' | 'graphCompare' | 'graphNextSteps'
 }
 ```
 
@@ -4981,7 +7624,7 @@ or
 ```typescript
 {
   'command': string,
-  'name': 'open/help-center/community-vs-pro' | 'open/composer' | 'open/graph' | 'open/launchpad' | 'open/help-center' | 'plus/login' | 'plus/sign-up' | 'plus/upgrade' | 'plus/reactivate' | 'shown' | 'dismiss' | 'open/home-view',
+  'name': 'shown' | 'open/help-center/community-vs-pro' | 'open/composer' | 'open/graph' | 'open/launchpad' | 'open/help-center' | 'plus/login' | 'plus/sign-up' | 'plus/upgrade' | 'plus/reactivate' | 'dismiss' | 'open/home-view' | 'open/kepler',
   'type': 'command'
 }
 ```
@@ -4990,7 +7633,7 @@ or
 
 ```typescript
 {
-  'name': 'open/help-center/community-vs-pro' | 'open/composer' | 'open/graph' | 'open/launchpad' | 'open/help-center' | 'plus/login' | 'plus/sign-up' | 'plus/upgrade' | 'plus/reactivate' | 'shown' | 'dismiss' | 'open/home-view',
+  'name': 'shown' | 'open/help-center/community-vs-pro' | 'open/composer' | 'open/graph' | 'open/launchpad' | 'open/help-center' | 'plus/login' | 'plus/sign-up' | 'plus/upgrade' | 'plus/reactivate' | 'dismiss' | 'open/home-view' | 'open/kepler',
   'type': 'url',
   'url': string
 }

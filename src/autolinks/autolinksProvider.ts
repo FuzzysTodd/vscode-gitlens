@@ -3,6 +3,16 @@ import { Disposable } from 'vscode';
 import type { DynamicAutolinkReference } from '@gitlens/git/models/autolink.js';
 import type { GitRemote } from '@gitlens/git/models/remote.js';
 import type { RemoteProvider, RemoteProviderId } from '@gitlens/git/models/remoteProvider.js';
+import type { ConfiguredIntegrationsChangeEvent } from '@gitlens/integrations/authentication/configuredIntegrationService.js';
+import type { IntegrationIds } from '@gitlens/integrations/constants.js';
+import type { GitHostIntegration } from '@gitlens/integrations/models/gitHostIntegration.js';
+import type { Integration } from '@gitlens/integrations/models/integration.js';
+import { IntegrationBase } from '@gitlens/integrations/models/integration.js';
+import type { IssuesIntegration } from '@gitlens/integrations/models/issuesIntegration.js';
+import {
+	convertRemoteProviderIdToIntegrationId,
+	getIntegrationIdForRemote,
+} from '@gitlens/integrations/utils/integration.utils.js';
 import { fromNow } from '@gitlens/utils/date.js';
 import { trace } from '@gitlens/utils/decorators/log.js';
 import { encodeUrl } from '@gitlens/utils/encoding.js';
@@ -10,25 +20,16 @@ import { join, map } from '@gitlens/utils/iterable.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { escapeMarkdown, unescapeMarkdown } from '@gitlens/utils/markdown.js';
 import { getSettledValue, isPromise } from '@gitlens/utils/promise.js';
-import { PromiseCache, PromiseMap } from '@gitlens/utils/promiseCache.js';
+import { PromiseCache } from '@gitlens/utils/promiseCache.js';
+import type { ResourceUsage } from '@gitlens/utils/resourceUsage.js';
 import { capitalize, encodeHtmlWeak, getSuperscript } from '@gitlens/utils/string.js';
 import type { OpenIssueActionContext } from '../api/gitlens.d.js';
 import { OpenIssueOnRemoteCommand } from '../commands/openIssueOnRemote.js';
-import type { IntegrationIds } from '../constants.integrations.js';
 import { GlyphChars } from '../constants.js';
 import type { Source } from '../constants.telemetry.js';
 import type { Container } from '../container.js';
 import { getIssueOrPullRequestHtmlIcon, getIssueOrPullRequestMarkdownIcon } from '../git/utils/-webview/icons.js';
 import { getRemoteIntegration, isRemoteMaybeIntegrationConnected } from '../git/utils/-webview/remote.utils.js';
-import type { ConfiguredIntegrationsChangeEvent } from '../plus/integrations/authentication/configuredIntegrationService.js';
-import type { GitHostIntegration } from '../plus/integrations/models/gitHostIntegration.js';
-import type { Integration } from '../plus/integrations/models/integration.js';
-import { IntegrationBase } from '../plus/integrations/models/integration.js';
-import type { IssuesIntegration } from '../plus/integrations/models/issuesIntegration.js';
-import {
-	convertRemoteProviderIdToIntegrationId,
-	getIntegrationIdForRemote,
-} from '../plus/integrations/utils/-webview/integration.utils.js';
 import { configuration } from '../system/-webview/configuration.js';
 import type {
 	Autolink,
@@ -55,7 +56,14 @@ export class AutolinksProvider implements Disposable {
 	private _disposable: Disposable | undefined;
 	private _references: GlCacheableAutolinkReference[] = [];
 	private _refsetCache = new PromiseCache<string | undefined, RefSet[]>({ accessTTL: 1000 * 60 * 60 });
-	private _inflightEnrichmentCache = new PromiseMap<string, Map<string, EnrichedAutolink> | undefined>();
+	// Caches enriched autolinks keyed by commit message (or joined messages) — despite the name, this is not
+	// inflight-only: settled entries are retained until evicted. Bounded here because keys can be large (the
+	// compare-range path joins every message in the range into a single key) and unbounded growth was retaining
+	// one entry per unique viewed message for the life of the session.
+	private _enrichedAutolinksCache = new PromiseCache<string, Map<string, EnrichedAutolink> | undefined>({
+		createTTL: 1000 * 60 * 30, // 30 minutes
+		capacity: 50,
+	});
 
 	constructor(private readonly container: Container) {
 		this._disposable = Disposable.from(
@@ -68,20 +76,29 @@ export class AutolinksProvider implements Disposable {
 
 	dispose(): void {
 		this._disposable?.dispose();
-		this._inflightEnrichmentCache.clear();
+		this._enrichedAutolinksCache.clear();
 	}
 
 	private onConfigurationChanged(e?: ConfigurationChangeEvent) {
 		if (configuration.changed(e, 'autolinks')) {
 			this.setAutolinksFromConfig();
 			this._refsetCache.clear();
-			this._inflightEnrichmentCache.clear();
+			this._enrichedAutolinksCache.clear();
 		}
 	}
 
 	private onIntegrationsChanged(_e: ConfiguredIntegrationsChangeEvent) {
 		this._refsetCache.clear();
-		this._inflightEnrichmentCache.clear();
+		this._enrichedAutolinksCache.clear();
+	}
+
+	/** Resource usage retained by autolink caches and configuration. */
+	getResourceUsage(): ResourceUsage {
+		return {
+			'refsets.entries.count': this._refsetCache.size,
+			'enriched.entries.count': this._enrichedAutolinksCache.size,
+			'configured.references.count': this._references.length,
+		};
 	}
 
 	private setAutolinksFromConfig() {
@@ -214,9 +231,24 @@ export class AutolinksProvider implements Disposable {
 				? `m:${remoteKey}:${messageOrAutolinks}`
 				: `a:${remoteKey}:${[...messageOrAutolinks.keys()].sort().join('|')}`;
 		if (options?.cached) {
-			return this._inflightEnrichmentCache.get(key) ?? Promise.resolve(undefined);
+			return this._enrichedAutolinksCache.get(key) ?? Promise.resolve(undefined);
 		}
-		return this._inflightEnrichmentCache.getOrCreate(key, () =>
+
+		// Trace-gated (noisy — fires on every cache miss): tracks retained cache state over time — entry count
+		// (pinned at capacity means evictions are active) and total retained key bytes, since keys can be large
+		// (compare ranges join every message into one key).
+		if (Logger.enabled('trace')) {
+			let keyBytes = 0;
+			for (const cachedKey of this._enrichedAutolinksCache.keys()) {
+				keyBytes += cachedKey.length;
+			}
+			Logger.trace(
+				undefined,
+				`AutolinksProvider._enrichedAutolinksCache: entries=${this._enrichedAutolinksCache.size}, keyBytes=${keyBytes}, newKeyBytes=${key.length}`,
+			);
+		}
+
+		return this._enrichedAutolinksCache.getOrCreate(key, () =>
 			this.enrichAutolinksCore(messageOrAutolinks, remote),
 		);
 	}

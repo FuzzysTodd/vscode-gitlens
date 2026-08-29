@@ -1,11 +1,11 @@
 import type { Disposable } from 'vscode';
 import { Uri, workspace } from 'vscode';
-import type { GitProviderDescriptor } from '@gitlens/git/providers/types.js';
-import type { GitResult, GitRunOptions, GitSpawnOptions } from '@gitlens/git/run.types.js';
 import type { CliGitProvider, CliGitProviderOptions } from '@gitlens/git-cli/cliGitProvider.js';
 import type { GitOptions } from '@gitlens/git-cli/exec/git.js';
 import { Git } from '@gitlens/git-cli/exec/git.js';
 import type { GitLocation } from '@gitlens/git-cli/exec/locator.js';
+import type { GitProviderDescriptor } from '@gitlens/git/providers/types.js';
+import type { GitResult, GitRunOptions, GitSpawnOptions } from '@gitlens/git/run.types.js';
 import { trace } from '@gitlens/utils/decorators/log.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { getScheme } from '@gitlens/utils/path.js';
@@ -70,6 +70,11 @@ export class VslsGitProvider extends GlCliGitProvider {
 		return {
 			...options,
 			git: new VslsGit(options.locator, { isTrusted: () => workspace.isTrusted }),
+			// The repository lives on the host, not here: the Git Health probes would stat local paths that
+			// aren't the repo, and every config write, `maintenance run`, `commit-graph write`, and
+			// `update-index` is rejected by the Live Share host's command allowlist. Report the capability as
+			// absent, exactly as web builds do, rather than emitting empty reports and swallowing failures.
+			localRepositories: false,
 		};
 	}
 

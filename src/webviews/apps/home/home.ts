@@ -1,6 +1,6 @@
 /*global*/
 import './home.scss';
-import type { Remote } from '@eamodio/supertalk';
+import type { Remote, Subscription } from '@eamodio/supertalk';
 import { ContextProvider } from '@lit/context';
 import { html, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
@@ -54,9 +54,8 @@ import '../plus/home/components/overview.js';
 import '../shared/components/skeleton-loader.js';
 import './components/repo-alerts.js';
 import '../shared/components/banner/banner.js';
+import '../shared/components/agents-banner.js';
 import '../shared/components/gl-error-banner.js';
-import '../shared/components/hooks-banner.js';
-import '../shared/components/mcp-banner.js';
 
 /**
  * Home App - signal-based state management with RPC.
@@ -70,9 +69,6 @@ import '../shared/components/mcp-banner.js';
 @customElement('gl-home-app')
 export class GlHomeApp extends SignalWatcherWebviewApp {
 	static override styles = [homeBaseStyles, scrollableBase, homeStyles];
-
-	@property({ type: String, noAccessor: true })
-	private context!: string;
 
 	@property({ type: String }) webroot?: string;
 
@@ -100,7 +96,7 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 	/**
 	 * RPC controller — manages connection lifecycle via Lit's ReactiveController pattern.
 	 */
-	private _rpc = new RpcController<HomeServices>(this, {
+	protected override readonly _rpc = new RpcController<HomeServices>(this, {
 		rpcOptions: {
 			webviewId: () => this._webview?.webviewId,
 			webviewInstanceId: () => this._webview?.webviewInstanceId,
@@ -113,6 +109,9 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 	/**
 	 * Context providers for state consumed by child components.
 	 */
+	/** True once the Lit context providers below exist — they're created once per element lifetime. */
+	private _contextProvidersCreated = false;
+
 	private _subscriptionCtx?: ContextProvider<typeof subscriptionContext>;
 	private _homeStateCtx?: ContextProvider<typeof homeStateContext>;
 	private _activeOverviewCtxProvider?: ContextProvider<typeof activeOverviewStateContext>;
@@ -147,8 +146,7 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 	// Per-resource in-flight gates. Concurrent callers receive the in-flight promise instead
 	// of triggering a `Resource.fetch()` that would cancel-and-restart the existing one (its
 	// default behavior is `cancelPrevious=true`). A trailing-edge re-fire after settle ensures
-	// the latest request gets fresh data. Same shape as Graph's `_wipNotifyInFlight` /
-	// `_wipNotifyDirty` pattern in graphWebview.ts.
+	// the latest request gets fresh data. Same shape as Graph's `CoalescedRun` pattern (`@gitlens/utils`).
 	//
 	// `replaceOverview` bypasses these gates — it explicitly cancels and force-fetches; the
 	// reset helper below clears in-flight tracking AND bumps the generation counters so any
@@ -248,9 +246,10 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 	}
 
 	/**
-	 * Unsubscribe function for RPC event subscriptions.
+	 * RPC event subscription — released at disconnect (before the actions its subscriber captured
+	 * are disposed) and recreated per ready against the new session's actions.
 	 */
-	private _unsubscribeEvents?: () => void;
+	private _eventsSubscription?: Subscription;
 
 	/**
 	 * Dynamic FS-level WIP watcher — re-subscribed when the overview repo changes.
@@ -280,11 +279,15 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 	override connectedCallback(): void {
 		super.connectedCallback?.();
 
-		const context = this.context;
-		this.context = undefined!;
-		this.initWebviewContext(context);
+		this.consumeContext();
 
-		// Create context providers for child components
+		// Create context providers for child components — once per element lifetime: a provider
+		// attaches host listeners that nothing detaches, so re-creating them on a startup-churn
+		// remount would accumulate duplicate providers answering every context request. The
+		// backing state objects are element fields and survive the remount unchanged.
+		if (this._contextProvidersCreated) return;
+
+		this._contextProvidersCreated = true;
 		this._subscriptionCtx = new ContextProvider(this, {
 			context: subscriptionContext,
 			initialValue: createDefaultSubscriptionContextState(),
@@ -315,9 +318,12 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 		this._readyAbort?.abort(new DOMException('home: disconnected', 'AbortError'));
 		this._readyAbort = undefined;
 
-		// Unsubscribe RPC event callbacks (before RPC connection is disposed)
-		this._unsubscribeEvents?.();
-		this._unsubscribeEvents = undefined;
+		// Unsubscribe BEFORE the actions/state below are disposed: the retained handle would
+		// otherwise re-issue its subscriber — which closes over those disposed objects — on the
+		// next handshake, ahead of `_onRpcReady`'s replacement. A fresh subscription is created
+		// per ready anyway, so nothing is lost by releasing this one here.
+		this._eventsSubscription?.unsubscribe();
+		this._eventsSubscription = undefined;
 		this._wipWatchUnsubscribe?.();
 		this._wipWatchUnsubscribe = undefined;
 
@@ -346,7 +352,7 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 		this._commandsState.service = undefined;
 
 		// GlWebviewApp: cleans up focus tracker, disposes ipc/promos/telemetry/DOM listeners
-		// Lit framework: calls RpcController.hostDisconnected() → disposes RPC connection
+		// Lit framework: calls RpcController.hostDisconnected() → ends the RPC session (the connection lives on)
 		super.disconnectedCallback?.();
 	}
 
@@ -418,7 +424,6 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 		const [
 			home,
 			launchpad,
-			config,
 			subscription,
 			integrations,
 			repositories,
@@ -427,10 +432,10 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 			commands,
 			onboarding,
 			branches,
+			agents,
 		] = await Promise.all([
 			services.home,
 			services.launchpad,
-			services.config,
 			services.subscription,
 			services.integrations,
 			services.repositories,
@@ -439,22 +444,27 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 			services.commands,
 			services.onboarding,
 			services.branches,
+			services.agents,
 		]);
+
+		// Subscription changes invalidate the promo cache.
+		this._promos.connect(this._rpc.connection!);
 
 		// Supertalk remote proxy properties are thenable at runtime (ProxyProperty with .then()),
 		// but Remote<T> types them as synchronous values. The lint rule correctly detects the
 		// thenable; the disable is required — this is how Supertalk property access works.
 
-		/* eslint-disable @typescript-eslint/await-thenable -- Supertalk proxy properties are thenable at runtime */
-		const [subscriptionSignal, orgSettingsSignal, avatarSignal, hasAccountSignal, orgCountSignal] =
+		/* oxlint-disable typescript/await-thenable -- Supertalk proxy properties are thenable at runtime */
+		const [subscriptionSignal, orgSettingsSignal, avatarSignal, hasAccountSignal, orgCountSignal, aiUsageSignal] =
 			await Promise.all([
 				subscription.subscriptionState,
 				subscription.orgSettingsState,
 				subscription.avatarState,
 				subscription.hasAccountState,
 				subscription.organizationsCountState,
+				subscription.aiUsageState,
 			]);
-		/* eslint-enable @typescript-eslint/await-thenable */
+		/* oxlint-enable typescript/await-thenable */
 
 		// Swap remote subscription context to use RemoteSignals directly (no bridge/copy)
 		this._subscriptionCtx?.setValue(
@@ -464,6 +474,7 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 				avatar: avatarSignal,
 				hasAccount: hasAccountSignal,
 				organizationsCount: orgCountSignal,
+				aiUsage: aiUsageSignal,
 			},
 			true,
 		);
@@ -611,15 +622,13 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 		// `isDismissed` as a Promise, so each call must be awaited — synchronous `!` against
 		// a Promise is always `false`, which leaves banners stuck "dismissed" until an
 		// onDidChange event corrects them (and never corrects fresh, never-dismissed keys).
-		/* eslint-disable @typescript-eslint/await-thenable -- Supertalk proxy method calls are thenable at runtime */
-		const [integrationDismissed, mcpDismissed, hooksDismissed] = await Promise.all([
+		/* oxlint-disable typescript/await-thenable -- Supertalk proxy method calls are thenable at runtime */
+		const [integrationDismissed, agentsDismissed] = await Promise.all([
 			onboarding.isDismissed('home:integrationBanner'),
-			onboarding.isDismissed('mcp:banner'),
-			onboarding.isDismissed('hooks:banner'),
+			onboarding.isDismissed('agents:banner'),
 		]);
 		this._onboardingState.banners.integrationBanner = !integrationDismissed;
-		this._onboardingState.banners.mcpBanner = !mcpDismissed;
-		this._onboardingState.banners.hooksBanner = !hooksDismissed;
+		this._onboardingState.banners.agentsBanner = !agentsDismissed;
 
 		// Set up event subscriptions FIRST (so we don't miss events during fetch)
 		// Supertalk RPC marshals subscription methods as `Promise<Unsubscribe>`, so the
@@ -673,6 +682,11 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 			refreshActiveOverview: () => {
 				this._refreshActiveDebounced();
 			},
+			// Coalesced but NOT cancel-and-restart: `replaceOverview`'s `cancel()` would abort the WIP and
+			// enrichment promises the already-rendered progressive cards are holding.
+			refreshActiveOverviewNow: () => {
+				void this._fetchActiveCoalesced();
+			},
 			refreshInactiveOverview: () => {
 				this._refreshInactiveDebounced();
 			},
@@ -696,24 +710,11 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 				void this._fetchAgentCoalesced();
 			},
 		};
-		this._unsubscribeEvents = await phaseTimeout(
-			'setupSubscriptions',
-			30_000,
-			setupSubscriptions(
-				root,
-				{
-					home: home,
-					launchpad: launchpad,
-					config: config,
-					subscription: subscription,
-					integrations: integrations,
-					repositories: repositories,
-					onboarding: onboarding,
-					ai: ai,
-				},
-				actions,
-			),
-		);
+		// Recreated per ready (not `??=`): the subscriber closes over this session's state/actions —
+		// see the equivalent note in commitDetails.ts.
+		this._eventsSubscription?.unsubscribe();
+		this._eventsSubscription = setupSubscriptions(this._rpc.connection!, root, actions);
+		await phaseTimeout('setupSubscriptions', 30_000, this._eventsSubscription.ready);
 
 		// Start FS-level WIP watcher for the initial overview repo
 		watchWipForRepo(this._homeState.overviewRepositoryPath.get());
@@ -749,7 +750,16 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 		await phaseTimeout(
 			'populateInitialState',
 			30_000,
-			populateInitialState(root, home, subscription, integrations, repositories, ai, syncInactiveOverviewFilter),
+			populateInitialState(
+				root,
+				home,
+				subscription,
+				integrations,
+				repositories,
+				ai,
+				agents,
+				syncInactiveOverviewFilter,
+			),
 		);
 	}
 
@@ -773,36 +783,23 @@ export class GlHomeApp extends SignalWatcherWebviewApp {
 		// Banners outside <main> only render once we know the layout
 		if (!this._homeState.ready.get()) return nothing;
 
-		const aiState = this._aiState.state.get();
-		// Suppress the MCP banner once MCP is actually installed — the "Connect More Agents" CTA
-		// still lives in the integrations popover row, so it isn't lost. Hooks takes the slot instead.
-		const showMcp = this._onboardingState.banners.mcpBanner && !aiState.mcp.installed;
-		if (showMcp) return this.renderMcpBanner();
-		return this.renderHooksBanner();
+		return this.renderAgentsBanner();
 	}
 
-	private renderMcpBanner(): unknown {
-		// Hide once the user has dismissed it via the onboarding service
-		if (!this._onboardingState.banners.mcpBanner) return nothing;
+	private renderAgentsBanner(): unknown {
+		if (!this._onboardingState.banners.agentsBanner) return nothing;
 
 		const aiState = this._aiState.state.get();
+		// Nothing left to pitch once MCP is installed and there are no hook-eligible agents to install for.
+		if (aiState.mcp.installed && !aiState.hooks.canInstallHooks) return nothing;
+
 		return html`
-			<gl-mcp-banner
+			<gl-agents-banner
 				source="home"
-				.canAutoRegister=${aiState.mcp.bundled}
-				.canInstallClaudeHook=${aiState.hooks.canInstallClaudeHook}
-			></gl-mcp-banner>
+				.mcpCanAutoRegister=${aiState.mcp.bundled}
+				.hooksAvailable=${aiState.hooks.agents.length > 0}
+			></gl-agents-banner>
 		`;
-	}
-
-	private renderHooksBanner(): unknown {
-		if (!this._onboardingState.banners.hooksBanner) return nothing;
-
-		const aiState = this._aiState.state.get();
-		if (!aiState.enabled || !aiState.orgEnabled) return nothing;
-		if (!aiState.hooks.canInstallClaudeHook) return nothing;
-
-		return html`<gl-hooks-banner source="home"></gl-hooks-banner>`;
 	}
 
 	private renderMain(): unknown {

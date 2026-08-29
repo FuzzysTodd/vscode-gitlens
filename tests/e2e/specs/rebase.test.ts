@@ -1,8 +1,26 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as process from 'node:process';
+import type { FrameLocator, Locator } from '@playwright/test';
 import type { VSCodeInstance } from '../baseTest.js';
 import { test as base, createTmpDir, DefaultTimeout, expect, GitFixture, ShortTimeout } from '../baseTest.js';
+
+/**
+ * The rebase editor's DEFAULT action: *Start Rebase* before the rebase runs, *Continue* while it is
+ * paused (`renderStartRebaseActions` / `renderActiveRebaseActions` in `apps/rebase/rebase.ts`).
+ *
+ * Excluding the AI actions is what makes this unambiguous, not a nicety. Since `d7a92df15` each default
+ * action has an AI twin whenever AI is allowed — *Start Auto-Rebase* beside *Start Rebase*, *Continue
+ * with AI* beside *Continue* — so a bare `/Start|Continue/` resolves to two `gl-button`s and every use
+ * fails Playwright's strict mode. It isn't a state a spec can steer around either: `aiAllowed` follows
+ * `gitlens.ai.enabled`, which `defaultUserSettings` turns on for every instance.
+ */
+function primaryRebaseAction(webviewFrame: FrameLocator): Locator {
+	return webviewFrame
+		.locator('gl-button')
+		.filter({ hasText: /Start|Continue/i })
+		.filter({ hasNotText: /Auto-Rebase|with AI/i });
+}
 
 /** SHA of the initial commit - captured during repo setup */
 let initialCommitSha: string;
@@ -129,10 +147,15 @@ async function standardTeardown({ vscode }: { vscode: VSCodeInstance }) {
 			await currentRebaseContext.signalEditorAbort().catch(() => {
 				// If signaling fails, we'll reinitialize in setup anyway
 			});
-			// Wait briefly for the signal to be processed
+			// Wait for that process to actually exit. `standardSetup` deletes `rebase-merge`, `REBASE_HEAD`
+			// and `index.lock` and then starts a new rebase, so returning while the previous `git rebase` is
+			// still alive lets the two fight over the same `.git` — which surfaces as the NEXT test hanging
+			// until its timeout. A second was not enough under load, and Playwright charges this hook to the
+			// preceding test's timeout, so the cap stays well inside it; the normal case still
+			// resolves as soon as git exits, so this only costs time when something really is stuck.
 			await Promise.race([
 				currentRebaseContext.rebasePromise.catch(() => {}),
-				new Promise(resolve => setTimeout(resolve, 1000)),
+				new Promise(resolve => setTimeout(resolve, 5000)),
 			]);
 			currentRebaseContext = null;
 		}
@@ -240,7 +263,7 @@ test.describe('Editor — Core', () => {
 
 			// Test bulk action change: multi-select with Ctrl+Click then drop with 'd'
 			await entries.nth(2).click();
-			await entries.nth(3).click({ modifiers: ['Control'] });
+			await entries.nth(3).click({ modifiers: ['ControlOrMeta'] });
 			await page.keyboard.press('d');
 			await page.waitForTimeout(ShortTimeout / 2);
 			await expect(entries.nth(2).locator('.action-select')).toHaveAttribute('value', 'drop');
@@ -287,7 +310,7 @@ test.describe('Editor — Core', () => {
 
 			// Select oldest then newest (so newest is focused)
 			await oldestEntry.click();
-			await newestEntry.click({ modifiers: ['Control'] });
+			await newestEntry.click({ modifiers: ['ControlOrMeta'] });
 
 			// Press 's' to squash selection
 			await page.keyboard.press('s');
@@ -374,7 +397,7 @@ test.describe('Editor — Core', () => {
 
 			// Test moving commits down: Select 2nd and 3rd entries (Commit C and Commit B)
 			await entries.nth(1).click();
-			await entries.nth(2).click({ modifiers: ['Control'] });
+			await entries.nth(2).click({ modifiers: ['ControlOrMeta'] });
 			await page.keyboard.press('Alt+ArrowDown');
 			await page.waitForTimeout(ShortTimeout / 2);
 
@@ -395,7 +418,7 @@ test.describe('Editor — Core', () => {
 
 			// Test moving commits up: Select repositioned Commit C and Commit B (now at indices 2 and 3)
 			await entries.nth(2).click();
-			await entries.nth(3).click({ modifiers: ['Control'] });
+			await entries.nth(3).click({ modifiers: ['ControlOrMeta'] });
 			await page.keyboard.press('Alt+ArrowUp');
 			await page.waitForTimeout(ShortTimeout / 2);
 
@@ -447,9 +470,11 @@ test.describe('Editor — Core', () => {
 	});
 
 	test.describe('Execute rebase', () => {
-		// Needs extra headroom: standardSetup (10+ git commands) can take ~12s under
-		// 8-worker load, and the test body does a full rebase flow (start + interact + execute)
-		test.setTimeout(45000);
+		// Needs extra headroom, and Playwright charges the hooks to the test: `standardSetup` runs 10+
+		// git commands (~12s under 8-worker load), the body runs a full rebase flow, and
+		// `standardTeardown` then waits for that rebase to exit. At 45s a loaded machine ran out
+		// mid-rebase; actions are bounded globally now, so a stuck one names itself well inside this.
+		test.setTimeout(60000);
 		test.beforeEach(standardSetup);
 		test.afterEach(standardTeardown);
 
@@ -475,7 +500,7 @@ test.describe('Editor — Core', () => {
 			await page.waitForTimeout(ShortTimeout / 2);
 
 			// Click Start/Continue button (gl-button custom element)
-			const startButton = webviewFrame.locator('gl-button').filter({ hasText: /Start|Continue/i });
+			const startButton = primaryRebaseAction(webviewFrame);
 			// Wait for any notifications to disappear or timeout
 			await page.waitForTimeout(ShortTimeout * 2);
 			// Try to close any visible notifications
@@ -531,7 +556,7 @@ test.describe('Editor — Core', () => {
 			await page.waitForTimeout(ShortTimeout / 2);
 
 			// Click Start/Continue button
-			const startButton = webviewFrame.locator('gl-button').filter({ hasText: /Start|Continue/i });
+			const startButton = primaryRebaseAction(webviewFrame);
 			// Wait for any notifications to disappear or timeout
 			await page.waitForTimeout(ShortTimeout * 2);
 			// Try to close any visible notifications
@@ -552,7 +577,9 @@ test.describe('Editor — Core', () => {
 			// Wait for rebase to complete with timeout
 			await Promise.race([
 				rebasePromise,
-				new Promise((_, reject) => setTimeout(() => reject(new Error('Rebase timeout after 60s')), 60000)),
+				// Must stay inside the test timeout above: a longer guard could never fire, so a stuck rebase would
+				// report a bare `Test timeout` naming nothing instead of the step that hung.
+				new Promise((_, reject) => setTimeout(() => reject(new Error('Rebase timeout after 30s')), 30000)),
 			]);
 
 			// Verify HEAD is "Commit B" (which now contains C's changes)
@@ -805,7 +832,7 @@ test.describe('Editor — Rebase Merges', () => {
 		expect(afterMessages).toEqual(beforeMessages);
 
 		// Verify Start button is NOT disabled
-		const startButton = webviewFrame.locator('gl-button').filter({ hasText: /Start|Continue/i });
+		const startButton = primaryRebaseAction(webviewFrame);
 		await expect(startButton).not.toBeDisabled();
 
 		// Signal editor done to keep it open, then abort

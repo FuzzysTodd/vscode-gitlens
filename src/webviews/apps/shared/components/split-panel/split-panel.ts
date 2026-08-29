@@ -2,13 +2,19 @@ import { html, LitElement } from 'lit';
 import { customElement, property, query } from 'lit/decorators.js';
 import { splitPanelStyles } from './split-panel.css.js';
 
-export const tagName = 'gl-split-panel';
+/** What triggered a snap evaluation. `'layout'` covers non-gesture callers — resize, orientation
+ *  flip, and the initial measurement — where the position isn't a deliberate user choice. */
+export type GlSplitPanelSnapSource = 'pointer' | 'keyboard' | 'layout';
 
-export type GlSplitPanelSnapFunction = (params: { pos: number; size: number }) => number;
+export type GlSplitPanelSnapFunction = (params: {
+	pos: number;
+	size: number;
+	source: GlSplitPanelSnapSource;
+}) => number;
 
 declare global {
 	interface HTMLElementTagNameMap {
-		[tagName]: GlSplitPanel;
+		['gl-split-panel']: GlSplitPanel;
 	}
 
 	interface GlobalEventHandlersEventMap {
@@ -26,6 +32,10 @@ declare global {
  * When `primary` is set, the designated panel maintains its pixel width on container resize
  * while the other panel absorbs the change. Without `primary`, both panels scale proportionally.
  *
+ * A "closed" panel (position pinned to the 0 or 100 edge) is only collapsed to zero size — it
+ * stays in the DOM and is NOT marked `inert`. Consumers that collapse a panel are responsible for
+ * applying `inert` to their slotted content so it leaves the tab order / a11y tree while hidden.
+ *
  * @slot start - Content for the start panel (left in horizontal, top in vertical).
  * @slot end - Content for the end panel (right in horizontal, bottom in vertical).
  *
@@ -41,7 +51,7 @@ declare global {
  * @cssproperty --gl-split-panel-divider-width - Divider visual width. Default `4px`.
  * @cssproperty --gl-split-panel-divider-hit-area - Divider interactive hit area. Default `var(--vscode-sash-hoverSize, 8px)`.
  */
-@customElement(tagName)
+@customElement('gl-split-panel')
 export class GlSplitPanel extends LitElement {
 	static override styles = splitPanelStyles;
 
@@ -50,15 +60,28 @@ export class GlSplitPanel extends LitElement {
 	private _position = 0;
 	private _positionBeforeCollapse = 0;
 	/**
-	 * Cached pixel width of the primary panel. Updated only when the position changes via
-	 * user interaction (setter), NOT during resize. This allows the primary panel to maintain
-	 * its pixel width across container resizes without drift — even when snap clamping occurs
-	 * during a shrink, the cache preserves the intended width for when the container grows back.
+	 * Cached pixel width of the primary panel, kept current on every position change (gesture or
+	 * layout) so it always reflects the panel's actual size. Whether a resize PRESERVES this pixel
+	 * width or lets it drift with the percentage depends on {@link _pxAnchored} — see there.
 	 */
 	private _cachedPrimaryPx = 0;
+	/**
+	 * True once the current position came from a deliberate user resize (pointer drag, keyboard,
+	 * or the pointerdown visual re-sync) rather than a consumer-bound value or a layout pass. Only
+	 * an anchored pixel width is worth preserving across container resizes — a mount-time or
+	 * programmatic position may be a transient mid-layout measurement, and preserving THAT would
+	 * fossilize an accidental size instead of an intended one. The `position` setter clears this
+	 * unless {@link anchoredPosition} is set (a consumer-bound position makes the percentage
+	 * authoritative again); the gesture paths set it back to true after writing through the setter.
+	 */
+	private _pxAnchored = false;
 	private _dragAc: AbortController | undefined;
 	private _resizeObserver: ResizeObserver | undefined;
 	private _lastPointerDownTime = 0;
+	/** Orientation last reconciled with `_size`/`_cachedPrimaryPx`. On an orientation flip we re-base
+	 *  the cache to the new axis so the divider keeps its PERCENTAGE rather than carrying the old
+	 *  axis's pixels across (which would snap it to an arbitrary spot). */
+	private _observedOrientation: 'horizontal' | 'vertical' | undefined;
 
 	/** Position of the divider as a percentage (0–100) from the start edge. */
 	@property({ type: Number, reflect: true })
@@ -67,7 +90,19 @@ export class GlSplitPanel extends LitElement {
 	}
 	set position(value: number) {
 		const old = this._position;
-		this._position = clampPosition(value);
+		const next = clampPosition(value);
+		// Only a value that actually MOVES the divider counts as a consumer override. Consumers
+		// re-bind `.position` from the state a gesture just wrote, and that echo arrives here as a
+		// fresh value (Lit's committed value is the pre-gesture one) — clearing the anchor on it
+		// would drop the pixel width the drag just established. With `anchoredPosition`, bound values
+		// are deliberate sizes, so they anchor rather than clear.
+		if (next !== this._position && !this.anchoredPosition) {
+			this._pxAnchored = false;
+		} else if (next !== this._position && this._size > 0) {
+			this._pxAnchored = true;
+		}
+
+		this._position = next;
 		this.updateCachedPrimaryPx();
 		// Emit closed-change on programmatic prop updates too (not just user interactions);
 		// otherwise a consumer-initiated open (`.position=22`) leaves the internal
@@ -80,6 +115,17 @@ export class GlSplitPanel extends LitElement {
 		this.requestUpdate('position', old);
 	}
 
+	/**
+	 * Treats consumer-bound positions as deliberate sizes: each distinct bound value re-anchors the
+	 * primary panel's pixel width for preservation across container resizes, instead of clearing the
+	 * anchor like {@link _pxAnchored}'s default rule does. For consumers whose persisted position is
+	 * already an intentional size (e.g. a pixel-policy-driven pane), this keeps that pixel height
+	 * held across unrelated resizes without requiring a fresh gesture after every remount or
+	 * visibility toggle.
+	 */
+	@property({ type: Boolean, reflect: true })
+	anchoredPosition = false;
+
 	/** Layout orientation. `horizontal` splits left/right, `vertical` splits top/bottom. */
 	@property({ reflect: true })
 	orientation: 'horizontal' | 'vertical' = 'horizontal';
@@ -91,6 +137,10 @@ export class GlSplitPanel extends LitElement {
 	 * - `size` — the container's current pixel size along the orientation axis
 	 *    (width for horizontal, height for vertical). Use this to express pixel-based
 	 *    constraints, e.g. `const px = (pos / 100) * size`.
+	 * - `source` — what triggered the snap: `'pointer'`, `'keyboard'`, or `'layout'` (resize,
+	 *    orientation flip, or the initial measurement). Consumers may ignore it, or use it to
+	 *    skip a gesture-only heuristic (e.g. a magnet-to-default window) that shouldn't apply
+	 *    to a single small keyboard step.
 	 *
 	 * Called on pointer drag, keyboard navigation, container resize, and once on first
 	 * measurement — so returning a pixel-clamped value is sufficient to enforce min/max
@@ -123,6 +173,21 @@ export class GlSplitPanel extends LitElement {
 	@property({ type: Boolean, reflect: true })
 	disabled = false;
 
+	/** Opt-in animated glide on `.position` changes — normally a position change snaps instantly.
+	 *  Set for a deliberate transition (e.g. a maximize release); leave unset for drag/keyboard, which
+	 *  already move smoothly under the pointer/key and would otherwise fight the transition. Named
+	 *  `animated` (attribute `animate`) — `animate` alone collides with `Element.prototype.animate`. */
+	@property({ type: Boolean, attribute: 'animate', reflect: true })
+	animated = false;
+
+	/** The end panel overlays the entire container as a sticky STATE rather than a position write.
+	 *  Purely visual — the grid tracks are untouched, so the start panel (e.g. the graph behind the
+	 *  details pane) keeps its exact size and never reflows; `position` (and the cached pixel size)
+	 *  stay untouched too, so restoring is exact even after resizes. Consumers should disable the
+	 *  divider alongside this. */
+	@property({ type: Boolean, reflect: true })
+	maximized = false;
+
 	/**
 	 * Tracks the last-emitted closed state. `undefined` doubles as the "not yet seeded"
 	 * sentinel — `emitClosedIfChanged` short-circuits until `connectedCallback` seeds the
@@ -137,6 +202,32 @@ export class GlSplitPanel extends LitElement {
 
 	private get isHorizontal(): boolean {
 		return this.orientation !== 'vertical';
+	}
+
+	/** Re-base `_size` and the cached primary pixels to the current orientation's axis, preserving the
+	 *  divider percentage. Returns true when an orientation flip was reconciled (px-preservation across
+	 *  axes is meaningless, so the percentage carries instead). */
+	private reconcileOrientation(): boolean {
+		// No-op until `connectedCallback` seeds the baseline (so the initial measure/snap isn't done
+		// twice), and when the axis hasn't actually flipped.
+		if (this._observedOrientation == null || this._observedOrientation === this.orientation) return false;
+
+		const rect = this.getBoundingClientRect();
+		const size = Math.round(this.isHorizontal ? rect.width : rect.height);
+		if (size <= 0) return false;
+
+		this._observedOrientation = this.orientation;
+		this._size = size;
+		// Re-clamp for the new axis (snap may be pixel-based) then re-cache, preserving the percentage.
+		// No change event: a flip isn't a user gesture and the consumer drives persistence, so a snap
+		// here must not masquerade as a deliberate resize.
+		const snapped = this.applySnap(this._position, 'layout');
+		if (snapped !== this._position) {
+			this._position = snapped;
+			this.requestUpdate();
+		}
+		this.updateCachedPrimaryPx();
+		return true;
 	}
 
 	/** Update the cached pixel width of the primary panel from the current position and size. */
@@ -161,19 +252,25 @@ export class GlSplitPanel extends LitElement {
 			// flash of the collapsed position when the element is re-shown.
 			if (size === 0) return;
 
+			// An orientation flip changes which axis `size` measures; re-base the cache to keep the
+			// divider's percentage rather than px-preserving across axes. (No-op for fixed-orientation
+			// splits like the sidebar/minimap.)
+			if (this.reconcileOrientation()) return;
+
 			if (size !== this._size) {
 				const oldPos = this._position;
 				this._size = size;
 
-				// When a primary panel is set, maintain its pixel width
-				if (this.primary && this._cachedPrimaryPx > 0) {
+				// When a primary panel is set AND the cached width came from a deliberate user
+				// resize, maintain its pixel width across the resize.
+				if (this.primary && this._cachedPrimaryPx > 0 && this._pxAnchored) {
 					const raw =
 						this.primary === 'end'
 							? clampPosition(100 - (this._cachedPrimaryPx / size) * 100)
 							: clampPosition((this._cachedPrimaryPx / size) * 100);
 					// Apply snap for visual constraints but DON'T update the cache —
 					// this preserves the intended pixel width for when the container grows back.
-					const snapped = this.applySnap(raw);
+					const snapped = this.applySnap(raw, 'layout');
 					// A resize is not a user gesture — the container changed shape, the user
 					// didn't ask to close the panel. If snap would transition open → closed,
 					// refuse and keep the unsnapped raw position (still clamped 0–100, still
@@ -181,28 +278,57 @@ export class GlSplitPanel extends LitElement {
 					// setter) still honor close-snap because they don't go through this branch.
 					const wasClosed = this._closedState === true;
 					this._position = !wasClosed && this.computeClosed(snapped) ? raw : snapped;
+				} else if (this.primary) {
+					// Not anchored — the cached pixel width may be a transient mid-layout
+					// measurement (e.g. seeded on reload before the container settled), not a
+					// user's intended size. Let the percentage ride the resize instead of
+					// fossilizing it, and refresh the cache so it tracks the new size.
+					this.updateCachedPrimaryPx();
 				}
 				// No primary: position stays the same percentage → proportional scaling
 
+				// A container resize is NOT a user gesture: hold the primary panel's pixel width by
+				// updating `_position` (→ `--_start-size` via `willUpdate`) but DON'T emit
+				// `gl-split-panel-change`. Emitting makes consumers persist the resize-adjusted
+				// percentage, which then feeds `.position` back into the setter and overwrites
+				// `_cachedPrimaryPx` — corrupting the very pixel width this branch preserves when snap
+				// clamps mid-resize (the panel then can't restore its width once the container grows
+				// back). Drag/keyboard still emit via their own paths; a closed transition can't happen
+				// here (refused above), so no closed-change is owed either.
 				if (this._position !== oldPos) {
-					this.emitChange();
+					this.requestUpdate();
 				}
-				this.requestUpdate();
 			}
 		});
 		void this.updateComplete.then(() => {
-			this._resizeObserver!.observe(this);
+			// This continuation runs a microtask later, by which point the panel may already have
+			// disconnected — `disconnectedCallback` clears the observer, so the non-null assertion this
+			// replaces threw `undefined.observe` on a connect/disconnect inside one update cycle. Nothing
+			// below (observing, seeding size/closed state, re-snapping) means anything for a detached
+			// panel, so bail rather than guard each step.
+			if (this._resizeObserver == null) return;
+
+			this._resizeObserver.observe(this);
 			const rect = this.getBoundingClientRect();
 			this._size = Math.round(this.isHorizontal ? rect.width : rect.height);
+			this._observedOrientation = this.orientation;
 			// Seed initial closed state so transition-detection has a baseline. Setting it to
 			// a non-undefined value also flips the position setter's "not seeded" gate, so
 			// subsequent programmatic updates emit transitions. Without a `primary` there is
 			// no closed edge; seed as `false` to unlock the gate while keeping the setter's
 			// `computeClosed` always returning `false` (no transitions will ever fire).
 			this._closedState = this.primary != null ? this.computeClosed(this._position) : false;
+			// Anchored-position consumers treat their bound value as deliberate — anchor it now that
+			// the size is known, so the very first container resize preserves pixels. Without this the
+			// anchor only engages on a later distinct bound value (the setter skips anchoring while
+			// `_size` is still 0 during initial property setup), leaving the mount-time position riding
+			// resizes as a percentage.
+			if (this.anchoredPosition) {
+				this._pxAnchored = true;
+			}
 			// Re-apply snap now that container size is known so pixel-aware snap
 			// functions can clamp initial position (from restored/default percentage).
-			const snapped = this.applySnap(this._position);
+			const snapped = this.applySnap(this._position, 'layout');
 			if (snapped !== this._position) {
 				this._position = snapped;
 				this.emitChange();
@@ -220,8 +346,35 @@ export class GlSplitPanel extends LitElement {
 		this._dragAc = undefined;
 	}
 
+	/** Re-applies the snap policy to the current position (source 'layout'), e.g. after slotted
+	 *  content changed the constraints a custom snap function derives. Non-persisting, like a resize
+	 *  — does NOT update the cached pixel width, and refuses an open→closed transition (mirrors the
+	 *  ResizeObserver's pixel-anchored branch in `connectedCallback`). */
+	refreshSnap(): void {
+		if (this._size <= 0) return;
+
+		const snapped = this.applySnap(this._position, 'layout');
+		if (snapped === this._position) return;
+
+		const wasClosed = this._closedState === true;
+		if (!wasClosed && this.computeClosed(snapped)) return;
+
+		this._position = snapped;
+		this.requestUpdate();
+	}
+
 	protected override willUpdate(): void {
+		// Maximize no longer touches the track sizes — the [maximized] CSS overlays the end panel
+		// across the container instead, leaving the start panel's layout (and anything rendering
+		// inside it) completely unaffected.
 		this.style.setProperty('--_start-size', `${this._position}%`);
+	}
+
+	protected override updated(): void {
+		// A resize-driven flip's ResizeObserver fires before this render applies the new orientation,
+		// and a flip with no container-size change never fires it at all — reconcile here so the cache
+		// is re-based to the new axis regardless. No-ops once the orientation is already reconciled.
+		this.reconcileOrientation();
 	}
 
 	override render() {
@@ -248,9 +401,9 @@ export class GlSplitPanel extends LitElement {
 		`;
 	}
 
-	private applySnap(pos: number): number {
+	private applySnap(pos: number, source: GlSplitPanelSnapSource): number {
 		if (this.snap) {
-			return this.snap({ pos: pos, size: this._size });
+			return this.snap({ pos: pos, size: this._size, source: source });
 		}
 		return pos;
 	}
@@ -328,13 +481,23 @@ export class GlSplitPanel extends LitElement {
 		if (Math.abs(visualPos - this._position) > 1) {
 			this._position = visualPos;
 			this.updateCachedPrimaryPx();
+			this._pxAnchored = true;
 			// Sync the CSS variable immediately so the grid doesn't jump when
 			// [dragging] removes fit-content and falls back to min(--_start-size, ...)
 			this.style.setProperty('--_start-size', `${this._position}%`);
 		}
 
 		this.toggleAttribute('dragging', true);
-		this.dividerEl.setPointerCapture(e.pointerId);
+
+		// A pointer can vanish between `pointerdown` and here (pen lift, touch cancel, synthetic
+		// events) making `setPointerCapture` throw — an unguarded throw here would leave the panel
+		// wedged in [dragging] with no listeners attached and no way to recover.
+		try {
+			this.dividerEl.setPointerCapture(e.pointerId);
+		} catch {
+			this.toggleAttribute('dragging', false);
+			return;
+		}
 
 		this._dragAc?.abort();
 		const ac = new AbortController();
@@ -349,7 +512,8 @@ export class GlSplitPanel extends LitElement {
 			const rect = this.getBoundingClientRect();
 			const posPx = (horiz ? ev.clientX - rect.left : ev.clientY - rect.top) - offsetPx;
 			const posPct = (posPx / this._size) * 100;
-			this.position = this.applySnap(posPct);
+			this.position = this.applySnap(posPct, 'pointer');
+			this._pxAnchored = true;
 			this.emitChange();
 		};
 
@@ -436,7 +600,8 @@ export class GlSplitPanel extends LitElement {
 
 		if (handled) {
 			e.preventDefault();
-			this.position = this.applySnap(newPos);
+			this.position = this.applySnap(newPos, 'keyboard');
+			this._pxAnchored = true;
 			this.emitChange();
 		}
 	}

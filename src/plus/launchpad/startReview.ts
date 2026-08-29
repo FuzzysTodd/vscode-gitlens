@@ -3,6 +3,7 @@ import { Uri, window } from 'vscode';
 import type { GitBranch } from '@gitlens/git/models/branch.js';
 import type { PullRequest } from '@gitlens/git/models/pullRequest.js';
 import type { GitWorktree } from '@gitlens/git/models/worktree.js';
+import type { IntegrationIds } from '@gitlens/integrations/constants.js';
 import { getScopedCounter } from '@gitlens/utils/counter.js';
 import { fromNow } from '@gitlens/utils/date.js';
 import { some } from '@gitlens/utils/iterable.js';
@@ -26,31 +27,28 @@ import {
 	OpenOnGitLabQuickInputButton,
 } from '../../commands/quick-wizard/quickButtons.js';
 import { QuickCommand } from '../../commands/quick-wizard/quickCommand.js';
-import { ensureAccessStep } from '../../commands/quick-wizard/steps/access.js';
+import { ensureAccessStep, getAccessGateErrorMessage } from '../../commands/quick-wizard/steps/access.js';
 import { StepsController } from '../../commands/quick-wizard/stepsController.js';
 import { canPickStepContinue, createPickStep } from '../../commands/quick-wizard/utils/steps.utils.js';
-import type { IntegrationIds } from '../../constants.integrations.js';
-import { GitCloudHostIntegrationId } from '../../constants.integrations.js';
 import { proBadge } from '../../constants.js';
 import type { Source } from '../../constants.telemetry.js';
 import type { Container } from '../../container.js';
+import type { ConnectMoreIntegrationsItem } from '../../quickpicks/integrationPicker.js';
+import {
+	getOpenOnGitProviderQuickInputButtons,
+	isManageIntegrationsItem,
+	manageIntegrationsItem,
+} from '../../quickpicks/integrationPicker.js';
 import type { QuickPickItemOfT } from '../../quickpicks/items/common.js';
 import { createQuickPickItemOfT } from '../../quickpicks/items/common.js';
 import type { DirectiveQuickPickItem } from '../../quickpicks/items/directive.js';
 import { createDirectiveQuickPickItem, Directive } from '../../quickpicks/items/directive.js';
 import { executeCommand } from '../../system/-webview/command.js';
-import { configuration } from '../../system/-webview/configuration.js';
-import { getContext } from '../../system/-webview/context.js';
 import { openUrl } from '../../system/-webview/vscode/uris.js';
 import type { AgentDescriptor, AgentRoute } from '../agents/agentDescriptor.js';
 import type { ResolveAgentFlowResult } from '../agents/agentPicker.js';
 import { buildAgentResolvedTelemetryData, resolveAgentFlow } from '../agents/agentPicker.js';
-import type { ConnectMoreIntegrationsItem } from '../integrations/utils/-webview/integration.quickPicks.js';
-import {
-	getOpenOnGitProviderQuickInputButtons,
-	isManageIntegrationsItem,
-	manageIntegrationsItem,
-} from '../integrations/utils/-webview/integration.quickPicks.js';
+import { ensureIntegrationConnectAllowed } from '../integrations/utils/-webview/integration.utils.js';
 import type { LaunchpadCategorizedResult, LaunchpadItem } from './launchpadProvider.js';
 import { getLaunchpadItemIdHash, supportedLaunchpadIntegrations } from './launchpadProvider.js';
 import { startReviewFromLaunchpadItem } from './utils/-webview/startReview.utils.js';
@@ -217,6 +215,19 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 				const hasConnectedIntegrations = [...context.connectedIntegrations.values()].some(c => c);
 
 				if (steps.isAtStep(Steps.ConnectIntegrations) || !hasConnectedIntegrations) {
+					// A programmatic (MCP/agent) caller has no way to answer the interactive "Connect an
+					// Integration" quick pick, so entering it would leave the picker open and the caller's
+					// pending result unsettled until it times out (see #5679). Settle the result with a
+					// structured error and bail instead of prompting.
+					if (!hasConnectedIntegrations && this.source.source === 'mcp') {
+						state.result?.cancel(
+							new Error(
+								'A hosting integration is required to start a review. Connect an integration and try again.',
+							),
+						);
+						return;
+					}
+
 					using step = steps.enterStep(Steps.ConnectIntegrations);
 
 					if (this.container.telemetry.enabled) {
@@ -232,10 +243,7 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 
 					opened = true;
 
-					const isUsingCloudIntegrations = configuration.get('cloudIntegrations.enabled', undefined, false);
-					const result = isUsingCloudIntegrations
-						? yield* this.confirmCloudIntegrationsConnectStep(state, context)
-						: yield* this.confirmLocalIntegrationConnectStep(state, context);
+					const result = yield* this.confirmCloudIntegrationsConnectStep(state, context);
 					if (result === StepResultBreak) {
 						if (step.goBack() == null) break;
 						continue;
@@ -250,8 +258,33 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 				if (steps.isAtStepOrUnset(Steps.EnsureAccess)) {
 					using step = steps.enterStep(Steps.EnsureAccess);
 
-					const result = yield* ensureAccessStep(this.container, 'startReview', state, context, step);
+					// A programmatic (MCP/agent) caller can't answer the interactive Pro/sign-in gate, so run
+					// the access step non-interactively and settle the pending result instead of hanging on it
+					// (see #5679). Interactive callers keep the gate.
+					const interactive = this.source.source !== 'mcp';
+					const result = yield* ensureAccessStep(
+						this.container,
+						'startReview',
+						state,
+						context,
+						step,
+						interactive,
+					);
 					if (result === StepResultBreak) {
+						if (!interactive) {
+							state.result?.cancel(
+								new Error(
+									await getAccessGateErrorMessage(
+										this.container,
+										'startReview',
+										undefined,
+										'start a review',
+									),
+								),
+							);
+							return;
+						}
+
 						if (step.goBack() == null) break;
 						continue;
 					}
@@ -386,9 +419,9 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 		// `state.showOpenInAgent` is the caller-supplied route override:
 		//   undefined → legacy behavior; honor `openChatOnComplete` (sends to host IDE chat)
 		//   'ask' / 'manual' / 'agent' → run the new flow with that route override
-		// Defense-in-depth: skip the agent flow entirely when the org has disabled AI, even if a
-		// caller passed `showOpenInAgent`. UI surfaces should already gate, but the wizard enforces.
-		if (state.showOpenInAgent == null || !getContext('gitlens:gk:organization:ai:enabled', true)) {
+		// Defense-in-depth: skip the agent flow entirely when AI is disabled (org or user setting),
+		// even if a caller passed `showOpenInAgent`. UI surfaces gate, but the wizard enforces too.
+		if (state.showOpenInAgent == null || !this.container.ai.allowed) {
 			return { agent: undefined, openChatOnComplete: state.openChatOnComplete };
 		}
 
@@ -428,6 +461,8 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 
 		let connected = integration.maybeConnected ?? (await integration.isConnected());
 		if (!connected) {
+			if (!(await ensureIntegrationConnectAllowed(this.container, integration))) return false;
+
 			connected = await integration.connect('startReview');
 		}
 
@@ -442,57 +477,6 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 		}
 
 		return result.items?.[0];
-	}
-
-	private async *confirmLocalIntegrationConnectStep(
-		state: StepState<StartReviewState>,
-		context: StartReviewContext,
-	): AsyncStepResultGenerator<{ connected: boolean | IntegrationIds; resume: () => void | undefined }> {
-		context.result = undefined;
-		const confirmations: (QuickPickItemOfT<IntegrationIds> | DirectiveQuickPickItem)[] = [];
-
-		for (const integration of supportedLaunchpadIntegrations) {
-			if (context.connectedIntegrations.get(integration)) {
-				continue;
-			}
-
-			switch (integration) {
-				case GitCloudHostIntegrationId.GitHub:
-					confirmations.push(
-						createQuickPickItemOfT(
-							{
-								label: 'Connect to GitHub...',
-								detail: 'Will connect to GitHub to provide access to your pull requests',
-							},
-							integration,
-						),
-					);
-					break;
-				default:
-					break;
-			}
-		}
-
-		const step = this.createConfirmStep(
-			`${this.title} \u00a0\u2022\u00a0 Connect an Integration`,
-			confirmations,
-			createDirectiveQuickPickItem(Directive.Cancel, false, { label: 'Cancel' }),
-			{
-				placeholder: 'Connect an integration to view pull requests for review',
-				buttons: [],
-				ignoreFocusOut: false,
-			},
-		);
-
-		const selection: StepSelection<typeof step> = yield step;
-		if (canPickStepContinue(step, state, selection)) {
-			const resume = step.freeze?.();
-			const chosenIntegrationId = selection[0].item;
-			const connected = await this.ensureIntegrationConnected(chosenIntegrationId);
-			return { connected: connected ? chosenIntegrationId : false, resume: () => resume?.dispose() };
-		}
-
-		return StepResultBreak;
 	}
 
 	private async *confirmCloudIntegrationsConnectStep(
@@ -711,10 +695,7 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 		const element = selection[0];
 		if (isConnectMoreIntegrationsItem(element)) {
 			this.sendTitleActionTelemetry('connect', context);
-			const isUsingCloudIntegrations = configuration.get('cloudIntegrations.enabled', undefined, false);
-			const result = isUsingCloudIntegrations
-				? yield* this.confirmCloudIntegrationsConnectStep(state, context, step)
-				: yield* this.confirmLocalIntegrationConnectStep(state, context);
+			const result = yield* this.confirmCloudIntegrationsConnectStep(state, context, step);
 			if (result === StepResultBreak) return result;
 
 			result.resume();

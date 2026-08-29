@@ -159,7 +159,7 @@ export class FilesService {
 	 * Opens a diff editor showing the file at `lhsRef` vs `rhsRef`. When `rhsRef === ''`
 	 * the right side is the working tree (S&C-style cumulative `lhsRef ↔ working` diff).
 	 */
-	// eslint-disable-next-line @typescript-eslint/require-await
+	// oxlint-disable-next-line typescript/require-await
 	async openFileCompareBetween(
 		file: GitFileChangeShape,
 		showOptions?: FileShowOptions,
@@ -167,6 +167,10 @@ export class FilesService {
 		rhsRef?: string,
 	): Promise<void> {
 		if (file.repoPath == null || lhsRef == null || rhsRef == null) return;
+		// An untracked directory that is itself a repository is reported with a trailing slash. It is a
+		// directory on disk with no content to diff against any ref. Guarded here rather than in the row
+		// component because this is where the path becomes a URI that gets handed to the diff editor.
+		if (file.path.endsWith('/')) return;
 
 		const lhsUri = GitUri.fromFile(file.originalPath ?? file.path, file.repoPath, lhsRef);
 		// `rhsRef === ''` means "working tree": construct an absolute `file://` URI directly.
@@ -191,7 +195,7 @@ export class FilesService {
 	 * `line` and `lineEnd` are 1-based to match the AI's diff line numbers; the resulting
 	 * selection is anchored on the rhs (the AI's "after" reference frame).
 	 */
-	// eslint-disable-next-line @typescript-eslint/require-await
+	// oxlint-disable-next-line typescript/require-await
 	async openFileChanges(
 		repoPath: string,
 		path: string,

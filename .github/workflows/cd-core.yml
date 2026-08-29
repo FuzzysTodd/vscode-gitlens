@@ -7,7 +7,7 @@ on:
     workflow_dispatch:
         inputs:
             dry_run:
-                description: 'Dry-run (runs npm publish --dry-run instead of actually publishing)'
+                description: 'Dry-run (runs pnpm publish --dry-run instead of actually publishing)'
                 type: boolean
                 default: true
 
@@ -19,18 +19,20 @@ jobs:
             contents: read
         steps:
             - name: Checkout code
-              uses: actions/checkout@v4
+              uses: actions/checkout@v7
 
-            - name: Setup node
-              uses: actions/setup-node@v4
+            # Publishing relies on pnpm resolving this package's `catalog:` dependencies when packing;
+            # pnpm/setup reads the version to install from `packageManager` in the root manifest.
+            - name: Setup Node.js
+              uses: actions/setup-node@v7
               with:
-                  node-version: '22'
+                  node-version: '24'
                   registry-url: 'https://registry.npmjs.org'
 
             - name: Setup pnpm
-              uses: pnpm/action-setup@v3
+              uses: pnpm/setup@v2
               with:
-                  version: 10
+                  install: false
 
             - name: Verify tag matches package version
               if: github.event_name == 'push'
@@ -47,32 +49,49 @@ jobs:
             - name: Install
               run: pnpm install --frozen-lockfile
 
+            # One version per dependency, and packages/core's generated manifest in step with the
+            # packages it bundles. A release is the last place to discover otherwise.
+            - name: Check dependency hygiene
+              run: pnpm run check:deps
+
             - name: Build sub-packages
               run: pnpm run build:packages
 
             - name: Bundle core package
               run: pnpm --filter @gitkraken/core-gitlens run bundle
 
+            # Consumers load this package with Node's own CJS->ESM interop, not a bundler's. A release is
+            # the last place to discover that a module cannot even be linked there.
+            - name: Verify bundle loads under Node ESM
+              run: pnpm --filter @gitkraken/core-gitlens run verify:esm
+
+            - name: Verify packed package as an external consumer
+              run: pnpm --filter @gitkraken/core-gitlens run verify:package
+
             - name: Pack tarball (artifact)
               run: pnpm --filter @gitkraken/core-gitlens pack --pack-destination packages/core
 
             - name: Upload tarball artifact
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@v7
               with:
                   name: core-gitlens-tarball
                   path: packages/core/*.tgz
                   retention-days: 30
 
+            # pnpm, not npm: the manifest's `catalog:` specifiers are only rewritten to concrete
+            # versions by pnpm at pack time — `npm publish` would ship them verbatim and every
+            # consumer would fail with EUNSUPPORTEDPROTOCOL. `--no-git-checks` because releases
+            # publish from a tag (detached HEAD) and `prepack` regenerates the manifest.
             - name: Publish (dry-run)
               if: github.event_name == 'workflow_dispatch' && inputs.dry_run == true
               working-directory: packages/core
-              run: npm publish --access public --dry-run
+              run: pnpm publish --access public --no-git-checks --dry-run
               env:
                   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN_GITKRAKEN }}
 
             - name: Publish
               if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
               working-directory: packages/core
-              run: npm publish --access public
+              run: pnpm publish --access public --no-git-checks
               env:
                   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN_GITKRAKEN }}

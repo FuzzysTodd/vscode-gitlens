@@ -1,6 +1,37 @@
 import { pluralize } from '@gitlens/utils/string.js';
 import type { GitPausedOperationStatus } from './models/pausedOperationStatus.js';
 
+/**
+ * stderr patterns git emits that are EXPECTED rather than exceptional — an empty repo, a path that doesn't
+ * exist at a revision, a branch with no upstream. The exec layer matches these to decide a command "warned"
+ * rather than failed.
+ *
+ * Matching one does NOT mean the empty output is a valid answer: `noCommits` on a fresh repo genuinely means
+ * "no commits", while `notARepository` means the read never happened. Callers must branch on which key
+ * matched — see `GitRunCompletion`. Pure patterns with no environment dependency, so this lives here rather
+ * than in the CLI provider, where the shared run contract couldn't reference it.
+ */
+export const GitWarnings = {
+	notARepository: /Not a git repository/i,
+	outsideRepository: /is outside repository/i,
+	noPath: /no such path/i,
+	noCommits: /does not have any commits/i,
+	notFound: /Path '.*?' does not exist in/i,
+	foundButNotInRevision: /Path '.*?' exists on disk, but not in/i,
+	headNotABranch: /HEAD does not point to a branch/i,
+	noUpstream: /no upstream configured for branch '(.*?)'/i,
+	unknownRevision:
+		/ambiguous argument '.*?': unknown revision or path not in the working tree|not stored as a remote-tracking branch/i,
+	mustRunInWorkTree: /this operation must be run in a work tree/i,
+	patchWithConflicts: /Applied patch to '.*?' with conflicts/i,
+	noRemoteRepositorySpecified: /No remote repository specified\./i,
+	remoteConnectionError: /Could not read from remote repository/i,
+	notAGitCommand: /'.+' is not a git command/i,
+	tipBehind: /tip of your current branch is behind/i,
+} as const;
+
+export type GitWarningKey = keyof typeof GitWarnings;
+
 export interface GitCommandContext {
 	readonly repoPath: string;
 	readonly args: readonly (string | undefined)[];
@@ -37,12 +68,18 @@ export abstract class GitCommandError<Details extends { gitCommand?: GitCommandC
 	}
 }
 
+export type GitSearchErrorReason = 'invalidPattern' | 'invalidRef';
+
 export class GitSearchError extends Error {
 	static is(ex: unknown): ex is GitSearchError {
 		return ex instanceof GitSearchError;
 	}
 
-	constructor(public readonly original: Error) {
+	constructor(
+		public readonly original: Error,
+		public readonly reason?: GitSearchErrorReason,
+		public readonly detail?: string,
+	) {
 		super(original.message);
 
 		Error.captureStackTrace?.(this, new.target);
@@ -420,6 +457,7 @@ export class PausedOperationAbortError extends GitCommandError<PausedOperationAb
 export type PausedOperationContinueErrorReason =
 	| 'conflicts'
 	| 'emptyCommit'
+	| 'messageEditFailed'
 	| 'nothingToContinue'
 	| 'uncommittedChanges'
 	| 'unmergedFiles'
@@ -452,6 +490,8 @@ export class PausedOperationContinueError extends GitCommandError<PausedOperatio
 				return `Cannot ${details.skip ? 'skip' : 'continue'} the ${details.operation.type} operation as there are unresolved conflicts`;
 			case 'emptyCommit':
 				return `Cannot ${details.skip ? 'skip' : 'continue'} the ${details.operation.type} operation as the previous commit is empty`;
+			case 'messageEditFailed':
+				return `Cannot ${details.skip ? 'skip' : 'continue'} the ${details.operation.type} operation as a commit message needs to be edited and the editor could not be opened`;
 			case 'nothingToContinue':
 				return `Cannot ${details.skip ? 'skip' : 'continue'} the ${details.operation.type} operation as there is no ${details.operation.type} in progress`;
 			case 'uncommittedChanges':
@@ -837,6 +877,7 @@ export type TagErrorReason =
 	| 'notFound'
 	| 'permissionDenied'
 	| 'remoteRejected'
+	| 'tagConflict'
 	| 'other';
 interface TagErrorDetails {
 	reason?: TagErrorReason;
@@ -875,6 +916,8 @@ export class TagError extends GitCommandError<TagErrorDetails> {
 				return `${baseMessage} because you don't have permission to push to this remote repository.`;
 			case 'remoteRejected':
 				return `${baseMessage} because the remote repository rejected the push.`;
+			case 'tagConflict':
+				return `${baseMessage} because the remote already has a tag with that name. Use force to overwrite it.`;
 			default:
 				return baseMessage;
 		}
@@ -925,9 +968,11 @@ export class WorktreeCreateError extends GitCommandError<WorktreeCreateErrorDeta
 	}
 }
 
-export type WorktreeDeleteErrorReason = 'defaultWorkingTree' | 'directoryNotEmpty' | 'uncommittedChanges';
+export type WorktreeDeleteErrorReason = 'defaultWorkingTree' | 'directoryNotEmpty' | 'locked' | 'uncommittedChanges';
 interface WorktreeDeleteErrorDetails {
 	reason?: WorktreeDeleteErrorReason;
+	/** The reason the worktree was locked, when known and provided by the locker */
+	lockReason?: string;
 	gitCommand?: GitCommandContext;
 }
 
@@ -951,6 +996,8 @@ export class WorktreeDeleteError extends GitCommandError<WorktreeDeleteErrorDeta
 				return 'Cannot delete worktree because it is the default working tree';
 			case 'directoryNotEmpty':
 				return 'Unable to delete worktree because the directory is not empty';
+			case 'locked':
+				return 'Unable to delete worktree because it is locked';
 			case 'uncommittedChanges':
 				return 'Unable to delete worktree because there are uncommitted changes';
 			default:

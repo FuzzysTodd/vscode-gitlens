@@ -1,6 +1,7 @@
 import * as assert from 'assert';
 import type { ReactiveController } from 'lit';
 import { uncommitted } from '@gitlens/git/models/revision.js';
+import type { Wip } from '../../../../../commitDetails/protocol.js';
 import type {
 	BranchComparisonOptions,
 	ComposeResult,
@@ -72,6 +73,10 @@ function createResources(): DetailsResources {
 	return {
 		commit: createResource(async (_signal, _repoPath: string, _sha: string) => undefined),
 		wip: createResource(async (_signal, _repoPath: string) => undefined),
+		pastAgentSessions: createResource(async (_signal, _worktreePath: string, _limit?: number) => undefined),
+		pastAgentSessionDetail: createResource(
+			async (_signal, _sessionId: string, _providerId: string | undefined, _cwd: string | undefined) => undefined,
+		),
 		compare: createResource(async (_signal, _repoPath: string, _fromSha: string, _toSha: string) => undefined),
 		branchCompareSummary: createResource(
 			async (
@@ -94,6 +99,7 @@ function createResources(): DetailsResources {
 		),
 		review: createResource(async () => ({ error: { message: 'not implemented' } })),
 		compose: createResource(async () => ({ error: { message: 'not implemented' } })),
+		resolve: createResource(async () => ({ error: { message: 'not implemented' } })),
 		scopeFiles: createResource(async (_signal, _repoPath: string, _scope: ScopeSelection) => []),
 	};
 }
@@ -101,16 +107,23 @@ function createResources(): DetailsResources {
 function createServices(overrides?: {
 	reviewChanges?: (...args: unknown[]) => Promise<ReviewResult>;
 	composeChanges?: (...args: unknown[]) => Promise<ComposeResult>;
+	discardCompose?: (...args: unknown[]) => Promise<void>;
+	sendEvent?: (name: string, data: Record<string, unknown>) => Promise<void>;
 }): ResolvedServices {
 	const noopUnsubscribe = () => {};
 	return {
 		repository: {
 			onRepositoryChanged: () => noopUnsubscribe,
 			onRepositoryWorkingChanged: () => noopUnsubscribe,
+			onRepositoryOrWorktreeChanged: () => noopUnsubscribe,
 		},
 		graphInspect: {
 			reviewChanges: overrides?.reviewChanges ?? (async () => ({ error: { message: 'not implemented' } })),
 			composeChanges: overrides?.composeChanges ?? (async () => ({ error: { message: 'not implemented' } })),
+			discardCompose: overrides?.discardCompose ?? (() => Promise.resolve()),
+		},
+		telemetry: {
+			sendEvent: overrides?.sendEvent ?? (() => Promise.resolve()),
 		},
 	} as unknown as ResolvedServices;
 }
@@ -151,11 +164,22 @@ class FakeHost implements DetailsWorkflowHost {
 	isWipSelection(): boolean {
 		return this._selection.sha === uncommitted;
 	}
+	branchSheetRefreshes = 0;
+	refreshBranchSheet(): void {
+		this.branchSheetRefreshes++;
+	}
 	currentSelection(): DetailsSelection {
 		return this._selection;
 	}
 	applyGeneratedCommitMessage(repoPath: string, message: string): void {
 		this.generatedMessages.push({ repoPath: repoPath, message: message });
+	}
+
+	/** Test-controlled snapshot returned by `readEngagedRefineState` — set by the capture-on-leave
+	 *  tests to simulate the live compose/resolve panel's posture + draft. */
+	engagedRefineState: { refineMode: boolean; refineDraft: string } | undefined = undefined;
+	readEngagedRefineState(): { refineMode: boolean; refineDraft: string } | undefined {
+		return this.engagedRefineState;
 	}
 
 	addController(c: ReactiveController): void {
@@ -448,7 +472,7 @@ suite('DetailsWorkflowController — running-operations registry', () => {
 		state.activeModeRepoPath.set('/A');
 		state.activeModeSha.set(uncommitted);
 
-		controller.runReview('/A', undefined, undefined);
+		controller.runReview('/A', undefined, undefined, 0);
 
 		// Immediately after dispatch — entry should be 'generating'.
 		const generatingEntry = host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.review;
@@ -490,7 +514,7 @@ suite('DetailsWorkflowController — running-operations registry', () => {
 		state.activeModeRepoPath.set('/A');
 		state.activeModeSha.set(uncommitted);
 
-		controller.runReview('/A', 'my prompt', undefined);
+		controller.runReview('/A', 'my prompt', undefined, 0);
 		const entryAbort = host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.review?.abortController;
 		assert.ok(entryAbort);
 		assert.strictEqual(entryAbort.signal.aborted, false);
@@ -912,6 +936,161 @@ suite('DetailsWorkflowController — running-operations registry', () => {
 		assert.strictEqual(host.crossPaneState.runningOperations.get().size, 1, 'registry survives panel disconnect');
 		assert.strictEqual(generatingCtl.signal.aborted, false, 'in-flight run keeps going across disconnect');
 	});
+
+	test('toggle-out captures the compose Refine posture + unsubmitted draft onto the preserved entry', () => {
+		// User has a ready compose plan, toggled Recompose on and typed a draft, then toggles the
+		// compose chip off. The entry survives (hideMode) and now carries the posture + draft so a
+		// return restores them. Also exercises the dedup guard: execState/result are unchanged, so
+		// without the refine-field comparison the write would be dropped.
+		const { host, state, controller } = setup({ repoPath: '/A', graphRepoPath: '/A' });
+		const result = makeComposeResult('capture-on-leave');
+		host.crossPaneState.runningOperations.set(new Map([[wipKey('/A'), makeComposeBucket('/A', result)]]));
+		state.activeMode.set('compose');
+		state.activeModeContext.set('wip');
+		state.activeModeRepoPath.set('/A');
+		state.activeModeSha.set(uncommitted);
+
+		host.engagedRefineState = { refineMode: true, refineDraft: 'merge commits 1 and 2' };
+
+		controller.toggleMode('compose', { sha: uncommitted, shas: undefined, repoPath: '/A' });
+
+		assert.strictEqual(state.activeMode.get(), null, 'panel hidden');
+		const surviving = host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.compose;
+		assert.ok(surviving, 'entry persists through toggle-out');
+		assert.strictEqual(surviving.result, result, 'result preserved');
+		assert.strictEqual(surviving.refineMode, true, 'refine posture captured despite unchanged execState/result');
+		assert.strictEqual(surviving.refineDraft, 'merge commits 1 and 2', 'refine draft captured');
+	});
+
+	test('capture-on-leave stores undefined for a closed gate / whitespace-only draft', () => {
+		const { host, state, controller } = setup({ repoPath: '/A', graphRepoPath: '/A' });
+		host.crossPaneState.runningOperations.set(
+			new Map([[wipKey('/A'), makeComposeBucket('/A', makeComposeResult('x'))]]),
+		);
+		state.activeMode.set('compose');
+		state.activeModeContext.set('wip');
+		state.activeModeRepoPath.set('/A');
+		state.activeModeSha.set(uncommitted);
+
+		host.engagedRefineState = { refineMode: false, refineDraft: '   ' };
+
+		controller.toggleMode('compose', { sha: uncommitted, shas: undefined, repoPath: '/A' });
+
+		const entry = host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.compose;
+		assert.strictEqual(entry?.refineMode, undefined, 'closed gate stored as undefined');
+		assert.strictEqual(entry?.refineDraft, undefined, 'whitespace-only draft stored as undefined');
+	});
+
+	test('capture-on-leave no-ops when the live panel reports nothing (readEngagedRefineState undefined)', () => {
+		const { host, state, controller } = setup({ repoPath: '/A', graphRepoPath: '/A' });
+		host.crossPaneState.runningOperations.set(
+			new Map([[wipKey('/A'), makeComposeBucket('/A', makeComposeResult('x'))]]),
+		);
+		state.activeMode.set('compose');
+		state.activeModeContext.set('wip');
+		state.activeModeRepoPath.set('/A');
+		state.activeModeSha.set(uncommitted);
+
+		host.engagedRefineState = undefined;
+
+		controller.toggleMode('compose', { sha: uncommitted, shas: undefined, repoPath: '/A' });
+
+		const entry = host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.compose;
+		assert.ok(entry, 'entry preserved');
+		assert.strictEqual(entry.refineMode, undefined);
+		assert.strictEqual(entry.refineDraft, undefined);
+	});
+
+	test('capture-on-leave no-ops when the engaged anchor has no registry entry', () => {
+		const { host, state, controller } = setup({ repoPath: '/A', graphRepoPath: '/A' });
+		// No entry planted — the gate/draft belong to no persisted plan.
+		state.activeMode.set('compose');
+		state.activeModeContext.set('wip');
+		state.activeModeRepoPath.set('/A');
+		state.activeModeSha.set(uncommitted);
+
+		host.engagedRefineState = { refineMode: true, refineDraft: 'orphan' };
+
+		controller.toggleMode('compose', { sha: uncommitted, shas: undefined, repoPath: '/A' });
+
+		assert.strictEqual(
+			host.crossPaneState.runningOperations.get().get(wipKey('/A')),
+			undefined,
+			'no phantom entry created by capture',
+		);
+	});
+
+	test('switchAnchorWithinMode captures the OUTGOING anchor Refine state, leaves the incoming untouched', () => {
+		const host = new FakeHost({
+			repoPath: '/A',
+			graphRepoPath: '/parent',
+			selection: { sha: uncommitted, shas: undefined, repoPath: '/A' },
+		});
+		const state = createDetailsState();
+		const actions = new DetailsActions(state, createServices(), createResources());
+		const controller = new DetailsWorkflowController(host, actions);
+		host.connectAll();
+		host.tickHostUpdate();
+		state.branchCommits.set([]);
+
+		host.crossPaneState.runningOperations.set(
+			new Map([
+				[wipKey('/A'), makeComposeBucket('/A', makeComposeResult('A-plan'))],
+				[wipKey('/B'), makeComposeBucket('/B', makeComposeResult('B-plan'))],
+			]),
+		);
+		state.activeMode.set('compose');
+		state.activeModeContext.set('wip');
+		state.activeModeRepoPath.set('/A');
+		state.activeModeSha.set(uncommitted);
+
+		host.engagedRefineState = { refineMode: true, refineDraft: 'A draft' };
+
+		controller.switchAnchorWithinMode({ sha: uncommitted, shas: undefined, repoPath: '/B' });
+
+		const a = host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.compose;
+		assert.strictEqual(a?.refineMode, true, 'outgoing /A captured its posture');
+		assert.strictEqual(a?.refineDraft, 'A draft', 'outgoing /A captured its draft');
+		const b = host.crossPaneState.runningOperations.get().get(wipKey('/B'))?.compose;
+		assert.strictEqual(b?.refineMode, undefined, 'incoming /B posture untouched');
+		assert.strictEqual(b?.refineDraft, undefined, 'incoming /B draft untouched');
+	});
+
+	test('a fresh compose run drops any captured Refine posture + draft from the entry', () => {
+		const { host, state, controller } = setup({ repoPath: '/A', graphRepoPath: '/A' });
+		// Prior plan carries captured refine state.
+		host.crossPaneState.runningOperations.set(
+			new Map([
+				[
+					wipKey('/A'),
+					{
+						compose: {
+							kind: 'compose' as const,
+							anchor: { kind: 'wip' as const, repoPath: '/A', sha: uncommitted },
+							execState: 'complete' as const,
+							result: makeComposeResult('prior'),
+							refineMode: true,
+							refineDraft: 'stale draft',
+						},
+					},
+				],
+			]),
+		);
+		state.scope.set({ type: 'wip', includeUnstaged: true, includeStaged: false, includeShas: [] });
+		state.activeMode.set('compose');
+		state.activeModeContext.set('wip');
+		state.activeModeRepoPath.set('/A');
+		state.activeModeSha.set(uncommitted);
+
+		controller.runCompose('/A', 'new instructions', undefined, undefined, 0);
+
+		// The fresh generating entry (registered synchronously by dispatchOperation) drops the stale
+		// refine fields — a new run starts in the default posture with an empty box.
+		const generating = host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.compose;
+		assert.strictEqual(generating?.execState, 'generating');
+		assert.strictEqual(generating?.refineMode, undefined, 'refine posture dropped on fresh dispatch');
+		assert.strictEqual(generating?.refineDraft, undefined, 'refine draft dropped on fresh dispatch');
+	});
 });
 
 suite('DetailsActions.clearEnrichmentCaches', () => {
@@ -1179,7 +1358,7 @@ suite('DetailsWorkflowController — R1 fix regressions', () => {
 		(actions as unknown as { startCompose: (...args: unknown[]) => Promise<ComposeResult> }).startCompose = () =>
 			Promise.resolve(settledResult);
 
-		controller.runCompose('/A', 'my prompt', undefined, undefined);
+		controller.runCompose('/A', 'my prompt', undefined, undefined, 0);
 
 		// Immediately after dispatch the entry is `'generating'` with the prompt set.
 		const generating = host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.compose;
@@ -1209,6 +1388,19 @@ suite('DetailsWorkflowController.compare lifecycle', () => {
 		assert.strictEqual(state.compareSheetOpen.get(), true);
 		assert.strictEqual(state.branchCompareLeftRef.get(), 'main');
 		assert.strictEqual(state.branchCompareRightRef.get(), 'feature');
+	});
+
+	test('openCompare records the GRAPH repo as the birth record — not the selection — and closeCompare clears it', () => {
+		const { state, controller } = setup({ repoPath: '/A/wt', graphRepoPath: '/A' });
+
+		controller.openCompare(
+			{ sha: uncommitted, shas: undefined, repoPath: '/A/wt' },
+			{ leftRef: 'main', leftRefType: 'branch', rightRef: 'feature', rightRefType: 'branch' },
+		);
+		assert.strictEqual(state.branchCompareGraphRepoPath.get(), '/A');
+
+		controller.closeCompare();
+		assert.strictEqual(state.branchCompareGraphRepoPath.get(), undefined);
 	});
 
 	test('openCompare while already-open with no overrides is a no-op (preserves in-flight comparison)', () => {
@@ -1337,6 +1529,7 @@ function createGenerateServices(calls: GenerateCall[]): ResolvedServices {
 		repository: {
 			onRepositoryChanged: () => noopUnsubscribe,
 			onRepositoryWorkingChanged: () => noopUnsubscribe,
+			onRepositoryOrWorktreeChanged: () => noopUnsubscribe,
 		},
 		graphInspect: {
 			reviewChanges: async () => ({ error: { message: 'not implemented' } }),
@@ -1357,6 +1550,9 @@ function createGenerateServices(calls: GenerateCall[]): ResolvedServices {
 						reject: reject,
 					});
 				}),
+		},
+		telemetry: {
+			sendEvent: () => Promise.resolve(),
 		},
 	} as unknown as ResolvedServices;
 }
@@ -1505,5 +1701,771 @@ suite('DetailsWorkflowController.generateMessage', () => {
 		assert.strictEqual(reviewAbort.signal.aborted, true, 'review aborted');
 		assert.strictEqual(composeAbort.signal.aborted, true, 'compose aborted');
 		assert.strictEqual(genAbort.signal.aborted, true, 'generate-message aborted');
+	});
+});
+
+suite('DetailsWorkflowController.enterComposeWithScope — recompose seeding', () => {
+	/** WIP fixture whose `changes.files` carry only the `staged` flag the scope builder reads. */
+	function makeWipWithFiles(staged: readonly boolean[]): Wip {
+		return {
+			changes: { files: staged.map(s => ({ staged: s })) },
+			repositoryCount: 1,
+			repo: { uri: 'file:///A', name: 'A', path: '/A', isWorktree: false },
+		} as unknown as Wip;
+	}
+
+	/** Pin the branch-commits cache so toggleMode's WIP-side fetch gate is skipped (getBranchCommits unmocked). */
+	function pinBranchCommits(state: DetailsState, actions: DetailsActions, repoPath: string): void {
+		state.branchCommits.set([]);
+		actions['_branchCommitsFetchedRepoPath'] = repoPath;
+	}
+
+	test('seeds the scope with includeShas; includeWip=false forces both flags false even when a file exists', () => {
+		const { state, actions, controller } = setup({ repoPath: '/A', graphRepoPath: '/A' });
+		pinBranchCommits(state, actions, '/A');
+		state.wip.set(makeWipWithFiles([false]));
+
+		controller.enterComposeWithScope({ sha: uncommitted, shas: undefined, repoPath: '/A' }, ['h', 'a', 'b'], false);
+
+		assert.strictEqual(state.activeMode.get(), 'compose');
+		assert.deepStrictEqual(state.scope.get(), {
+			type: 'wip',
+			includeStaged: false,
+			includeUnstaged: false,
+			includeShas: ['h', 'a', 'b'],
+		});
+	});
+
+	test('includeWip=true folds staged + unstaged working changes into the scope', () => {
+		const { state, actions, controller } = setup({ repoPath: '/A', graphRepoPath: '/A' });
+		pinBranchCommits(state, actions, '/A');
+		state.wip.set(makeWipWithFiles([true, false]));
+
+		controller.enterComposeWithScope({ sha: uncommitted, shas: undefined, repoPath: '/A' }, ['h', 'a'], true);
+
+		assert.strictEqual(state.activeMode.get(), 'compose');
+		assert.deepStrictEqual(state.scope.get(), {
+			type: 'wip',
+			includeStaged: true,
+			includeUnstaged: true,
+			includeShas: ['h', 'a'],
+		});
+	});
+
+	test('seeded includeShas survive a late branch-commits arrival (the includeShas-non-empty bail protects it)', async () => {
+		const host = new FakeHost({
+			repoPath: '/A',
+			graphRepoPath: '/A',
+			selection: { sha: uncommitted, shas: undefined, repoPath: '/A' },
+		});
+		const state = createDetailsState();
+		// getBranchCommits resolves so fetchBranchCommits runs its late-re-derivation block to the guard.
+		const services = {
+			repository: {
+				onRepositoryChanged: () => () => {},
+				onRepositoryWorkingChanged: () => () => {},
+			},
+			graphInspect: {
+				getBranchCommits: async () => ({
+					commits: [{ sha: 'x', pushed: false }],
+					hasMore: false,
+				}),
+			},
+			telemetry: { sendEvent: () => Promise.resolve() },
+		} as unknown as ResolvedServices;
+		const actions = new DetailsActions(state, services, createResources());
+		const controller = new DetailsWorkflowController(host, actions);
+		host.connectAll();
+		host.tickHostUpdate();
+		pinBranchCommits(state, actions, '/A');
+		state.wip.set(makeWipWithFiles([false]));
+
+		controller.enterComposeWithScope({ sha: uncommitted, shas: undefined, repoPath: '/A' }, ['h', 'a'], false);
+		assert.deepStrictEqual(state.scope.get(), {
+			type: 'wip',
+			includeStaged: false,
+			includeUnstaged: false,
+			includeShas: ['h', 'a'],
+		});
+
+		// Drive the late-arriving branch-commits path directly; the seeded (non-empty) includeShas
+		// must bail the re-derivation instead of being clobbered by the default scope.
+		await actions.fetchBranchCommits('/A');
+
+		assert.deepStrictEqual(state.scope.get(), {
+			type: 'wip',
+			includeStaged: false,
+			includeUnstaged: false,
+			includeShas: ['h', 'a'],
+		});
+	});
+
+	test('compose WIP gate intact — toggleMode on a non-WIP commit selection still no-ops', () => {
+		const { state, controller } = setup({ repoPath: '/A', graphRepoPath: '/A' });
+
+		controller.toggleMode('compose', { sha: 'real-commit-sha', shas: undefined, repoPath: '/A' });
+
+		assert.strictEqual(state.activeMode.get(), null);
+	});
+
+	test('re-invoking with a new range while idle-composing switches the scope in place (no toggle-off)', () => {
+		const { state, actions, controller } = setup({ repoPath: '/A', graphRepoPath: '/A' });
+		pinBranchCommits(state, actions, '/A');
+		state.wip.set(makeWipWithFiles([false]));
+		const sel = { sha: uncommitted, shas: undefined, repoPath: '/A' };
+
+		controller.enterComposeWithScope(sel, ['h', 'a'], false);
+		assert.strictEqual(state.activeMode.get(), 'compose');
+		assert.deepStrictEqual(state.scope.get(), {
+			type: 'wip',
+			includeStaged: false,
+			includeUnstaged: false,
+			includeShas: ['h', 'a'],
+		});
+
+		// Still idle on the same WIP anchor (no run registered) → the new range replaces the scope
+		// rather than re-clicking a no-op or toggling compose off.
+		controller.enterComposeWithScope(sel, ['h', 'a', 'b'], false);
+		assert.strictEqual(state.activeMode.get(), 'compose', 'stays in compose mode');
+		assert.deepStrictEqual(state.scope.get(), {
+			type: 'wip',
+			includeStaged: false,
+			includeUnstaged: false,
+			includeShas: ['h', 'a', 'b'],
+		});
+	});
+});
+
+type SentEvent = { name: string; data: Record<string, unknown> };
+
+/** Harness for the resolve-session gesture counts: records every telemetry event and lets each
+ *  resolve/re-resolve RPC be scripted, so a run can be made to succeed, fail, or cancel. */
+function setupResolveCounts(options?: { resolveResults?: unknown[]; reresolveResults?: unknown[] }): {
+	controller: DetailsWorkflowController;
+	state: DetailsState;
+	sent: SentEvent[];
+} {
+	const sent: SentEvent[] = [];
+	const resolveResults = [...(options?.resolveResults ?? [])];
+	const reresolveResults = [...(options?.reresolveResults ?? [])];
+	const okResolve = { result: { resolutions: [] } };
+	const okReresolve = { result: { filePath: 'a.ts', strategy: 'ai', confidence: 1 } };
+
+	const services = {
+		repository: {
+			onRepositoryChanged: () => () => {},
+			onRepositoryWorkingChanged: () => () => {},
+			onRepositoryOrWorktreeChanged: () => () => {},
+		},
+		graphInspect: {
+			resolveConflicts: () => Promise.resolve(resolveResults.shift() ?? okResolve),
+			reresolveFile: () => Promise.resolve(reresolveResults.shift() ?? okReresolve),
+			discardResolutions: () => Promise.resolve(),
+		},
+		telemetry: {
+			sendEvent: (name: string, data: Record<string, unknown>) => {
+				sent.push({ name: name, data: data });
+				return Promise.resolve();
+			},
+		},
+	} as unknown as ResolvedServices;
+
+	const host = new FakeHost({ repoPath: '/A', graphRepoPath: '/A' });
+	const state = createDetailsState();
+	const actions = new DetailsActions(state, services, createResources());
+	const controller = new DetailsWorkflowController(host, actions);
+	host.connectAll();
+	host.tickHostUpdate();
+	state.activeMode.set('resolve');
+	state.activeModeRepoPath.set('/A');
+
+	return { controller: controller, state: state, sent: sent };
+}
+
+const generateEvents = (sent: SentEvent[]) =>
+	sent.filter(e => e.name.startsWith('graphDetails/resolve/generateResolutions/'));
+
+suite('DetailsWorkflowController — resolve session refine/retry counts', () => {
+	test('a cold run reports run.kind start with every count at zero', async () => {
+		const m = setupResolveCounts();
+
+		m.controller.runResolve('/A', undefined, undefined, 'start');
+		await flush();
+
+		const events = generateEvents(m.sent);
+		assert.strictEqual(events.length, 1);
+		assert.strictEqual(events[0].data['run.kind'], 'start');
+		assert.strictEqual(events[0].data['refine.count'], 0);
+		assert.strictEqual(events[0].data['retryFromError.count'], 0);
+		assert.strictEqual(events[0].data['retryFile.count'], 0);
+	});
+
+	test('each refine increments refine.count within the session', async () => {
+		const m = setupResolveCounts();
+
+		m.controller.runResolve('/A', undefined, undefined, 'start');
+		await flush();
+		m.controller.runResolve('/A', undefined, undefined, 'refine');
+		await flush();
+		m.controller.runResolve('/A', undefined, undefined, 'refine');
+		await flush();
+
+		const events = generateEvents(m.sent);
+		assert.deepStrictEqual(
+			events.map(e => e.data['refine.count']),
+			[0, 1, 2],
+			'the count accumulates across the session rather than resetting per run',
+		);
+		assert.deepStrictEqual(
+			events.map(e => e.data['run.kind']),
+			['start', 'refine', 'refine'],
+		);
+	});
+
+	test('a retry after an error reports run.kind retry, not start', async () => {
+		// The bug this fixes: `refine` was derived from the resource, which holds `{error}` after a
+		// failure — so a retry was indistinguishable from a cold start.
+		const m = setupResolveCounts({ resolveResults: [{ error: { message: 'boom' } }] });
+
+		m.controller.runResolve('/A', undefined, undefined, 'start');
+		await flush();
+		m.controller.resolve.retryFromError();
+		await flush();
+
+		const events = generateEvents(m.sent);
+		assert.strictEqual(events.length, 2);
+		assert.strictEqual(events[1].data['run.kind'], 'retry', 'a retry must not look like a cold start');
+		assert.strictEqual(events[1].data.refine, true);
+		assert.strictEqual(events[1].data['retryFromError.count'], 1);
+	});
+
+	test('a cold run resets counts carried over from the previous session', async () => {
+		const m = setupResolveCounts();
+
+		m.controller.runResolve('/A', undefined, undefined, 'start');
+		await flush();
+		m.controller.runResolve('/A', undefined, undefined, 'refine');
+		await flush();
+		m.controller.runResolve('/A', undefined, undefined, 'start');
+		await flush();
+
+		const events = generateEvents(m.sent);
+		assert.strictEqual(events[2].data['refine.count'], 0, 'a new session starts clean');
+	});
+
+	test('a per-file retry emits its own event carrying the running counts', async () => {
+		const m = setupResolveCounts();
+
+		m.controller.runResolve('/A', undefined, undefined, 'start');
+		await flush();
+		m.controller.runResolve('/A', undefined, undefined, 'refine');
+		await flush();
+		await m.controller.resolve.retryFile('a.ts', 'prefer ours');
+
+		const retry = m.sent.filter(e => e.name === 'graphDetails/resolve/retryFile/completed');
+		assert.strictEqual(retry.length, 1, 'the per-file retry path reported nothing before this');
+		assert.strictEqual(retry[0].data['retryFile.count'], 1);
+		assert.strictEqual(retry[0].data['refine.count'], 1, 'it carries the session context too');
+		assert.strictEqual(retry[0].data['customInstructions.length'], 'prefer ours'.length);
+		assert.strictEqual(retry[0].data['customInstructions.used'], true);
+	});
+
+	test('a failed per-file retry reports the reason', async () => {
+		const m = setupResolveCounts({ reresolveResults: [{ error: { message: 'nope' } }] });
+
+		m.controller.runResolve('/A', undefined, undefined, 'start');
+		await flush();
+		await m.controller.resolve.retryFile('a.ts', 'try again');
+
+		const retry = m.sent.filter(e => e.name === 'graphDetails/resolve/retryFile/failed');
+		assert.strictEqual(retry.length, 1);
+		assert.strictEqual(retry[0].data['failed.reason'], 'error');
+	});
+
+	test('concurrent per-file retries each count exactly once', async () => {
+		// The count is bumped on dispatch rather than on settle — `resolveRetryingFiles` is a Set, so
+		// several files can be in flight and a read-modify-write across the await would lose one.
+		const m = setupResolveCounts();
+
+		m.controller.runResolve('/A', undefined, undefined, 'start');
+		await flush();
+		await Promise.all([m.controller.resolve.retryFile('a.ts', 'x'), m.controller.resolve.retryFile('b.ts', 'y')]);
+
+		const counts = m.sent
+			.filter(e => e.name === 'graphDetails/resolve/retryFile/completed')
+			.map(e => e.data['retryFile.count']);
+		assert.deepStrictEqual(counts.sort(), [1, 2]);
+	});
+
+	test('discard carries the session totals', async () => {
+		const m = setupResolveCounts();
+
+		m.controller.runResolve('/A', undefined, undefined, 'start');
+		await flush();
+		m.controller.runResolve('/A', undefined, undefined, 'refine');
+		await flush();
+		await m.controller.resolve.retryFile('a.ts', 'x');
+		m.controller.resolve.discard();
+
+		const discarded = m.sent.filter(e => e.name === 'graphDetails/resolve/discarded');
+		assert.strictEqual(discarded.length, 1);
+		assert.strictEqual(discarded[0].data['refine.count'], 1);
+		assert.strictEqual(discarded[0].data['retryFile.count'], 1);
+	});
+
+	test('cancelling the mode ends the session', async () => {
+		const m = setupResolveCounts();
+
+		m.controller.runResolve('/A', undefined, undefined, 'start');
+		await flush();
+		m.controller.runResolve('/A', undefined, undefined, 'refine');
+		await flush();
+		m.controller.cancelOperation('resolve');
+		m.controller.runResolve('/A', undefined, undefined, 'start');
+		await flush();
+
+		const events = generateEvents(m.sent);
+		assert.strictEqual(events[2].data['refine.count'], 0);
+	});
+});
+
+/** A completed compose result carrying the host's cache key — the handle a refine needs. */
+function makeComposeResultWithKey(label: string, cacheKey: string): ComposeResult {
+	return {
+		result: { commits: [], baseCommit: { sha: '0'.repeat(40), message: label }, cacheKey: cacheKey },
+	} as unknown as ComposeResult;
+}
+
+/** Like {@link setup}, but captures the args of every `composeChanges` RPC the controller issues. */
+function setupComposeCapture(repoPath: string): {
+	host: FakeHost;
+	state: DetailsState;
+	actions: DetailsActions;
+	controller: DetailsWorkflowController;
+	calls: unknown[][];
+} {
+	const calls: unknown[][] = [];
+	const host = new FakeHost({ repoPath: repoPath, graphRepoPath: repoPath });
+	const state = createDetailsState();
+	const actions = new DetailsActions(
+		state,
+		createServices({
+			composeChanges: async (...args: unknown[]) => {
+				calls.push(args);
+				return { error: { message: 'stub' } };
+			},
+		}),
+		createResources(),
+	);
+	const controller = new DetailsWorkflowController(host, actions);
+	host.connectAll();
+	host.tickHostUpdate();
+	return { host: host, state: state, actions: actions, controller: controller, calls: calls };
+}
+
+function seedCompletedPlan(host: FakeHost, state: DetailsState, repoPath: string, cacheKey: string): void {
+	host.crossPaneState.runningOperations.set(
+		new Map([
+			[
+				wipKey(repoPath),
+				{
+					compose: {
+						kind: 'compose' as const,
+						anchor: { kind: 'wip' as const, repoPath: repoPath, sha: uncommitted },
+						execState: 'complete' as const,
+						result: makeComposeResultWithKey('plan', cacheKey),
+						// `onRunSettled` stamps this on a real completed run; the refine handle is read
+						// from here, not from the result, so it survives the entry going to an error.
+						cacheKey: cacheKey,
+					},
+				},
+			],
+		]),
+	);
+	state.scope.set({ type: 'wip', includeUnstaged: true, includeStaged: false, includeShas: [] });
+	enterMockMode(state, repoPath, uncommitted);
+}
+
+suite('DetailsWorkflowController.runCompose — refine continuation across a leave-and-return', () => {
+	test('refines the displayed plan after toggling out of compose and back in', () => {
+		// `hideMode` is the preserve-leave path: it keeps the registry entry (so the plan is projected
+		// back on return) and captures the Refine draft precisely so the user can resume. It used to
+		// also drop the refine handle, so the resumed plan was silently regenerated from scratch — and
+		// with conversation tracking, re-minted its conversation.
+		const m = setupComposeCapture('/A');
+		seedCompletedPlan(m.host, m.state, '/A', 'K1');
+
+		// Leave to another anchor and come back — the round trip that runs `hideMode`.
+		m.controller.switchAnchorWithinMode({ sha: uncommitted, shas: undefined, repoPath: '/B' });
+		m.controller.switchAnchorWithinMode({ sha: uncommitted, shas: undefined, repoPath: '/A' });
+		// Re-establish the engaged posture the panel would have on return — the anchor round trip
+		// rebuilds scope for whichever anchor it lands on.
+		m.state.scope.set({ type: 'wip', includeUnstaged: true, includeStaged: false, includeShas: [] });
+		enterMockMode(m.state, '/A', uncommitted);
+
+		m.controller.runCompose('/A', 'tighten it up', undefined, undefined, 0);
+
+		assert.strictEqual(m.calls.length, 1, 'one compose RPC should have been issued');
+		// composeChanges(repoPath, sessionKey, scope, instructions, excludedFiles, aiExcludedFiles, signal, options)
+		const options = m.calls[0][7] as { mode?: string; priorCacheKey?: string } | undefined;
+		assert.strictEqual(options?.mode, 'refine', 'the run must be dispatched as a refine, not a cold start');
+		assert.strictEqual(options?.priorCacheKey, 'K1', 'and must carry the plan it is refining');
+	});
+
+	test('sends the session key of the anchor it is engaged on', () => {
+		const m = setupComposeCapture('/A');
+		seedCompletedPlan(m.host, m.state, '/A', 'K1');
+
+		m.controller.runCompose('/A', 'tighten it up', undefined, undefined, 0);
+
+		assert.strictEqual(m.calls[0][1], wipKey('/A'), 'session key must be this anchor’s key');
+	});
+
+	test('cold-starts when the anchor has no plan to continue', () => {
+		// The inverse guard: without a live plan the run must NOT claim to be a refine, or the host
+		// would try to continue a session that does not exist.
+		const m = setupComposeCapture('/A');
+		m.state.scope.set({ type: 'wip', includeUnstaged: true, includeStaged: false, includeShas: [] });
+		enterMockMode(m.state, '/A', uncommitted);
+
+		m.controller.runCompose('/A', 'organize these', undefined, undefined, 0);
+
+		assert.strictEqual(m.calls.length, 1);
+		assert.strictEqual(m.calls[0][7], undefined, 'no continuation options on a cold start');
+	});
+});
+
+suite('DetailsWorkflowController.runCompose — retrying a failed refine', () => {
+	test('retries as a refine, not a cold start, after the refine errored', () => {
+		// The entry flips to an error result when a refine fails, so deriving the refine handle from
+		// that result loses it and the retry silently restarts the session — discarding a plan that was
+		// never invalid. The handle lives on the entry itself precisely so it survives this.
+		const m = setupComposeCapture('/A');
+		m.host.crossPaneState.runningOperations.set(
+			new Map([
+				[
+					wipKey('/A'),
+					{
+						compose: {
+							kind: 'compose' as const,
+							anchor: { kind: 'wip' as const, repoPath: '/A', sha: uncommitted },
+							execState: 'error' as const,
+							result: { error: { message: 'the refine blew up' } } as unknown as ComposeResult,
+							cacheKey: 'K1',
+							prompt: 'tighten it up',
+						},
+					},
+				],
+			]),
+		);
+		m.state.scope.set({ type: 'wip', includeUnstaged: true, includeStaged: false, includeShas: [] });
+		enterMockMode(m.state, '/A', uncommitted);
+
+		m.controller.compose.retryFromError('/A', uncommitted, undefined, undefined, undefined, 0);
+
+		assert.strictEqual(m.calls.length, 1, 'the retry should have issued a compose RPC');
+		const options = m.calls[0][7] as { mode?: string; priorCacheKey?: string } | undefined;
+		assert.strictEqual(options?.mode, 'refine', 'a retry after a failed refine is still a refine');
+		assert.strictEqual(options?.priorCacheKey, 'K1', 'and continues the same plan');
+	});
+
+	test('discarding a compose tells the host to end the session', () => {
+		// The host cannot see a Discard on its own: the webview just drops the entry. Without this call
+		// the plan and its conversation sit on the host until the next compose here or panel teardown.
+		const calls: unknown[][] = [];
+		const host = new FakeHost({ repoPath: '/A', graphRepoPath: '/A' });
+		const state = createDetailsState();
+		const actions = new DetailsActions(
+			state,
+			createServices({
+				discardCompose: (...args: unknown[]) => {
+					calls.push(args);
+					return Promise.resolve();
+				},
+			}),
+			createResources(),
+		);
+		const controller = new DetailsWorkflowController(host, actions);
+		host.connectAll();
+		host.tickHostUpdate();
+		seedCompletedPlan(host, state, '/A', 'K1');
+
+		controller.compose.discard();
+
+		assert.strictEqual(calls.length, 1, 'the host must be told the session is over');
+		assert.strictEqual(calls[0][0], wipKey('/A'), 'for this anchor’s session');
+		assert.strictEqual(calls[0][1], 'K1', 'naming the plan being discarded, so a late call is a no-op');
+	});
+
+	test('walking Back to the scope picker cold-starts the next generate', () => {
+		// Back retains the plan so `forward()` can restore it without re-running the AI, but the panel
+		// is showing the idle scope picker. A generate from there is the user starting over: it must
+		// recollect the scope they just chose and abandon the plan's session, not silently refine the
+		// plan they walked away from under its old conversation.
+		const m = setupComposeCapture('/A');
+		seedCompletedPlan(m.host, m.state, '/A', 'K1');
+		m.actions.resources.compose.mutate(makeComposeResultWithKey('plan', 'K1'));
+
+		m.controller.compose.back();
+		assert.strictEqual(
+			m.host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.compose?.execState,
+			'backed',
+			'precondition: Back parks the entry in `backed`',
+		);
+
+		m.state.scope.set({ type: 'wip', includeUnstaged: true, includeStaged: false, includeShas: [] });
+		enterMockMode(m.state, '/A', uncommitted);
+		m.controller.runCompose('/A', 'organize these instead', undefined, undefined, 0);
+
+		assert.strictEqual(m.calls.length, 1);
+		assert.strictEqual(m.calls[0][7], undefined, 'Back then generate must not be dispatched as a refine');
+	});
+
+	test('discarding while a commit message is being written does not end the session', () => {
+		// A message rewrite runs while its plan reads as complete, so the in-flight check on the run's
+		// state cannot see it. Ending the session here would flush it before the rewrite reports back,
+		// and that request's usage would then have nothing to flush it.
+		const calls: unknown[][] = [];
+		const host = new FakeHost({ repoPath: '/A', graphRepoPath: '/A' });
+		const state = createDetailsState();
+		const actions = new DetailsActions(
+			state,
+			createServices({
+				discardCompose: (...args: unknown[]) => {
+					calls.push(args);
+					return Promise.resolve();
+				},
+			}),
+			createResources(),
+		);
+		const controller = new DetailsWorkflowController(host, actions);
+		host.connectAll();
+		host.tickHostUpdate();
+		seedCompletedPlan(host, state, '/A', 'K1');
+		state.composeRegeneratingCommitId.set('commit-1');
+
+		controller.compose.discard();
+
+		assert.deepStrictEqual(calls, [], 'the session must outlive the rewrite it belongs to');
+		// And the plan itself must still be here — tearing the panel down under a running rewrite would
+		// leave its result with nothing to land on. This is what the guard on `discard` itself buys,
+		// beyond the one on the teardown helper.
+		assert.notStrictEqual(
+			host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.compose,
+			undefined,
+			'the plan must survive a discard attempted mid-rewrite',
+		);
+
+		// Once the rewrite settles, the same gesture ends it as usual.
+		state.composeRegeneratingCommitId.set(undefined);
+		controller.compose.discard();
+		assert.strictEqual(calls.length, 1, 'and ends normally afterwards');
+	});
+
+	test('destroying a compose while its run is in flight does not end the session', () => {
+		// Aborting is a request to stop, not proof that it stopped. A refine that lands anyway would
+		// report under a conversation this call had already closed, so its usage would accumulate against
+		// an ID nothing will flush again. Those sessions are left for the next compose here, or dispose.
+		const calls: unknown[][] = [];
+		const host = new FakeHost({ repoPath: '/A', graphRepoPath: '/A' });
+		const state = createDetailsState();
+		const actions = new DetailsActions(
+			state,
+			createServices({
+				discardCompose: (...args: unknown[]) => {
+					calls.push(args);
+					return Promise.resolve();
+				},
+			}),
+			createResources(),
+		);
+		const controller = new DetailsWorkflowController(host, actions);
+		host.connectAll();
+		host.tickHostUpdate();
+
+		// A refine in flight: the entry is `generating` and still names the plan it is refining.
+		host.crossPaneState.runningOperations.set(
+			new Map([
+				[
+					wipKey('/A'),
+					{
+						compose: {
+							kind: 'compose' as const,
+							anchor: { kind: 'wip' as const, repoPath: '/A', sha: uncommitted },
+							execState: 'generating' as const,
+							cacheKey: 'K1',
+						},
+					},
+				],
+			]),
+		);
+		enterMockMode(state, '/A', uncommitted);
+
+		controller.compose.discard();
+
+		assert.deepStrictEqual(calls, [], 'an in-flight run’s session must not be closed under it');
+	});
+
+	test('a cold start after Back does not carry the abandoned plan’s key onto its entry', () => {
+		// The entry's key is what later teardown calls name when they tell the host which plan to let go
+		// of. A cold start makes the host discard the plan it held, so inheriting that key would leave the
+		// entry naming something already gone — and a Discard or repository switch would then name it too,
+		// miss the host's match guard, and leave the session's conversation open.
+		const m = setupComposeCapture('/A');
+		seedCompletedPlan(m.host, m.state, '/A', 'K1');
+		m.actions.resources.compose.mutate(makeComposeResultWithKey('plan', 'K1'));
+		m.controller.compose.back();
+
+		m.state.scope.set({ type: 'wip', includeUnstaged: true, includeStaged: false, includeShas: [] });
+		enterMockMode(m.state, '/A', uncommitted);
+		m.controller.runCompose('/A', 'organize these instead', undefined, undefined, 0);
+
+		const dispatched = m.host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.compose;
+		assert.strictEqual(dispatched?.execState, 'generating', 'precondition: the cold start dispatched');
+		assert.strictEqual(dispatched?.cacheKey, undefined, 'a cold start must not inherit the dead key');
+	});
+
+	test('a refine keeps the plan’s key on its in-flight entry', () => {
+		// The inverse: a refine IS continuing that plan, so the key has to survive the in-flight window or
+		// a refine that fails could not be retried as a refine.
+		const m = setupComposeCapture('/A');
+		seedCompletedPlan(m.host, m.state, '/A', 'K1');
+		m.controller.runCompose('/A', 'tighten it up', undefined, undefined, 0);
+
+		const dispatched = m.host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.compose;
+		assert.strictEqual(dispatched?.cacheKey, 'K1', 'a refine keeps the key it is continuing');
+	});
+
+	test('going Forward again restores the refine continuation', () => {
+		// The inverse: `forward()` returns the entry to `complete` with the plan on screen, so the
+		// session it belongs to is resumable again.
+		const m = setupComposeCapture('/A');
+		seedCompletedPlan(m.host, m.state, '/A', 'K1');
+		m.actions.resources.compose.mutate(makeComposeResultWithKey('plan', 'K1'));
+
+		m.controller.compose.back();
+		assert.strictEqual(m.controller.compose.forward(), true);
+
+		m.state.scope.set({ type: 'wip', includeUnstaged: true, includeStaged: false, includeShas: [] });
+		enterMockMode(m.state, '/A', uncommitted);
+		m.controller.runCompose('/A', 'tighten it up', undefined, undefined, 0);
+
+		const options = m.calls[0][7] as { mode?: string; priorCacheKey?: string } | undefined;
+		assert.strictEqual(options?.mode, 'refine');
+		assert.strictEqual(options?.priorCacheKey, 'K1');
+	});
+
+	test('a settled error keeps the prior plan’s key on the entry', () => {
+		// Guards the mechanism the test above depends on: `onRunSettled` must carry the key forward
+		// rather than rebuild the entry without it.
+		const m = setupComposeCapture('/A');
+		m.state.scope.set({ type: 'wip', includeUnstaged: true, includeStaged: false, includeShas: [] });
+		enterMockMode(m.state, '/A', uncommitted);
+		m.host.crossPaneState.runningOperations.set(
+			new Map([
+				[
+					wipKey('/A'),
+					{
+						compose: {
+							kind: 'compose' as const,
+							anchor: { kind: 'wip' as const, repoPath: '/A', sha: uncommitted },
+							execState: 'complete' as const,
+							result: makeComposeResultWithKey('plan', 'K1'),
+							cacheKey: 'K1',
+						},
+					},
+				],
+			]),
+		);
+
+		// The stubbed RPC resolves to an error, so this run settles as a failure over the live plan.
+		m.controller.runCompose('/A', 'tighten it up', undefined, undefined, 0);
+
+		return Promise.resolve().then(() => {
+			const entry = m.host.crossPaneState.runningOperations.get().get(wipKey('/A'))?.compose;
+			assert.strictEqual(entry?.cacheKey, 'K1', 'the failed run must not drop the plan handle');
+		});
+	});
+});
+
+suite('DetailsWorkflowController — failure telemetry classification', () => {
+	/** Harness for the compose/review failure payload: scripts the generate RPC and records every
+	 *  telemetry event the run emits. Only the per-kind classification is asserted below — that a
+	 *  message assigned into the payload arrives in the payload is a tautology, not a contract. */
+	function setupRunFailure(overrides: {
+		composeChanges?: (...args: unknown[]) => Promise<ComposeResult>;
+		reviewChanges?: (...args: unknown[]) => Promise<ReviewResult>;
+	}): { controller: DetailsWorkflowController; sent: SentEvent[] } {
+		const sent: SentEvent[] = [];
+		const host = new FakeHost({ repoPath: '/A', graphRepoPath: '/A' });
+		const state = createDetailsState();
+		const actions = new DetailsActions(
+			state,
+			createServices({
+				...overrides,
+				sendEvent: (name: string, data: Record<string, unknown>) => {
+					sent.push({ name: name, data: data });
+					return Promise.resolve();
+				},
+			}),
+			createResources(),
+		);
+		const controller = new DetailsWorkflowController(host, actions);
+		host.connectAll();
+		host.tickHostUpdate();
+		state.scope.set({ type: 'wip', includeUnstaged: true, includeStaged: false, includeShas: [] });
+		enterMockMode(state, '/A', uncommitted);
+
+		return { controller: controller, sent: sent };
+	}
+
+	const failedEvents = (sent: SentEvent[], name: string) => sent.filter(e => e.name === name);
+
+	test('a compose failure over an unrewritable scope reports it as invalid-scope', async () => {
+		// The distinction that matters for the funnel: an identical retry can never succeed here, so
+		// these must not be pooled with transient host/AI errors.
+		const m = setupRunFailure({
+			composeChanges: async (): Promise<ComposeResult> => ({
+				error: { message: 'interior fork', kind: 'invalid-scope' },
+			}),
+		});
+
+		m.controller.runCompose('/A', undefined, undefined, undefined, 0);
+		await flush();
+
+		const events = failedEvents(m.sent, 'graphDetails/compose/generatePlan/failed');
+		assert.strictEqual(events.length, 1);
+		assert.strictEqual(events[0].data['failure.reason'], 'invalid-scope');
+		assert.strictEqual(events[0].data['failure.error.message'], 'interior fork');
+	});
+
+	test('a failed review reports the error message and no failure reason', async () => {
+		const m = setupRunFailure({
+			reviewChanges: async (): Promise<ReviewResult> => ({ error: { message: 'review blew up' } }),
+		});
+
+		m.controller.runReview('/A', undefined, undefined, 0);
+		await flush();
+
+		const events = failedEvents(m.sent, 'graphDetails/review/generateReview/failed');
+		assert.strictEqual(events.length, 1);
+		assert.strictEqual(events[0].data['failure.error.message'], 'review blew up');
+		// Key ABSENT, not present-and-undefined: review's event never declares `failure.reason`, so the
+		// shared compose/review payload must not smuggle the key in. `strictEqual(…, undefined)` would
+		// pass either way and wouldn't catch that.
+		assert.ok(!('failure.reason' in events[0].data), 'review has no structured failure kind to report');
+	});
+
+	test('a cancelled per-file retry reports no error message', async () => {
+		const m = setupResolveCounts({ reresolveResults: [{ cancelled: true }] });
+
+		m.controller.runResolve('/A', undefined, undefined, 'start');
+		await flush();
+		await m.controller.resolve.retryFile('a.ts', 'try again');
+
+		const events = failedEvents(m.sent, 'graphDetails/resolve/retryFile/failed');
+		assert.strictEqual(events.length, 1);
+		assert.strictEqual(events[0].data['failed.reason'], 'cancelled');
+		assert.strictEqual(events[0].data['failure.error.message'], undefined);
 	});
 });

@@ -2,6 +2,7 @@ import type { PropertyValues } from 'lit';
 import { html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { cache } from 'lit/directives/cache.js';
+import { ifDefined } from 'lit/directives/if-defined.js';
 import type { GitCommitStats } from '@gitlens/git/models/commit.js';
 import type { GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
 import type { IssueOrPullRequest } from '@gitlens/git/models/issueOrPullRequest.js';
@@ -17,9 +18,11 @@ import type {
 	Preferences,
 	State,
 } from '../../../../plus/graph/detailsProtocol.js';
-import { buildFolderContext, messageHeadlineSplitterToken } from '../../../../plus/graph/detailsProtocol.js';
+import { buildFolderContext } from '../../../../plus/graph/detailsProtocol.js';
+import type { AiModelInfo } from '../../../../rpc/services/types.js';
 import type { OpenMultipleChangesArgs } from '../../../shared/actions/file.js';
-import { renderLearnAboutAutolinks } from '../../../shared/components/chips/learn-about-autolinks.js';
+import { AutolinkMerger } from '../../../shared/components/chips/autolinks.js';
+import { renderDetailsMaximizeChip } from '../../../shared/components/details-header/details-maximize-chip.js';
 import { redispatch } from '../../../shared/components/element.js';
 import {
 	elementBase,
@@ -28,30 +31,26 @@ import {
 	subPanelEnterStyles,
 } from '../../../shared/components/styles/lit/base.css.js';
 import type { TreeItemAction } from '../../../shared/components/tree/base.js';
+import { renderCopyChangesAction, renderOpenChangesAction } from '../../../shared/components/tree/file-tree-utils.js';
 import type { FileChangeListItemDetail } from '../../../shared/components/tree/gl-file-tree-pane.js';
 import type { RunningOperationExecState } from './detailsState.js';
 import { multiCommitPanelStyles, panelActionInputStyles, panelHostStyles } from './gl-details-multicommit-panel.css.js';
+import { renderAutolinksStrip } from './shared-panel-templates.js';
+import { panelAutolinkStripStyles } from './shared-panel.css.js';
 import '../../../shared/components/code-icon.js';
 import './gl-compare-ai-actions.js';
 import '../../../shared/components/commit-sha.js';
 import '../../../shared/components/progress.js';
 import '../../../shared/components/commit/commit-stats.js';
-import '../../../shared/components/commit/signature-badge.js';
-import '../../../shared/components/commit/signature-details.js';
-import '../../../shared/components/formatted-date.js';
-import '../../../shared/components/chips/action-chip.js';
-import '../../../shared/components/chips/autolink-chip.js';
-import '../../../shared/components/chips/chip-overflow.js';
 import '../../../shared/components/button.js';
 import '../../../shared/components/menu/menu-divider.js';
 import '../../../shared/components/menu/menu-item.js';
 import '../../../shared/components/menu/menu-label.js';
-import '../../../shared/components/overlays/popover.js';
 import '../../../shared/components/overlays/tooltip.js';
 import '../../../shared/components/panes/pane-group.js';
 import '../../../shared/components/tree/gl-file-tree-pane.js';
 import '../../../shared/components/details-header/gl-details-header.js';
-import './gl-commit-row.js';
+import './gl-commit-row-item.js';
 
 @customElement('gl-details-multicommit-panel')
 export class GlDetailsMultiCommitPanel extends LitElement {
@@ -60,6 +59,7 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 		metadataBarVarsBase,
 		panelHostStyles,
 		panelActionInputStyles,
+		panelAutolinkStripStyles,
 		multiCommitPanelStyles,
 		subPanelEnterStyles,
 		scrollableBase,
@@ -136,6 +136,12 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 	/** Forwarded to `gl-details-header` — when true, close becomes a back arrow. */
 	@property({ type: Boolean }) inResultsView = false;
 
+	/** Graph-bottom-only: render the maximize/restore chip in the header actions (and its active-mode
+	 *  cluster). */
+	@property({ type: Boolean, attribute: 'show-maximize' }) showMaximize = false;
+	/** Drives the maximize chip's icon/label when `showMaximize` is true. */
+	@property({ type: Boolean }) maximized = false;
+
 	@property({ attribute: false })
 	subPanelContent?: ReturnType<typeof html> | typeof nothing;
 
@@ -144,6 +150,9 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 
 	@property({ type: Object })
 	orgSettings?: State['orgSettings'];
+
+	@property({ type: Object })
+	aiModel?: AiModelInfo;
 
 	@property({ type: Boolean, attribute: 'file-icons' })
 	fileIcons = false;
@@ -161,6 +170,9 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 	searchContext?: GitCommitSearchContext;
 
 	@state() private _enrichmentNoneFound = false;
+
+	/** Mirrors the pane's multi-selection so the "Open Changes" chip can swap to "Open Selected". */
+	@state() private _selectedFiles: readonly GitFileChangeShape[] = [];
 	private _enrichmentNoneFoundTimer?: ReturnType<typeof setTimeout>;
 
 	/**
@@ -212,6 +224,10 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 
 	override render() {
 		const isInitialLoad = this.loading && !this.commitFrom && !this.commitTo;
+		// Once the commit poles paint from lite/cached shells, `isInitialLoad` is false even though
+		// the comparison diff is still in flight — show a spinner in the file tree rather than the
+		// "No Files" empty text. Mirrors gl-details-compare-mode-panel's files-section loading.
+		const filesLoadingEmpty = this._comparisonChanging && !this.files?.length;
 		// Use a single template so the header element persists across mode toggles,
 		// allowing the CSS transition on .mode-header to animate. `cache` keeps both
 		// body sub-trees alive across sub-panel toggles so the explain input and file
@@ -224,45 +240,86 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 		const showMetadataBar = this.activeMode !== 'compose';
 
 		return html`
-			${isInitialLoad
-				? html`<div class="details-loading" aria-busy="true" aria-live="polite">Loading...</div>`
-				: html`
-						${this.renderCompareHeader()} ${showMetadataBar ? this.renderMetadataBar() : nothing}
-						${cache(
-							hasSubPanel
-								? html`<div class="sub-panel-enter">${this.subPanelContent}</div>`
-								: html`<div class="compare-section">
-											${this.renderPoles()} ${this.renderAutolinksRow()} ${this.renderAIActions()}
-										</div>
-										<div class="compare-files">
-											<webview-pane-group flexible>
-												<gl-file-tree-pane
-													.files=${this.files}
-													.filesLayout=${this.preferences?.files}
-													.showIndentGuides=${this.preferences?.indentGuides}
-													.collapsable=${this.filesCollapsable}
-													?show-file-icons=${this.fileIcons}
-													.fileActions=${GlDetailsMultiCommitPanel._fileActions}
-													.fileContext=${this.getFileContext}
-													.folderContext=${(folder: { relativePath: string }) =>
-														buildFolderContext(this.commitTo?.repoPath, folder)}
-													.searchContext=${this.searchContext}
-													.showSearchBox=${this.showSearchBox}
-													.searchBoxFilter=${this.searchBoxFilter}
-													.buttons=${this.getMultiDiffRefs()
-														? ['layout', 'search', 'multi-diff']
-														: undefined}
-													@file-compare-previous=${this.handleFileCompareBetween}
-													@file-open=${this.redispatch}
-													@file-compare-working=${this.redispatch}
-													@file-more-actions=${this.redispatch}
-													@change-files-layout=${this.redispatch}
-													@gl-file-tree-pane-open-multi-diff=${this.handleOpenMultiDiff}
-												></gl-file-tree-pane>
-											</webview-pane-group>
-										</div>`,
-						)}
-					`}
+			${
+				isInitialLoad
+					? html`<div class="details-loading" aria-busy="true" aria-live="polite">Loading...</div>`
+					: html`
+							${this.renderCompareHeader()} ${showMetadataBar ? this.renderMetadataBar() : nothing}
+							${cache(
+								hasSubPanel
+									? html`<div class="sub-panel-enter">${this.subPanelContent}</div>`
+									: html`<div class="compare-section">
+												${this.renderPoles()} ${this.renderAutolinksRow()}
+												${this.renderAIActions()}
+											</div>
+											<div class="compare-files">
+												<webview-pane-group flexible>
+													<gl-file-tree-pane
+														.files=${this.files}
+														.filesLayout=${this.preferences?.files}
+														.showIndentGuides=${this.preferences?.indentGuides}
+														.collapsable=${this.filesCollapsable}
+														?show-file-icons=${this.fileIcons}
+														.fileActions=${GlDetailsMultiCommitPanel._fileActions}
+														.fileContext=${this.getFileContext}
+														.folderContext=${(folder: { relativePath: string }) =>
+															buildFolderContext(this.commitTo?.repoPath, folder)}
+														.contextRevision=${`${this.commitTo?.sha}|${this.commitTo?.repoPath}|${this.commitFrom?.sha}`}
+														.searchContext=${this.searchContext}
+														.showSearchBox=${this.showSearchBox}
+														.searchBoxFilter=${this.searchBoxFilter}
+														empty-text=${filesLoadingEmpty ? '' : 'No Files'}
+														?multi-selectable=${true}
+														@file-compare-previous=${this.handleFileCompareBetween}
+														@file-open=${this.redispatch}
+														@file-compare-working=${this.redispatch}
+														@file-more-actions=${this.redispatch}
+														@change-files-layout=${this.redispatch}
+														@file-selection-changed=${this.handleFileSelectionChanged}
+													>
+														${
+															this.getMultiDiffRefs() != null
+																? renderOpenChangesAction({
+																		selectedCount: this._selectedFiles.length,
+																		slot: 'leading-actions',
+																		onOpenAll: () => this.handleOpenMultiDiff(),
+																		onOpenSelected: () =>
+																			this.handleOpenSelectedChanges(),
+																	})
+																: nothing
+														}
+														${(() => {
+															const refs = this.getMultiDiffRefs();
+															return refs != null
+																? renderCopyChangesAction({
+																		repoPath: refs.repoPath,
+																		to: refs.rhs,
+																		from: refs.lhs || undefined,
+																		slot: 'leading-actions',
+																	})
+																: nothing;
+														})()}
+														${
+															filesLoadingEmpty
+																? html`<div
+																		slot="before-tree"
+																		class="compare-files--loading"
+																		aria-busy="true"
+																	>
+																		<code-icon
+																			icon="loading"
+																			modifier="spin"
+																		></code-icon>
+																		<span>Loading changes…</span>
+																	</div>`
+																: nothing
+														}
+													</gl-file-tree-pane>
+												</webview-pane-group>
+											</div>`,
+							)}
+						`
+			}
 		`;
 	}
 
@@ -293,6 +350,7 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 				sha: sha,
 				comparisonSha: this.commitFrom?.sha,
 				status: file.status,
+				originalPath: file.originalPath,
 			},
 		};
 
@@ -342,6 +400,31 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 		);
 	};
 
+	private handleFileSelectionChanged = (e: CustomEvent<{ files: readonly GitFileChangeShape[] }>): void => {
+		this._selectedFiles = e.detail?.files ?? [];
+	};
+
+	private handleOpenSelectedChanges = (): void => {
+		const refs = this.getMultiDiffRefs();
+		const selectedPaths = new Set(this._selectedFiles.map(f => f.path));
+		const files = (this.files ?? []).filter(f => selectedPaths.has(f.path));
+		if (!refs || !files.length) return;
+
+		this.dispatchEvent(
+			new CustomEvent('open-multiple-changes', {
+				detail: {
+					files: files,
+					repoPath: refs.repoPath,
+					lhs: refs.lhs,
+					rhs: refs.rhs,
+					title: refs.title,
+				} satisfies OpenMultipleChangesArgs,
+				bubbles: true,
+				composed: true,
+			}),
+		);
+	};
+
 	private redispatch = redispatch.bind(this);
 
 	private renderCompareHeader() {
@@ -355,16 +438,24 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 			.loading=${this.loading}
 			.modes=${modes}
 			.compareEnabled=${true}
+			?show-maximize=${this.showMaximize}
+			?maximized=${this.maximized}
 			?in-results-view=${this.inResultsView}
 		>
 			<span class="compare-header__title">
-				${this.activeMode === 'review'
-					? html`<span>
-							<code-icon class="compare-header__mode-icon" icon="checklist"></code-icon>
-							Reviewing Comparison
-						</span>`
-					: html`Comparing References`}
+				${
+					this.activeMode === 'review'
+						? html`<span>
+								<code-icon class="compare-header__mode-icon" icon="checklist"></code-icon>
+								Reviewing Comparison
+							</span>`
+						: html`Comparing References`
+				}
+				<!-- The Graph slots its details coach mark here so the tip's lightbulb parks inline
+					 with the title text (same pattern as the compare sheet's title-hint slot). -->
+				<slot name="coachmark"></slot>
 			</span>
+			${this.activeMode == null && this.showMaximize ? renderDetailsMaximizeChip(this.maximized) : nothing}
 		</gl-details-header>`;
 	}
 
@@ -396,9 +487,11 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 				></gl-commit-sha-copy>
 			</div>
 			<div class="compare-metadata__right">
-				${this.modeStatusText
-					? html`<span class="mode-status">${this.modeStatusText}</span>`
-					: this.renderCommitStats(this.stats)}
+				${
+					this.modeStatusText
+						? html`<span class="mode-status">${this.modeStatusText}</span>`
+						: this.renderCommitStats(this.stats)
+				}
 			</div>
 		</div>`;
 	}
@@ -420,11 +513,13 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 					</gl-tooltip>
 					<div class="compare-middle__rule"></div>
 				</div>
-				${this.betweenCount > 0
-					? html`<span class="compare-middle__count"
-							>${pluralize('commit', this.betweenCount)} in between</span
-						>`
-					: nothing}
+				${
+					this.betweenCount > 0
+						? html`<span class="compare-middle__count"
+								>${pluralize('commit', this.betweenCount)} in between</span
+							>`
+						: nothing
+				}
 			</div>
 			${this.renderPoleCard(this.commitTo, this.signatureTo)}
 		</div>`;
@@ -433,241 +528,68 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 	private renderPoleCard(commit: CommitDetails | undefined, signature?: CommitSignatureShape) {
 		if (!commit) return html`<div class="pole-card pole-card--loading">Loading...</div>`;
 
-		const message = commit.message;
 		const showSignature = this.preferences?.showSignatureBadges && signature != null;
 
-		// Map CommitDetails into the shared gl-commit-row data shape so the multi-commit pole
-		// anchor and the WIP-compare commit list render identically. The signature badge stays
-		// as a card-only adornment overlaid on the avatar (passed via the row's signature slot
-		// would couple gl-commit-row to signature concerns; instead the card renders it next to
-		// the row).
+		// Overlay the committer avatar only when the committer differs from the author (the
+		// gl-commit-author convention), so ordinary author==committer commits stay un-cluttered.
+		const committerEmail = commit.committer?.email;
+		// Distinct committer = different name OR email (mirrors gl-commit-author.hasDistinctCommitter).
+		const hasDistinctCommitter =
+			(commit.committer?.name != null && commit.committer.name !== commit.author.name) ||
+			(committerEmail != null && committerEmail.toLowerCase() !== commit.author.email?.toLowerCase());
+
+		// Map CommitDetails into the shared CommitRowData shape consumed by gl-commit-row-item.
 		const rowData = {
 			sha: commit.sha,
 			shortSha: commit.shortSha,
-			message: message,
+			message: commit.message,
 			author: commit.author.name,
 			authorEmail: commit.author.email,
 			avatarUrl: commit.author.avatar ?? undefined,
+			committerAvatarUrl: hasDistinctCommitter ? (commit.committer?.avatar ?? undefined) : undefined,
+			committerName: hasDistinctCommitter ? commit.committer?.name : undefined,
+			committerEmail: hasDistinctCommitter ? committerEmail : undefined,
+			committerDate: hasDistinctCommitter
+				? typeof commit.committer?.date === 'string'
+					? commit.committer.date
+					: commit.committer?.date?.toISOString?.()
+				: undefined,
 			date:
 				typeof commit.author.date === 'string'
 					? commit.author.date
 					: (commit.author.date.toISOString?.() ?? ''),
 		};
 
-		return html`<gl-popover hoist placement="bottom" trigger="hover focus" class="pole-card__popover">
-			<div slot="anchor" class="pole-card" tabindex="0" @click=${() => this.handlePoleClick(commit.sha)}>
-				${showSignature
-					? html`<gl-signature-badge
-							class="pole-card__signature"
-							.signature=${signature}
-							.committerEmail=${commit.committer?.email}
-						></gl-signature-badge>`
-					: nothing}
-				<gl-commit-row .commit=${rowData} .preferences=${this.preferences}></gl-commit-row>
-			</div>
-			<div slot="content" class="pole-popover">
-				<div class="pole-popover__header">
-					<div class="pole-popover__info">
-						<img class="pole-popover__avatar" src=${commit.author.avatar ?? ''} alt=${commit.author.name} />
-						<div class="pole-popover__details">
-							<span class="pole-popover__name">${commit.author.name}</span>
-							${commit.author.email
-								? html`<span class="pole-popover__email"
-										><a href="mailto:${commit.author.email}">${commit.author.email}</a></span
-									>`
-								: nothing}
-						</div>
-					</div>
-					<formatted-date
-						class="pole-popover__date"
-						.date=${commit.author.date}
-						.format=${this.preferences?.dateFormat ?? 'MMMM Do, YYYY h:mma'}
-						.dateStyle=${'absolute'}
-					></formatted-date>
-				</div>
-				${showSignature
-					? html`<gl-signature-details
-							.signature=${signature}
-							.committerEmail=${commit.committer?.email}
-						></gl-signature-details>`
-					: nothing}
-				<span class="pole-popover__message scrollable"
-					>${message.replaceAll(messageHeadlineSplitterToken, '\n')}</span
-				>
-			</div>
-		</gl-popover>`;
+		return html`<gl-commit-row-item
+			class="pole-card"
+			.commit=${rowData}
+			.preferences=${this.preferences}
+			.signature=${showSignature ? signature : undefined}
+			committer-email=${ifDefined(commit.committer?.email)}
+			@gl-commit-row-item-select=${() => this.handlePoleClick(commit.sha)}
+		></gl-commit-row-item>`;
 	}
 
-	private _cachedMergedAutolinks?: {
-		autolinksRef: Autolink[] | undefined;
-		enrichedRef: IssueOrPullRequest[] | undefined;
-		out: { autolinks: Autolink[]; enriched: IssueOrPullRequest[] };
-	};
-
-	private getMergedAutolinks() {
-		const autolinks = this.autolinks;
-		const enriched = this.enrichedItems;
-
-		const cached = this._cachedMergedAutolinks;
-		if (cached != null && cached.autolinksRef === autolinks && cached.enrichedRef === enriched) {
-			return cached.out;
-		}
-
-		let out: { autolinks: Autolink[]; enriched: IssueOrPullRequest[] };
-		if (!enriched?.length) {
-			out = { autolinks: autolinks ?? [], enriched: [] };
-		} else {
-			const enrichedIds = new Set(enriched.map(i => i.id));
-			const remaining = autolinks?.filter(a => !enrichedIds.has(a.id)) ?? [];
-			out = { autolinks: remaining, enriched: enriched };
-		}
-		this._cachedMergedAutolinks = { autolinksRef: autolinks, enrichedRef: enriched, out: out };
-		return out;
-	}
+	private readonly _autolinkMerger = new AutolinkMerger();
 
 	private renderAutolinksRow() {
-		const { autolinks, enriched } = this.getMergedAutolinks();
-		const hasAutolinks = autolinks.length > 0;
-		const hasEnriched = enriched.length > 0;
-		const hasChips = hasAutolinks || hasEnriched;
+		if (!this.autolinksEnabled) return nothing;
+
 		// Show the loading state until BOTH the comparison fetch AND the autolinks fetch settle —
 		// the autolinks request is fired after `compare` resolves, so there's a window where
 		// `_comparisonChanging` is false but chips haven't arrived yet. Without `autolinksLoading`
 		// the strip flashes "Learn about autolinks" before the chips populate.
-		const isLoadingEmpty = (this._comparisonChanging || this.autolinksLoading) && !hasChips;
-
-		return html`<div class="compare-enrichment">
-			<gl-chip-overflow max-rows="1">
-				${hasChips
-					? nothing
-					: isLoadingEmpty
-						? html`<span slot="prefix" class="compare-enrichment__loading" aria-busy="true">
-								<code-icon icon="loading" modifier="spin"></code-icon>
-								<span>Loading autolinks…</span>
-							</span>`
-						: renderLearnAboutAutolinks({
-								hasIntegrationsConnected: this.hasIntegrationsConnected,
-								hasAccount: this.hasAccount,
-								showLabel: true,
-								slotName: 'prefix',
-							})}
-				${hasAutolinks
-					? autolinks.map(autolink => {
-							const name = autolink.description ?? autolink.title ?? `${autolink.prefix}${autolink.id}`;
-							return html`<gl-autolink-chip
-								type="autolink"
-								name=${name}
-								url=${autolink.url}
-								identifier="${autolink.prefix}${autolink.id}"
-								openOnRemote
-							></gl-autolink-chip>`;
-						})
-					: nothing}
-				${hasEnriched
-					? enriched.map(
-							item =>
-								html`<gl-autolink-chip
-									type=${item.type === 'pullrequest' ? 'pr' : 'issue'}
-									name=${item.title}
-									url=${item.url}
-									identifier="#${item.id}"
-									status=${item.state}
-									.date=${item.closed ? item.closedDate : item.createdDate}
-									.dateFormat=${this.preferences?.dateFormat}
-									.dateStyle=${this.preferences?.dateStyle}
-									.itemId=${item.id}
-									.providerId=${item.provider?.id}
-									?details=${item.type === 'pullrequest'}
-									openOnRemote
-								></gl-autolink-chip>`,
-						)
-					: nothing}
-				${this.renderAutolinksPopover(autolinks, enriched)} ${this.renderEnrichButton()}
-				${hasChips
-					? renderLearnAboutAutolinks({
-							hasIntegrationsConnected: this.hasIntegrationsConnected,
-							hasAccount: this.hasAccount,
-							slotName: 'suffix',
-						})
-					: nothing}
-			</gl-chip-overflow>
-		</div>`;
-	}
-
-	private renderAutolinksPopover(autolinks: Autolink[], enriched: IssueOrPullRequest[]) {
-		if (!autolinks.length && !enriched.length) return nothing;
-
-		const enrichedPrs = enriched.filter(i => i.type === 'pullrequest');
-		const enrichedIssues = enriched.filter(i => i.type !== 'pullrequest');
-		let needsDivider = false;
-
-		return html`<div slot="popover">
-			${enrichedPrs.length > 0
-				? html`<menu-label>Pull Requests</menu-label> ${enrichedPrs.map(
-							pr =>
-								html`<menu-item href=${pr.url}>
-									<code-icon icon="git-pull-request"></code-icon> #${pr.id}
-									${pr.title ? ` — ${pr.title}` : ''}
-								</menu-item>`,
-						)}${((needsDivider = true), nothing)}`
-				: nothing}
-			${enrichedIssues.length > 0
-				? html`${needsDivider ? html`<menu-divider></menu-divider>` : nothing}
-						<menu-label>Issues</menu-label>
-						${enrichedIssues.map(
-							issue =>
-								html`<menu-item href=${issue.url}>
-									<code-icon icon="issues"></code-icon> #${issue.id}
-									${issue.title ? ` — ${issue.title}` : ''}
-								</menu-item>`,
-						)}${((needsDivider = true), nothing)}`
-				: nothing}
-			${autolinks.length > 0
-				? html`${needsDivider ? html`<menu-divider></menu-divider>` : nothing}
-						<menu-label>Autolinks</menu-label>
-						${autolinks.map(
-							a =>
-								html`<menu-item href=${a.url}>
-									<code-icon icon="link"></code-icon> ${a.prefix}${a.id}${a.provider?.name
-										? ` on ${a.provider.name}`
-										: ''}
-								</menu-item>`,
-						)}`
-				: nothing}
-		</div>`;
-	}
-
-	private renderEnrichButton() {
-		if (!this.hasIntegrationsConnected) return nothing;
-
-		if (this._enrichmentNoneFound) {
-			return html`<gl-action-chip
-				slot="suffix"
-				icon="info"
-				label="No Additional Issues or Pull Requests Found"
-				overlay="tooltip"
-			></gl-action-chip>`;
-		}
-
-		if (this.enrichedItems != null) return nothing;
-
-		if (this.enrichmentLoading) {
-			return html`<gl-action-chip
-				slot="suffix"
-				icon="loading"
-				label="Loading Issues and Pull Requests..."
-				overlay="tooltip"
-				disabled
-			></gl-action-chip>`;
-		}
-
-		return html`<gl-action-chip
-			slot="suffix"
-			icon="sync"
-			label="Load Associated Issues and Pull Requests"
-			overlay="tooltip"
-			@click=${this.handleEnrichAutolinks}
-		></gl-action-chip>`;
+		return renderAutolinksStrip({
+			merged: this._autolinkMerger.merge(this.autolinks, this.enrichedItems),
+			isLoadingEmpty: this._comparisonChanging || this.autolinksLoading,
+			preferences: this.preferences,
+			hasAccount: this.hasAccount,
+			hasIntegrationsConnected: this.hasIntegrationsConnected,
+			enrichmentSettled: this.enrichedItems != null,
+			enrichmentNoneFound: this._enrichmentNoneFound,
+			enrichmentLoading: this.enrichmentLoading,
+			onRequestEnrichment: () => this.handleEnrichAutolinks(),
+		});
 	}
 
 	private handleEnrichAutolinks() {
@@ -681,6 +603,7 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 			.explainBusy=${this.explainBusy}
 			.generateChangelogBusy=${this.generateChangelogBusy}
 			.orgSettings=${this.orgSettings}
+			.aiModel=${this.aiModel}
 		></gl-compare-ai-actions>`;
 	}
 

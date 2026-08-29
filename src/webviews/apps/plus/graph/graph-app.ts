@@ -1,13 +1,12 @@
-import type { GraphRow, SelectCommitsOptions } from '@gitkraken/gitkraken-components';
-import { refZone } from '@gitkraken/gitkraken-components';
-import { consume, provide } from '@lit/context';
 import { SignalWatcher } from '@lit-labs/signals';
+import { consume, ContextProvider, provide } from '@lit/context';
 import { html, LitElement, nothing } from 'lit';
 import { customElement, query, state } from 'lit/decorators.js';
 import { classMap } from 'lit/directives/class-map.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
 import { when } from 'lit/directives/when.js';
-import type { GitGraphRowType } from '@gitlens/git/models/graph.js';
+import { isMac } from '@env/platform.js';
+import type { GitGraphRow, GitGraphRowKind } from '@gitlens/git/models/graph.js';
 import { uncommitted } from '@gitlens/git/models/revision.js';
 import type { SearchQuery } from '@gitlens/git/models/search.js';
 import type { GitCommitReachability } from '@gitlens/git/providers/commits.js';
@@ -15,41 +14,59 @@ import { getBranchId } from '@gitlens/git/utils/branch.utils.js';
 import { getScopedCounter } from '@gitlens/utils/counter.js';
 import type { Deferrable } from '@gitlens/utils/debounce.js';
 import { debounce } from '@gitlens/utils/debounce.js';
+import type { Disposable } from '@gitlens/utils/disposable.js';
+import type { OverlayEntry } from '@gitlens/utils/keys/keybinding.js';
 import { Logger } from '@gitlens/utils/logger.js';
-import type { GraphDetailsMode } from '../../../../constants.telemetry.js';
+import type { GlExtensionCommands } from '../../../../constants.commands.js';
+import type { GraphDetailsMode, TrackedUsageKeys } from '../../../../constants.telemetry.js';
+import { mergeWebviewItems } from '../../../../system/webview.js';
 import type { CommitDetails } from '../../../commitDetails/protocol.js';
 import type {
+	DidGetRowHoverParams,
+	DidGetSidebarDataParams,
 	DidRequestOpenCompareModeParams,
 	DidRequestOpenTimelineScopeParams,
 	DidRequestSearchParams,
+	GraphCoachMarkType,
+	GraphComponentConfig,
+	GraphComposeScopeSeed,
 	GraphDisplayMode,
+	GraphItemContext,
 	GraphMinimapMarkerTypes,
+	GraphScopeBranch,
+	GraphScopeOrigin,
+	GraphScopeSource,
 	GraphShowAction,
 	GraphSidebarPanel,
+	GraphSidebarPullRequest,
 	OverviewRecentThreshold,
 	VisualizationMode,
 } from '../../../plus/graph/protocol.js';
 import {
-	createWipSha,
-	DismissVisualizationsButtonCalloutCommand,
-	GetRowHoverRequest,
-	getSecondaryWipPath,
-	GetWipStatsRequest,
-	isSecondaryWipSha,
-	isWipSha,
-	TrackGraphDetailsCompareModeCommand,
-	TrackGraphDetailsComposeModeCommand,
-	TrackGraphDetailsReviewModeCommand,
-	TrackGraphDetailsWipShownCommand,
-	TrackGraphScopeChangedCommand,
-	UpdateGraphConfigurationCommand,
-	UpdateGraphDisplayModeCommand,
+	createWipRowId,
+	getWipRowWorktreePath,
+	isPrimaryWipRowId,
+	isWipSelectionSha,
 } from '../../../plus/graph/protocol.js';
+import { fireAndForget, notifyService } from '../../shared/actions/rpc.js';
 import type { CustomEventType } from '../../shared/components/element.js';
-import { ipcContext } from '../../shared/contexts/ipc.js';
-import type { TelemetryContext } from '../../shared/contexts/telemetry.js';
-import { telemetryContext } from '../../shared/contexts/telemetry.js';
+import type { GlSplitPanel, GlSplitPanelSnapSource } from '../../shared/components/split-panel/split-panel.js';
+import { aiContext, createAIState } from '../../shared/contexts/ai.js';
+import { createIntegrationsState, integrationsContext } from '../../shared/contexts/integrations.js';
+import { createOnboardingState, onboardingContext } from '../../shared/contexts/onboarding.js';
+import type { OnboardingDismissals } from '../../shared/contexts/onboardingDismissals.js';
+import { onboardingDismissalsContext } from '../../shared/contexts/onboardingDismissals.js';
+import { createDefaultSubscriptionContextState, subscriptionContext } from '../../shared/contexts/subscription.js';
+import type { NavigationState } from '../../shared/controllers/navigationStack.js';
+import { NavigationStack } from '../../shared/controllers/navigationStack.js';
+import '../shared/components/account-bar.js';
+import type { KeymapDispatcher } from '../../shared/keymap/keymapDispatcher.js';
 import { emitTelemetrySentEvent } from '../../shared/telemetry.js';
+import { AccountLaunchpadController } from './accountLaunchpadController.js';
+import { graphCoachMarks } from './components/coachMarks.js';
+import type { CapturedComparison } from './components/detailsState.js';
+import { shouldRestoreCapturedComparison } from './components/detailsState.js';
+import type { BranchSheetRef } from './components/gl-graph-branch-sheet-pane.js';
 import type { GlGraphDetailsPanel } from './components/gl-graph-details-panel.js';
 import type { GlGraphKeyboardShortcuts } from './components/gl-graph-keyboard-shortcuts.js';
 import type {
@@ -58,22 +75,50 @@ import type {
 } from './components/gl-graph-timeline.js';
 import type { GraphTreemapModeChangeDetail } from './components/gl-graph-treemap.js';
 import type { GraphVisualizationModeChangeDetail } from './components/gl-graph-visualizations.js';
+import type { SheetKind } from './components/sheetStack.js';
+import { getEffectiveVisualizationKey } from './components/visualizations.utils.js';
 import type { AppState } from './context.js';
 import { graphServicesContext, graphStateContext } from './context.js';
 import { getEffectiveDisplayMode } from './displayMode.js';
+import { DragShiftHintController } from './dragShiftHintController.js';
 import type { GlGraphHeader } from './graph-header.js';
-import type { GlGraphWrapper } from './graph-wrapper/graph-wrapper.js';
+import type { GlGraphWrapper, GraphNavigationOptions, GraphNavigationResult } from './graph-wrapper/graph-wrapper.js';
 import type { GraphCrossPaneState } from './graphCrossPaneState.js';
 import { abortRunningOperations, createGraphCrossPaneState, graphCrossPaneContext } from './graphCrossPaneState.js';
+import type { GraphLaunchpadState } from './graphLaunchpadState.js';
+import { createGraphLaunchpadState, graphLaunchpadContext } from './graphLaunchpadState.js';
 import type { GlGraphHover } from './hover/graphHover.js';
+import { JumpToastController } from './jumpToastController.js';
+import type { GraphKeymapScope } from './keymap/graphKeymap.js';
+import { createGraphKeymapDispatcher } from './keymap/graphKeymap.js';
+import { registerGraphKeymap } from './keymap/registerKeymap.js';
 import type { GlGraphMinimapContainer, GraphMinimapConfigChangeEventDetail } from './minimap/minimap-container.js';
-import type { GraphMinimapDaySelectedEventDetail, GraphMinimapWheelEvent } from './minimap/minimap.js';
+import type {
+	GraphMinimapDaySelectedEventDetail,
+	GraphMinimapWheelEvent,
+	GraphMinimapZoomChangeEvent,
+} from './minimap/minimap.js';
+import { OverviewBarController } from './overviewBarController.js';
+import { groupPullRequestsByStack } from './sidebar/pullRequestStacks.utils.js';
 import type { GlGraphSidebarPanel, GraphSidebarPanelSelectEventDetail } from './sidebar/sidebar-panel.js';
-import type { GraphSidebarDisplayModeChangeEventDetail, GraphSidebarToggleEventDetail } from './sidebar/sidebar.js';
+import type {
+	GlGraphSideBar,
+	GraphSidebarDisplayModeChangeEventDetail,
+	GraphSidebarToggleEventDetail,
+} from './sidebar/sidebar.js';
+import { sidebarActionsContext } from './sidebar/sidebarContext.js';
+import type { SidebarActions } from './sidebar/sidebarState.js';
+import { SidebarOverlayController } from './sidebarOverlayController.js';
 import type { SelectionBranch } from './utils/branchSelection.utils.js';
 import { getOverviewBranchSelectionSha } from './utils/branchSelection.utils.js';
+import { resolveMinimapShown } from './utils/minimap.utils.js';
 import { getSelectedRepoPath } from './utils/repository.utils.js';
 import { getCommitDateFromRow } from './utils/row.utils.js';
+import { resolveScopeToBranchTarget, shouldDrainParkedScopeToBranch } from './utils/scopeToBranch.utils.js';
+import { hasDirtyCounts, isScopeFocalHead, shouldShowPrimaryWipRow } from './utils/wip.utils.js';
+import { isGraphWalkthroughBannerHighlighted } from './walkthroughBanner.js';
+import './empty-state.js';
+import './access-account.js';
 import './gate.js';
 import './graph-header.js';
 import './graph-wrapper/graph-wrapper.js';
@@ -82,12 +127,15 @@ import './minimap/minimap-container.js';
 import '../../shared/components/split-panel/split-panel.js';
 import './sidebar/sidebar.js';
 import './sidebar/sidebar-panel.js';
-import '../../shared/components/mcp-banner.js';
 import '../../shared/components/button.js';
 import '../../shared/components/code-icon.js';
+import '../../shared/components/overlays/drag-shift-overlay.js';
 import './components/gl-graph-details-panel.js';
+import './components/gl-graph-health-banner.js';
+import './components/gl-graph-jump-toast.js';
 import './components/gl-graph-kanban.js';
 import './components/gl-graph-keyboard-shortcuts.js';
+import './components/gl-graph-overview-bar.js';
 import './components/gl-graph-timeline.js';
 import './components/gl-graph-visualizations.js';
 
@@ -99,8 +147,21 @@ const detailsDefaultPct = 50;
 const detailsMinPct = 20;
 const detailsMaxPct = 80;
 
+// The `auto` details location flips to the bottom when width is scarce relative to height — the
+// panel docks on whichever axis has surplus. The width threshold scales with height (a short pane
+// can't spare vertical room; a tall one can), clamped so tiny panes still prefer the bottom's
+// full-width file list and huge panes eventually go side-by-side. Exit sits 10% above enter as a
+// dead-band against flicker while dragging across the boundary.
+const detailsAutoBottomAspect = 1.6;
+const detailsAutoBottomMinPx = 900;
+const detailsAutoBottomMaxPx = 1600;
+
 const minimapDefaultPx = 40;
 const minimapMaxPct = 40;
+
+/** A typical OS double-click interval — how long sidebar interactions wait to see whether a second
+ *  click lands. */
+const sidebarDblClickGraceMs = 300;
 
 type GraphSelectedCommit = {
 	sha: string;
@@ -117,9 +178,21 @@ type GraphSelectedCommits = {
 	commitLites?: Record<string, CommitDetails>;
 };
 
+/** What asked the details panel to become visible — feeds telemetry and `withDetailsPanel`. */
+type DetailsVisibleTrigger =
+	| 'toggle'
+	| 'placement'
+	| 'request-compare'
+	| 'request-mode'
+	| 'request-agents'
+	| 'request-graph-wip-bar'
+	| 'auto-restore';
+
 @customElement('gl-graph-app')
 export class GraphApp extends SignalWatcher(LitElement) {
 	private _hoverTrackingCounter = getScopedCounter();
+	/** Aborts a superseded hover fetch — a newer row's hover always supersedes an outstanding one. */
+	private _hoverAbort?: AbortController;
 	private _selectionTrackingCounter = getScopedCounter();
 	private _lastSearchRequest: SearchQuery | undefined;
 	private _wasDetailsVisible = false;
@@ -137,25 +210,53 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	 *  doesn't end up selecting the wrong branch's tip. */
 	private _pendingFocalTipBranchRef: string | undefined;
 
-	private _sidebarSnap = ({ pos }: { pos: number }) => {
+	private _sidebarSnap = ({ pos, source }: { pos: number; source: GlSplitPanelSnapSource }) => {
 		if (pos < sidebarMinPct / 2) return 0;
 		if (pos < sidebarMinPct) return sidebarMinPct;
 		if (pos > sidebarMaxPct) return sidebarMaxPct;
-		if (Math.abs(pos - sidebarDefaultPct) <= 1.5) return sidebarDefaultPct;
+		// Keyboard steps by 1%, smaller than this magnet's ±1.5% window, so the magnet would
+		// capture every step and the position could never leave 20% — skip it for keyboard.
+		if (source !== 'keyboard' && Math.abs(pos - sidebarDefaultPct) <= 1.5) return sidebarDefaultPct;
 		return pos;
 	};
 
-	private _detailsSnap = ({ pos }: { pos: number }) => {
+	private _detailsSnap = ({ pos, size, source }: { pos: number; size: number; source: GlSplitPanelSnapSource }) => {
 		const endPct = 100 - pos;
 		if (endPct < detailsMinPct / 2) return 100;
-		if (endPct < detailsMinPct) return 100 - detailsMinPct;
-		if (endPct > detailsMaxPct) return 100 - detailsMaxPct;
-		if (Math.abs(endPct - detailsDefaultPct) <= 1.5) return 100 - detailsDefaultPct;
-		return pos;
+
+		let minPct = detailsMinPct;
+		// Bottom placement only: don't let the pane shrink below its rigid content (header + agents
+		// bar + commit box + file-list floor) — a shorter pane clips the commit box behind a
+		// scrollbar. Height-based, so it must not clamp the horizontal (right-docked) split.
+		if (size > 0 && this.effectiveDetailsLocation === 'bottom') {
+			const minPx = this.detailsPanelEl?.minContentHeight;
+			if (minPx != null) {
+				minPct = Math.min(Math.max(minPct, (minPx / size) * 100), detailsMaxPct);
+			}
+		}
+
+		let out = pos;
+		if (endPct > detailsMaxPct) {
+			out = 100 - detailsMaxPct;
+		} else if (source !== 'keyboard' && Math.abs(endPct - detailsDefaultPct) <= 1.5) {
+			// Keyboard steps by 1%, smaller than this magnet's ±1.5% window, so the magnet would
+			// capture every step and the position could never leave the default — skip it for keyboard.
+			out = 100 - detailsDefaultPct;
+		}
+		if (100 - out < minPct) {
+			out = 100 - minPct;
+		}
+		return out;
 	};
 
-	private _minimapSnap = ({ pos, size }: { pos: number; size: number }) => {
+	private _minimapSnap = ({ pos, size, source }: { pos: number; size: number; source: GlSplitPanelSnapSource }) => {
 		if (size <= 0) return pos;
+
+		// A hidden minimap sits at 0 deliberately, so layout-driven snaps must never open it — without
+		// this the split panel's first-measurement re-snap would open a minimap that the policy says
+		// stays hidden (`applySnap` runs against the seeded position before any stored one exists).
+		// Gestures are exempt: pointer/keyboard drags are how the user opens it again.
+		if (!this.minimapShown && source === 'layout') return 0;
 
 		const defaultPct = (minimapDefaultPx / size) * 100;
 		// First render without a stored position: snap to the exact pixel default
@@ -171,6 +272,141 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		if (Math.abs(px - minimapDefaultPx) <= 2) return defaultPct;
 		return pos;
 	};
+
+	/**
+	 * Search session the user dismissed the auto-shown minimap in, or `undefined` if they haven't.
+	 * Stored as the session rather than a boolean that something has to remember to clear: the
+	 * dismissal simply stops matching once a new search bumps the session, so there's no ordering
+	 * dependency between "record the new session" and "dismiss" (a boolean cleared from `willUpdate`
+	 * lost dismissals issued before the update that noticed the session had moved).
+	 */
+	private _minimapDismissedSession: number | undefined;
+
+	private get minimapSearchDismissed(): boolean {
+		return this._minimapDismissedSession === this.graphState.searchSession;
+	}
+
+	private dismissMinimapForSearch(): void {
+		this._minimapDismissedSession = this.graphState.searchSession;
+		this.requestUpdate();
+	}
+
+	/**
+	 * Whether a search is active — the trigger for the `onSearch` minimap policy. Deliberately spans from
+	 * submit until the search is *cleared*, not until it finishes: keying off results alone would flash
+	 * the minimap open and shut on a zero-match search, and drop it the moment a search completes.
+	 * `searchQuery` is what survives a finished search; the reducer nulls it only on cancel/clear.
+	 */
+	private get minimapSearchActive(): boolean {
+		const gs = this.graphState;
+		return gs.searching || gs.searchQuery != null || (gs.searchResults?.count ?? 0) > 0;
+	}
+
+	private get minimapShown(): boolean {
+		const gs = this.graphState;
+		if (!this.minimapMountable) return false;
+
+		return resolveMinimapShown(
+			gs.config?.minimapDefaultVisibility ?? 'onSearch',
+			gs.minimap?.visible,
+			this.minimapSearchActive,
+			this.minimapSearchDismissed,
+		);
+	}
+
+	/**
+	 * Whether the minimap is available at all — the `gitlens.graph.minimap.enabled` gate. Deliberately
+	 * NOT derived from the search or the visibility policy: `renderGraphMain` gates the split panel on
+	 * this, and a gate that flipped per-search (or on a `hidden` policy's first show) would unmount and
+	 * remount the entire graph. A collapsed panel costs nothing — `gl-graph-minimap-container` defers
+	 * all aggregation while collapsed.
+	 */
+	private get minimapMountable(): boolean {
+		return this.graphState.config?.minimap ?? true;
+	}
+
+	/** Shared back/forward history of visited single commits, mirrored into {@link _navState} for
+	 *  the details header. Re-driving selection via {@link navigateTo} is guarded by
+	 *  {@link _navExpectedSha} so the resulting (async) selection echo isn't recorded as new. */
+	private readonly _nav = new NavigationStack<{ sha: string; repoPath: string; commitLite?: CommitDetails }>(
+		10,
+		undefined,
+		s => (this._navState = s),
+	);
+
+	/** Document-level key dispatcher for the graph webview's shortcuts. Scopes/bindings are registered
+	 *  in {@link connectedCallback}; {@link disconnectedCallback} tears everything down in one call. */
+	readonly keymap: KeymapDispatcher<GraphKeymapScope> = createGraphKeymapDispatcher(isMac);
+
+	/** The jump feedback toast (see {@link JumpToastController}) — owns the toast slots, their timers,
+	 *  and the jump-failure remedies; wired here with closures over this element's own state. */
+	private readonly jumpToast = new JumpToastController(this, {
+		graph: () => this.graph,
+		graphState: () => this.graphState,
+		updateGraphConfig: changes => this.updateGraphConfig(changes),
+		getFiltersService: () => this.getFiltersService(),
+		graphHeader: () => this.graphHeader,
+		waitForState: (predicate, timeoutMs) => this.waitForState(predicate, timeoutMs),
+	});
+
+	/** Routed from {@link GraphAppHost} for the host's `reveal/didFail` notification. */
+	handleRevealFailed(id: string): void {
+		this.jumpToast.revealFailed(id);
+	}
+
+	/** The overlay (unpinned) side bar's auto-collapse, Esc dismissal, and focus-handoff behaviors
+	 *  (see {@link SidebarOverlayController}); wired here with closures over this element's own state. */
+	private readonly sidebarOverlay = new SidebarOverlayController(
+		this,
+		{
+			sidebarOpen: () => this.sidebarOpen,
+			sidebarPinned: () => this.graphState.config?.sidebarPinned ?? false,
+			hideSidebar: () => this.hideSidebar(),
+			focusGraph: () => this.graph?.focus(),
+			railEl: () => this.sidebarRailEl,
+			panelEl: () => this.sidebarPanelEl,
+			scopeBranchRef: () => this.graphState.scope?.branchRef,
+		},
+		sidebarDblClickGraceMs,
+	);
+
+	/** Native-drag "Hold Shift" boundary tracking for the app-level overlay
+	 *  (see {@link DragShiftHintController}). */
+	private readonly dragShiftHint = new DragShiftHintController(this);
+
+	/** The overview/WIP bar: item building, pill select/focus/jump handlers, and lazy stats fetches
+	 *  (see {@link OverviewBarController}); wired here with closures over this element's own state. */
+	private readonly overviewBar = new OverviewBarController(this, {
+		graph: () => this.graph,
+		graphState: () => this.graphState,
+		updateComplete: () => this.updateComplete,
+		fallbackRepoPath: () => this.fallbackRepoPath,
+		primaryWipRowId: () => this.primaryWipRowId,
+		ensureGraphDisplayMode: () => this.ensureGraphDisplayMode(),
+		getFiltersService: () => this.getFiltersService(),
+		waitForState: (predicate, timeoutMs) => this.waitForState(predicate, timeoutMs),
+		selectedCommitRepoPath: () => this._selectedCommit?.repoPath,
+		selectWip: repoPath => {
+			this._selectedCommit = { sha: uncommitted, repoPath: repoPath };
+			this._selectedCommits = undefined;
+		},
+		openWipDetails: (repoPath, sha, target, trigger) => this.openWipDetails(repoPath, sha, target, trigger),
+		emitDetailsVisibilityTelemetry: (visible, trigger) => this.emitDetailsVisibilityTelemetry(visible, trigger),
+		scopeToBranchByName: (branchName, upstreamName, options) =>
+			this.scopeToBranchByName(branchName, upstreamName, options),
+		fetchSelectedWorktreeWipStats: sha => this.fetchSelectedWorktreeWipStats(sha),
+	});
+
+	/** Stable `pushOverlay` reference for surfaces that register themselves on the Esc stack through a
+	 *  property (the hover card) — a fresh bind per render would dirty the property every update. */
+	private readonly pushOverlay = (entry: OverlayEntry): Disposable => this.keymap.pushOverlay(entry);
+
+	@state()
+	private _navState: NavigationState = { count: 0, position: 0, canBack: false, canForward: false };
+
+	/** Sha of an in-flight back/forward re-drive — sha-based (not boolean) because the
+	 *  `navigateToCommit` re-drive re-emits the selection asynchronously through the graph. */
+	private _navExpectedSha?: string;
 
 	/** Graph-mode single selection. Don't read directly for what the details panel shows — go
 	 *  through {@link activeSelection}, which picks the slot matching the active `displayMode`. */
@@ -203,6 +439,46 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		return getEffectiveDisplayMode(this.graphState);
 	}
 
+	/** Everything the graph-level gate needs apart from the walkthrough banner. */
+	private get coachMarksAllowed(): boolean {
+		return (this.graphState.repositories?.length ?? 0) > 0 && (this.graphState.allowed ?? false);
+	}
+
+	/** Graph-level gate for the coach marks — there's no first-class "graph is open" signal, so this
+	 *  composes the suppressors that would leave a mark with nothing visible to anchor to. */
+	private get coachMarksEligible(): boolean {
+		// Read here (not just in `updated`) so `SignalWatcher` re-renders us once the host answers.
+		const deferredBefore = this._bannerDeferredBefore ?? this._dismissals?.get('graph:coachMarks:bannerDeferral');
+
+		return (
+			this.coachMarksAllowed &&
+			// The banner auto-opens for the same audience and `closeOthers()` can't reach it, so a tip
+			// would land on top. One session only: nothing expires the banner on its own.
+			(deferredBefore === true ||
+				!isGraphWalkthroughBannerHighlighted({
+					bannerCollapsed: this._dismissals?.get('graph-walkthrough:banner'),
+					graphWalkthroughProgress: this._onboardingState.graphWalkthroughProgress.get(),
+					graphWalkthroughStarted: this.graphState.graphWalkthroughStarted,
+				}))
+		);
+	}
+
+	/** What the details-pane marks need on top of the graph-level gate; agents answers to that alone. */
+	private get detailsCoachMarksEligible(): boolean {
+		return (
+			this.coachMarksEligible &&
+			this.effectiveDisplayMode === 'graph' &&
+			(this.graphState.details?.visible ?? false)
+		);
+	}
+
+	/** Gates a binding to graph mode only — kanban/visualizations hide the graph subtree behind
+	 *  `renderGraphPaneContent`'s short-circuit, so graph-only shortcuts (ref finder, overview-bar
+	 *  digits, the Shift+letter toggles) must not fire there. NOTE: graph mode does NOT guarantee
+	 *  `this.graph` exists — the gated / no-repo screens replace the whole graph subtree — so run
+	 *  bodies must still null-guard it. */
+	private readonly isGraphModeShortcut = (): boolean => this.effectiveDisplayMode === 'graph';
+
 	/** The selection that drives the details panel, picked by the active `displayMode`. In
 	 *  any non-graph mode the alternate-mode slot is honored; otherwise the graph slots. */
 	private get activeSelection(): {
@@ -215,15 +491,51 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		return { single: this._selectedCommit, multi: this._selectedCommits };
 	}
 
+	/** The GRAPH-ROW sha(s) of the current inspection anchor, for the wrapper's derived highlight
+	 *  (`highlight = anchorShas ∩ renderableRows`). `undefined` in alt modes (the graph is hidden, so
+	 *  nothing to highlight) — the alt slot drives details independently. Multi-select carries real
+	 *  commit shas (WIP rows are excluded from compare); the single anchor goes through
+	 *  {@link toGraphRowSha}. */
+	private get activeAnchorShas(): readonly string[] | undefined {
+		if (this.effectiveDisplayMode !== 'graph') return undefined;
+		if (this._selectedCommits != null) return this._selectedCommits.shas;
+
+		const single = this._selectedCommit;
+		if (single == null) return undefined;
+
+		const rowSha = this.toGraphRowSha(single.sha, single.repoPath);
+		return rowSha != null ? [rowSha] : undefined;
+	}
+
+	/** The GRAPH-ROW sha for an anchor `(sha, repoPath)`: a real sha is itself; `uncommitted` maps to the
+	 *  WIP row of the worktree it belongs to — `repoPath` IS that worktree's path, so the reconstruction
+	 *  is exact.
+	 *
+	 *  Prefers the anchor's own `repoPath`; during a repo-switch/reload tick it can be transiently empty,
+	 *  so it falls back to the graph's selected repo — its own WIP row is the only one nameable then.
+	 *  With neither there is no row id to anchor on, so this returns `undefined`. */
+	private toGraphRowSha(sha: string, repoPath: string): string | undefined {
+		if (sha !== uncommitted) return sha;
+
+		const worktreePath = repoPath !== '' ? repoPath : this.fallbackRepoPath;
+		return worktreePath != null ? createWipRowId(worktreePath) : undefined;
+	}
+
 	private get fallbackRepoPath(): string | undefined {
 		return getSelectedRepoPath(this.graphState);
+	}
+
+	/** The graph's own worktree's WIP row id, or `undefined` before the repo path resolves. */
+	private get primaryWipRowId(): string | undefined {
+		const repoPath = this.fallbackRepoPath;
+		return repoPath != null ? createWipRowId(repoPath) : undefined;
 	}
 
 	/** Graph's currently-selected repo "family" — `commonPath` when available, otherwise the
 	 *  repo path itself. Mirrors {@link GraphRepository.commonPath} semantics in `sidebar-panel`'s
 	 *  `resolveGraphAnchorContext`. Used to gate cross-repo session interactions: a kanban click
 	 *  on a session whose `commonPath` doesn't match the graph's family cannot resolve a row in
-	 *  the currently-rendered graph, so we don't drive `ensureAndSelectCommit` for it. */
+	 *  the currently-rendered graph, so we don't drive `navigateToCommit` for it. */
 	private get fallbackRepoFamily(): string | undefined {
 		const repoId = this.graphState.selectedRepository;
 		const repos = this.graphState.repositories;
@@ -231,16 +543,85 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		return repo?.commonPath ?? repo?.path;
 	}
 
+	/** Family key for a repository path — mirrors {@link fallbackRepoFamily}'s `commonPath ?? path`.
+	 *  Only called at RESTORE time, when the state carries a populated repository list. */
+	private familyOfRepoPath(repoPath: string | undefined): string | undefined {
+		if (!repoPath) return undefined;
+
+		const repo = this.graphState.repositories?.find(r => r.path === repoPath);
+		return repo?.commonPath ?? repo?.path ?? repoPath;
+	}
+
+	/** Whether the selected repository is virtual (GitHub/GitLab-hosted, no local git) — gates the
+	 *  `worktrees`/`stashes` sidebar panels, same rule `gl-graph-sidebar` applies to its rail. */
+	private get isVirtualRepo(): boolean {
+		const gs = this.graphState;
+		return gs.repositories?.find(r => r.id === gs.selectedRepository)?.virtual ?? false;
+	}
+
+	/** Whether the one-time layout-choice prompt should show. Bootstrap seeds the initial value (no
+	 *  async fetch on first render — flash risk); a live dismissal of `graph:layoutPrompt` (e.g. from
+	 *  another window) flips it false via the onboarding dismissals cache, which only ever transitions
+	 *  true → false, never back. */
+	private get layoutPromptNeeded(): boolean {
+		return (this.graphState.layoutPromptNeeded ?? false) && this._dismissals?.get('graph:layoutPrompt') !== true;
+	}
+
 	// use Light DOM
 	protected override createRenderRoot(): HTMLElement | DocumentFragment {
 		return this;
 	}
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	graphState!: typeof graphStateContext.__context__;
+
+	@consume({ context: onboardingDismissalsContext, subscribe: true })
+	private _dismissals?: OnboardingDismissals;
+
+	/** Whether an earlier session already deferred to the walkthrough banner. Latched, because banking
+	 *  the flag below flips the live value and would lift the deferral in the session that set it. */
+	@state()
+	private _bannerDeferredBefore?: boolean;
+
+	/** True once the follow-terminal controller's first passive reveal (`revealOnly`) has landed —
+	 *  latched for the session; NEVER reset. The `followTerminal` coach mark's own dismissed/seen
+	 *  guards handle showing it only once ever. */
+	@state()
+	private _followTerminalRevealed = false;
 
 	@consume({ context: graphServicesContext, subscribe: true })
 	private services?: typeof graphServicesContext.__context__;
+
+	/** Fire-and-forget usage tracking (drives walkthrough state + `usage/track` telemetry). */
+	private trackUsage(key: TrackedUsageKeys): void {
+		const services = this.services;
+		if (services == null) return;
+
+		notifyService(services.telemetry, 'track usage', svc => svc.trackUsage(key));
+	}
+
+	/** Persists a graph config change via RPC, resolving once the write lands (the new config
+	 *  itself arrives separately over `configuration.onDidChange`, wired in `stateProvider.ts`). */
+	private updateGraphConfig(changes: Partial<GraphComponentConfig>): Promise<void> {
+		const services = this.services;
+		if (services == null) return Promise.resolve();
+
+		return (async () => (await services.configuration).update(changes))();
+	}
+
+	/** Resolves the filters RPC sub-service, or `undefined` before the handshake completes. Its writes
+	 *  resolve once the host has written and fired; the resulting STATE arrives one transport hop later on
+	 *  the filters push — see {@link waitForState}. */
+	private async getFiltersService(): Promise<Awaited<NonNullable<typeof this.services>['filters']> | undefined> {
+		return this.services?.filters;
+	}
+
+	private setDisplayMode(mode: GraphDisplayMode): Promise<void> {
+		const services = this.services;
+		if (services == null) return Promise.resolve();
+
+		return (async () => (await services.configuration).setDisplayMode(mode))();
+	}
 
 	// Cross-pane shared signals: state owned by one pane (e.g. the details panel's
 	// running-modes registry) but observed by another (e.g. row adornments in the graph
@@ -250,11 +631,61 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	@provide({ context: graphCrossPaneContext })
 	private readonly _crossPaneState: GraphCrossPaneState = createGraphCrossPaneState();
 
-	@consume({ context: ipcContext })
-	private readonly _ipc!: typeof ipcContext.__context__;
+	// Shared Launchpad summary — fetched once here (the common ancestor) and read by BOTH the
+	// header's Launchpad indicator and the WIP details "empty pane", so there's a single fetch and
+	// a single source of truth. See `graphLaunchpadState.ts`.
+	@provide({ context: graphLaunchpadContext })
+	private readonly _launchpadState: GraphLaunchpadState = createGraphLaunchpadState();
 
-	@consume({ context: telemetryContext as any })
-	private readonly _telemetry!: TelemetryContext;
+	/** One-shot guard: the Launchpad fetch + `onLaunchpadChanged` subscription start once `services`
+	 *  first resolves (a `@consume`d context value, so it isn't in `updated`'s changedProperties). */
+	private _launchpadInitialized = false;
+
+	// Account/integrations bar state (issue #5411). The `<gl-account-bar>` chips consume these
+	// shared contexts; provide them here (the common ancestor) and populate from the host once
+	// `services` resolves. `promosContext` is provided globally by the app host. NOTE: this
+	// mirrors the Home view's wiring — a follow-up should extract it into a reusable helper.
+	private readonly _integrationsState = createIntegrationsState();
+	private readonly _aiState = createAIState();
+	private readonly _subscriptionCtx = new ContextProvider(this, {
+		context: subscriptionContext,
+		initialValue: createDefaultSubscriptionContextState(),
+	});
+	// `_integrationsCtx`/`_aiCtx` are intentionally kept as fields: `ContextProvider` self-registers
+	// on construction, so they're never read again (Home provides these as bare `new ContextProvider`
+	// statements instead — same effect). `_subscriptionCtx` above is a field because it's read later.
+	private readonly _integrationsCtx = new ContextProvider(this, {
+		context: integrationsContext,
+		initialValue: this._integrationsState,
+	});
+	private readonly _aiCtx = new ContextProvider(this, {
+		context: aiContext,
+		initialValue: this._aiState,
+	});
+	// Walkthrough progress (issue #5522). Provided here so the header account/walkthrough pills and the
+	// account modal can consume it; populated from the walkthrough RPC service in `initAccountContexts`.
+	private readonly _onboardingState = createOnboardingState();
+	private readonly _onboardingCtx = new ContextProvider(this, {
+		context: onboardingContext,
+		initialValue: this._onboardingState,
+	});
+	/** One-shot guard for the account-bar context wiring (see `updated()`). */
+	private _accountContextsInitialized = false;
+
+	/** Launchpad + account-bar context bootstrap and teardown (see {@link AccountLaunchpadController});
+	 *  started from `updated()` once `services` resolves. */
+	private readonly accountLaunchpad = new AccountLaunchpadController(this, {
+		launchpadState: () => this._launchpadState,
+		subscriptionCtx: () => this._subscriptionCtx,
+		integrationsState: () => this._integrationsState,
+		aiState: () => this._aiState,
+		onboardingState: () => this._onboardingState,
+		isConnected: () => this.isConnected,
+		services: () => this.services,
+	});
+
+	@consume({ context: sidebarActionsContext, subscribe: true })
+	private _sidebarActions?: SidebarActions;
 
 	@query('gl-graph-wrapper')
 	graph!: GlGraphWrapper;
@@ -274,8 +705,18 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	@query('gl-graph-sidebar-panel')
 	private readonly sidebarPanelEl: GlGraphSidebarPanel | undefined;
 
+	@query('gl-graph-sidebar')
+	private readonly sidebarRailEl: GlGraphSideBar | undefined;
+
 	@query('gl-graph-details-panel')
 	private readonly detailsPanelEl: GlGraphDetailsPanel | undefined;
+
+	@query('.graph__details-split')
+	private readonly detailsSplitEl: GlSplitPanel | undefined;
+
+	/** Bumped on every {@link withDetailsPanel} call — lets a stale in-flight reveal (e.g. rapid
+	 *  clicks racing a repo switch) detect it's no longer the latest and skip its callback. */
+	private _detailsRevealToken = 0;
 
 	@query('gl-graph-keyboard-shortcuts')
 	private readonly keyboardShortcutsEl: GlGraphKeyboardShortcuts | undefined;
@@ -294,11 +735,18 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	private _detailsShownAt: number | undefined;
 	private _detailsTelemetryFirstRender = true;
 
+	/** Width-driven details location used when the configured location is `auto`. Tracked (with
+	 *  hysteresis) by `_graphSizeObserver` and seeded by its initial callback, so no synchronous
+	 *  width read is needed. See `effectiveDetailsLocation`. */
+	@state()
+	private _autoEffectiveLocation: 'right' | 'bottom' = 'right';
+
 	/**
 	 * Last observed non-zero size of the top-level `.graph` element, used to freeze it
-	 * across editor-tab hide/show transitions. Without this freeze the external GK
-	 * GraphContainer's internal ResizeObserver sees the iframe's layout collapse to 0 (and
-	 * then re-expand on restore), producing a visible re-layout cascade. VS Code applies
+	 * across editor-tab hide/show transitions. Without this freeze the graph's
+	 * ResizeObservers (the row virtualizer's, and `gl-lit-graph`'s own lane-window ones) see
+	 * the iframe's layout collapse to 0 (and then re-expand on restore), producing a visible
+	 * re-layout cascade. VS Code applies
 	 * `display: none` to the webview iframe even with `retainContextWhenHidden: true` —
 	 * that flag preserves the iframe content but not its layout visibility.
 	 */
@@ -308,19 +756,31 @@ export class GraphApp extends SignalWatcher(LitElement) {
 
 	override connectedCallback(): void {
 		super.connectedCallback?.();
-		// Overlay mode auto-collapse — listeners gate themselves on mode + visibility, so they
-		// stay attached for the lifetime of the component and become inert in split mode.
-		document.addEventListener('focusout', this._handleSidebarOverlayFocusOut, true);
-		document.addEventListener('pointerdown', this._handleSidebarOverlayPointerDown, true);
-		document.addEventListener('contextmenu', this._handleSidebarOverlayContextMenu, true);
-		window.addEventListener('webview-blur', this._handleSidebarOverlayWebviewBlur, false);
-		window.addEventListener('webview-focus', this._handleSidebarOverlayWebviewFocus, false);
+
+		registerGraphKeymap(this.keymap, {
+			isGraphModeShortcut: () => this.isGraphModeShortcut(),
+			graph: () => this.graph,
+			graphHeader: () => this.graphHeader,
+			sidebarPanelEl: () => this.sidebarPanelEl,
+			shouldAutoCollapseOverlay: () => this.sidebarOverlay.shouldAutoCollapse(),
+			overviewBarItems: () => this.overviewBar.items,
+			selectOverviewBarItem: (detail, options) => this.overviewBar.selectItem(detail, options),
+			isVirtualRepo: () => this.isVirtualRepo,
+			activateSidebarPanel: panel => this.activateSidebarPanel(panel),
+			sidebarEnabled: () => this.graphState.config?.sidebar ?? false,
+			kanbanEnabled: () => this.graphState.config?.experimentalKanbanEnabled ?? false,
+			toggleDisplayMode: mode => this.toggleDisplayMode(mode),
+			toggleMinimap: () => this.handleToggleMinimap(),
+			toggleSidebar: () => this.handleToggleSidebar(),
+			toggleDetails: e => this.handleToggleDetails(e),
+			showShortcuts: () => this.handleShowShortcuts(),
+		});
 
 		this._graphSizeObserver = new ResizeObserver(entries => {
 			// Use `borderBoxSize` (not `contentRect`) so the snapshot matches what
 			// `style.width/height` sets when applied with `box-sizing: border-box`. Using
 			// contentRect would leave a 2× padding gap (.graph has `padding: 0.1rem`), which
-			// cascades into a visible 2–10px row jump in the GK GraphContainer on restore.
+			// cascades into a visible 2–10px row jump on restore.
 			const box = entries[0]?.borderBoxSize?.[0];
 			if (box == null) return;
 
@@ -331,17 +791,60 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			// hide/show cycle.
 			if (width > 0 && height > 0) {
 				this._lastGraphSize = { width: width, height: height };
+				// Drive the `auto` details location from the panes' shape: the width threshold is a
+				// pure function of height (see `detailsAutoBottomAspect`), so no feedback loop is
+				// possible — `.graph` is the layout root and its size doesn't depend on where the
+				// panel docks. Hysteresis (exit 10% above enter) keeps it from flapping when
+				// dragged across the boundary. Only consumed when the configured location is `auto`
+				// (see `effectiveDetailsLocation`), but tracked unconditionally so switching back
+				// to `auto` is immediately correct without waiting for the next resize.
+				const enterPx = Math.min(
+					Math.max(height * detailsAutoBottomAspect, detailsAutoBottomMinPx),
+					detailsAutoBottomMaxPx,
+				);
+				if (this._autoEffectiveLocation === 'right' && width < enterPx) {
+					this._autoEffectiveLocation = 'bottom';
+				} else if (this._autoEffectiveLocation === 'bottom' && width > enterPx * 1.1) {
+					this._autoEffectiveLocation = 'right';
+					// Maximize is bottom-only — drop it on a flip to the side so it doesn't silently
+					// re-apply when the panel later returns to the bottom.
+					if (this.graphState.details?.maximized) {
+						this.graphState.details = { maximized: false };
+						this.persistState();
+					}
+				}
 			}
 		});
 	}
 
-	protected override firstUpdated(): void {
-		// Observe the outer `.graph` div once it's been rendered. It contains the entire
-		// layout — header, panes, sidebar, the React mount — so freezing this single element
-		// freezes everything inside it without needing to touch other components.
-		if (this.graphRootEl != null) {
-			this._graphSizeObserver?.observe(this.graphRootEl);
+	private _observedGraphRoot: HTMLElement | undefined;
+
+	// Observe the outer `.graph` div once rendered — it contains the entire layout (header, panes,
+	// sidebar, React mount), so freezing this one element freezes everything inside it. Identity-tracked
+	// (not a one-shot latch) and driven from both `firstUpdated` and `updated`: the signed-out
+	// account-access screen replaces the whole tree, so `.graph` is absent on the first render in that
+	// state AND is a brand-new element after each sign-out/sign-in cycle — a latch would leave the new
+	// element unobserved, freezing every height/width-driven behavior (inline header mode, `auto`
+	// details location) until a webview reload.
+	private ensureGraphObserved(): void {
+		const el = this.graphRootEl;
+		if (el === this._observedGraphRoot || this._graphSizeObserver == null) return;
+
+		if (this._observedGraphRoot != null) {
+			this._graphSizeObserver.unobserve(this._observedGraphRoot);
 		}
+		this._observedGraphRoot = el;
+		if (el != null) {
+			this._graphSizeObserver.observe(el);
+		}
+	}
+
+	protected override firstUpdated(): void {
+		this.ensureGraphObserved();
+
+		// Manual refresh entry point (the WIP empty pane's refresh button, routed through the
+		// details panel) — force an immediate refetch rather than waiting on `onLaunchpadChanged`.
+		this._launchpadState.refresh = () => void this.accountLaunchpad.refreshLaunchpadSummary(true);
 	}
 
 	override disconnectedCallback(): void {
@@ -352,121 +855,26 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// lose the last visualization choice. The debouncer is leading-trailing by default;
 		// `flush()` runs the queued trailing call immediately, no-ops if nothing's queued.
 		this._persistStateDebounced.flush();
-		document.removeEventListener('focusout', this._handleSidebarOverlayFocusOut, true);
-		document.removeEventListener('pointerdown', this._handleSidebarOverlayPointerDown, true);
-		document.removeEventListener('contextmenu', this._handleSidebarOverlayContextMenu, true);
-		window.removeEventListener('webview-blur', this._handleSidebarOverlayWebviewBlur, false);
-		window.removeEventListener('webview-focus', this._handleSidebarOverlayWebviewFocus, false);
+		// Drops every registered scope/binding AND the whole overlay stack, so the surfaces' own disposables
+		// (held for the reconnect case) become no-ops.
+		this.keymap.dispose();
+		this._minimapZoomOverlay = undefined;
 
 		this._graphSizeObserver?.disconnect();
 		this._graphSizeObserver = undefined;
+		// Reset the identity tracking so a reconnect (which creates a fresh observer) re-observes the
+		// root even when the DOM element survived the disconnect.
+		this._observedGraphRoot = undefined;
 		if (this._releaseSuspensionRafId != null) {
 			cancelAnimationFrame(this._releaseSuspensionRafId);
 			this._releaseSuspensionRafId = undefined;
 		}
 	}
 
-	// Set when a right-click / context-menu request is in flight. VS Code's native context menu
-	// steals webview focus on open, which would otherwise cascade through focusout +
-	// webview-blur and dismiss the overlay sidebar before the user can interact with the menu.
-	// Cleared on webview-focus (when the menu closes and focus returns) or on the next primary
-	// pointerdown (safety net in case no menu actually appears).
-	private _suppressOverlayCollapseForMenu = false;
-
-	private _handleSidebarOverlayFocusOut = (e: FocusEvent): void => {
-		if (!this.shouldAutoCollapseOverlay()) return;
-		if (this._suppressOverlayCollapseForMenu) return;
-
-		const next = e.relatedTarget as Node | null;
-		// Focus left the webview entirely — handled by _handleSidebarOverlayWebviewBlur, not
-		// here, so we don't react to in-webview focus moves to non-focusable nodes.
-		if (next == null) return;
-		if (this.isInsideSidebarZone(next)) return;
-
-		this.scheduleAutoCollapse();
-	};
-
-	private _handleSidebarOverlayPointerDown = (e: PointerEvent): void => {
-		if (!this.shouldAutoCollapseOverlay()) return;
-		if (e.button !== 0) {
-			// Non-primary button — almost certainly a right-click context menu. Set a flag
-			// before the focusout/webview-blur cascade so they don't dismiss the sidebar.
-			this._suppressOverlayCollapseForMenu = true;
-			return;
-		}
-
-		// Primary button — clear any stale suppression (e.g. a prior right-click that opened
-		// no menu and never received a webview-focus to clear the flag).
-		this._suppressOverlayCollapseForMenu = false;
-
-		const target = e.target as Node | null;
-		if (target == null) return;
-		if (this.isInsideSidebarZone(target)) return;
-
-		this.scheduleAutoCollapse();
-	};
-
-	private _handleSidebarOverlayContextMenu = (): void => {
-		// Covers keyboard-triggered context menus (Shift+F10, ContextMenu key) which fire no
-		// pointerdown. For mouse-triggered menus, the pointerdown handler has already set the
-		// flag; setting it again here is a harmless no-op.
-		if (!this.shouldAutoCollapseOverlay()) return;
-
-		this._suppressOverlayCollapseForMenu = true;
-	};
-
-	private _handleSidebarOverlayWebviewBlur = (): void => {
-		if (!this.shouldAutoCollapseOverlay()) return;
-		if (this._suppressOverlayCollapseForMenu) return;
-
-		this.scheduleAutoCollapse();
-	};
-
-	private _handleSidebarOverlayWebviewFocus = (): void => {
-		// Menu closed (or focus otherwise returned) — clear the suppression so subsequent
-		// click-outside interactions collapse normally.
-		this._suppressOverlayCollapseForMenu = false;
-	};
-
-	// Pre-collapse sidebarVisible captured synchronously when the auto-collapse fires. The
-	// sidebar toggle button's click runs in a later task — by then the queued hide has
-	// already mutated state, so handleToggleSidebar would see the post-collapse value and
-	// flip the toggle backwards. This snapshot lets the click handler honor the user's
-	// actual pre-click intent. Cleared on read.
-	private _sidebarVisibleAtAutoCollapse: boolean | undefined;
-
-	private scheduleAutoCollapse(): void {
-		this._sidebarVisibleAtAutoCollapse = this.graphState.sidebar?.visible ?? false;
-		// Microtask, not sync: lets any same-task handlers run before the actual hide; the
-		// click handler in a later task reads _sidebarVisibleAtAutoCollapse instead of current
-		// state. hideSidebar gates on already-hidden so a stale schedule is a no-op.
-		queueMicrotask(() => this.hideSidebar());
-	}
-
-	private shouldAutoCollapseOverlay(): boolean {
-		if (this.graphState.config?.sidebarPinned !== false) return false;
-		if (!this.graphState.sidebar?.visible) return false;
-		return true;
-	}
-
-	private isInsideSidebarZone(node: Node): boolean {
-		const rail = this.querySelector('gl-graph-sidebar');
-		if (rail?.contains(node)) return true;
-
-		const panel = this.sidebarPanelEl;
-		if (panel?.contains(node)) return true;
-
-		// Pointerdown / focusout from the split-panel divider (in its shadow DOM) retargets to
-		// the split-panel host. Without this, dragging the divider auto-collapses the panel.
-		const sidebarSplit = this.querySelector('.graph__sidebar-split');
-		if (sidebarSplit === node) return true;
-		return false;
-	}
-
 	onWebviewVisibilityChanged(visible: boolean): void {
 		// Freeze the layout across the hide/show cycle so the ResizeObserver cascade that
 		// VS Code's iframe resize (down to ~300x150 then back) produces does NOT propagate
-		// into the GK GraphContainer. The IPC `visible=false` arrives with ~1.5s of headroom
+		// into the graph. The IPC `visible=false` arrives with ~1.5s of headroom
 		// before the queued RO callbacks fire, so we can apply explicit pixel dimensions +
 		// `contain: size layout` to `.graph` and the cascade sees zero delta. `document.
 		// visibilitychange` doesn't fire for editor-tab transitions in VS Code webviews,
@@ -489,7 +897,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				}
 			} else if (graph.style.contain !== '') {
 				// Release on the next animation frame so the frozen box is still in effect
-				// when the GraphContainer's internal RO runs its first post-restore callback
+				// when the graph's ResizeObservers run their first post-restore callback
 				// (same size → no-op), then drops back to natural sizing for live
 				// drag-resizes.
 				if (this._releaseSuspensionRafId != null) {
@@ -517,9 +925,15 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	 *  explicit refs (e.g. from a sidebar tree compare action). Ensures the details panel is
 	 *  visible, then forwards to the details panel which owns the workflow controller. */
 	openCompareMode(params: DidRequestOpenCompareModeParams): void {
-		this.setDetailsVisible(true, 'request-compare');
-		this.ensureDetailsPosition();
-		this.detailsPanelEl?.openCompareMode(params);
+		void this.withDetailsPanel(panel => panel.openCompareMode(params), 'request-compare');
+	}
+
+	/** Routed from {@link GraphAppHost} when the extension pushes a selection — a host-initiated reveal
+	 *  (Show in Commit Graph, terminal links, deep links). The graph doesn't auto-scroll on a plain
+	 *  selection, so bring the revealed row into view. A landing: the user acted somewhere else entirely,
+	 *  so leaving an already-visible row where it sits would answer "which one?" with nothing. */
+	ensureRowVisible(sha: string): void {
+		void this.graph?.navigateToCommit(sha, { source: 'host', flash: true });
 	}
 
 	/** Routed from {@link GraphAppHost} when a graph context-menu action requests showing a
@@ -582,7 +996,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	 *  `params.selectSha` is intentionally NOT forwarded to the header: the host-side
 	 *  `hasSearchQuery` handler already calls `setSelectedRows` and (when needed) `onGetMoreRows`
 	 *  synchronously before firing this notification. The selection update reaches the webview via
-	 *  the separate `DidChangeSelectionNotification` push, not via the search query.
+	 *  the separate `GraphSelectionService.onSelectionChanged` push, not via the search query.
 	 *
 	 *  Sets `_lastSearchRequest` so the cold-show path's `state.searchRequest` consumer (in
 	 *  `updated()`) treats this request as already handled if the same query also lands in state. */
@@ -611,34 +1025,150 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		});
 	}
 
-	private _pendingScopeToBranch = false;
+	/** A task action that arrived — or was interrupted by a sign-out or plan change — while an access
+	 *  wall is up (#5534). While gated the graph is unreachable (the account screen replaces it, or the
+	 *  plan gate covers it with an undismissable modal), so consuming an action would silently drop it —
+	 *  or worse, drive the graph behind the modal. It's parked here instead, drives the screen's
+	 *  task-specific messaging, and is consumed once access is granted. `@state` so a warm arrival
+	 *  re-renders the already-shown screen with the task copy. */
+	@state()
+	private _gatedPendingAction?: NonNullable<AppState['pendingAction']> & {
+		/** An interrupted comparison from the wall capture — never host-delivered, so its
+		 *  presence marks the parked action as a capture and arms the restore guards */
+		capturedComparison?: CapturedComparison;
+	};
+	private _wasAccessGated = false;
+
+	/** Drives the welcome's live-sign-in copy variant: armed when the account wall clears live (a
+	 *  sign-in completed while the account screen was showing) with no parked task to run — a task
+	 *  arrival goes straight to the graph instead, both for intent and because
+	 *  `consumePendingAction` drives the graph subtree, which doesn't mount while this screen is up.
+	 *  Cleared when the user continues, a task action arrives, or the account wall re-raises. */
+	@state()
+	private _postSignInPending = false;
+	private _wasAccountGated = false;
+
+	/** Mirrors the host's `isAccountAccessRequired` — the predicate for the render swap to the
+	 *  account screen, and one of the two walls `isAccessGated` parks behind. */
+	private get isAccountGated(): boolean {
+		const sub = this.graphState.subscription;
+		return sub != null && (sub.account == null || sub.account.verified === false);
+	}
+
+	/** Any wall that blocks the graph — the account screen, or the plan gate (`!allowed`, the very
+	 *  predicate that renders `gl-graph-gate`), so what's parked can't desync from what's displayed. */
+	private get isAccessGated(): boolean {
+		return this.isAccountGated || !this.graphState.allowed;
+	}
+
+	/** Shows the first-run welcome (the `graph:intro` onboarding surface). Full-viewport early-return
+	 *  in `render`, so — unlike the old in-subtree dialog — it needs no `repositories > 0` guard and
+	 *  shows even with no repo open. Held back while the Pro gate is up (the gate is the proper first
+	 *  surface for an unentitled user; the welcome shows once they can use the graph) and while a
+	 *  deep-linked task action is parked/incoming (the action's intent trumps onboarding). */
+	private get shouldShowWelcome(): boolean {
+		return (
+			!this.isAccountGated &&
+			(this.graphState.allowed ?? false) &&
+			// Client-read onboarding flag: `undefined` until known (don't flash), `false` = not yet
+			// dismissed, `true` = dismissed.
+			this._dismissals?.get('graph:intro') === false &&
+			this._gatedPendingAction == null &&
+			this.graphState.pendingAction == null
+		);
+	}
 
 	private async consumePendingAction(pending: {
 		action: GraphShowAction;
-		target?: { sha: string; worktreePath: string };
+		target?: { sha: string; worktreePath: string; filePaths?: string[] };
 		commitMessage?: string;
+		scopeBranch?: GraphScopeBranch;
+		scopeOrigin?: GraphScopeOrigin;
+		composeInstructions?: string;
+		composeScope?: GraphComposeScopeSeed;
+		capturedComparison?: CapturedComparison;
+		agentSessionId?: string;
+		revealOnly?: boolean;
+		followed?: boolean;
+		onlyIfWipSelected?: boolean;
 	}): Promise<void> {
-		const { action, target, commitMessage } = pending;
+		const {
+			action,
+			target,
+			commitMessage,
+			scopeBranch,
+			scopeOrigin,
+			composeInstructions,
+			composeScope,
+			capturedComparison,
+			agentSessionId,
+			revealOnly,
+			followed,
+			onlyIfWipSelected,
+		} = pending;
+
+		// Passive follow to the graph's own WIP row only lands while the user is already WIP-hopping
+		// (a WIP row selected) — otherwise it would yank a deliberately-taken position for a row
+		// that's one `w` keypress away. Dropping here skips everything: selection, reveal, the
+		// coach-mark latch, and the agent highlight.
+		if (onlyIfWipSelected === true) {
+			const { single, multi } = this.activeSelection;
+			if (multi != null || single == null || !isWipSelectionSha(single.sha)) return;
+		}
+
 		if (action === 'scope-to-branch') {
-			await this.scopeToBranch();
+			// A target branch (from a Focus on Branch/Worktree command) scopes to it; otherwise scope
+			// to the current branch (the welcome-page / generic `scope-to-branch` entry point).
+			if (scopeBranch != null) {
+				await this.scopeToBranchByName(scopeBranch.branchName, scopeBranch.upstreamName, {
+					remote: scopeBranch.remote,
+					origin: scopeOrigin,
+				});
+			} else {
+				await this.scopeToBranch();
+			}
 			return;
+		}
+
+		if (action === 'open-compare' && capturedComparison != null) {
+			const capturedFamily = this.familyOfRepoPath(capturedComparison.graphRepoPath);
+			const live = this.detailsPanelEl?.liveComparison;
+			if (
+				!shouldRestoreCapturedComparison(capturedComparison.refs, capturedFamily, this.fallbackRepoFamily, live)
+			) {
+				return;
+			}
 		}
 
 		// When a target is supplied (e.g. context-menu invocation on a secondary WIP row), route
 		// the action to that row's worktree; otherwise fall back to the primary repo + uncommitted.
 		const repoPath = target?.worktreePath ?? this.fallbackRepoPath ?? '';
 		const sha = target?.sha ?? uncommitted;
-		this._selectedCommit = { sha: sha, repoPath: repoPath };
-		this._selectedCommits = undefined;
+		if (!(action === 'open-compare' && capturedComparison?.refs != null)) {
+			this._selectedCommit = { sha: sha, repoPath: repoPath };
+			this._selectedCommits = undefined;
+		}
 
 		// Reliably select the target row in the graph itself, not just the details panel. The host's
 		// selection notification is prop-driven and can drop the synthetic WIP row to a render race
 		// (the row is injected by `getDecoratedRows` only after Lit+React catch up), which surfaces as
-		// review/compose updating the details but leaving the row unselected. `ensureAndSelectCommit`
+		// review/compose updating the details but leaving the row unselected. `navigateToCommit`
 		// normalizes `uncommitted`→the WIP row and retries across frames until it's injected. Skip for
-		// compare (it drives its own range selection).
-		if (action !== 'open-compare') {
-			this.graph?.ensureAndSelectCommit(sha);
+		// compare (it drives its own range selection) and the rebase summary (selection-decoupled sheet).
+		if (action !== 'open-compare' && action !== 'show-rebase-summary') {
+			// The ROW sha, not the raw target sha: a WIP target on another worktree is that worktree's own
+			// WIP row, while `navigateToCommit` maps `uncommitted` only to the graph's own primary row — so
+			// handing it the raw sha would select the wrong worktree's working changes. `undefined` means no
+			// row id is nameable yet (transient repo-switch tick), so there is nothing to navigate to.
+			const rowSha = this.toGraphRowSha(sha, repoPath);
+			if (rowSha != null) {
+				// Any WIP selection, not just the `uncommitted` revision — actions target `wip::<path>` row ids,
+				// and gating on the revision alone would reveal into a scope that still hides the row.
+				if (isWipSelectionSha(sha)) {
+					this.overviewBar.unscopeToRevealWip(rowSha);
+				}
+				void this.graph?.navigateToCommit(rowSha, { source: 'selection-sync', reveal: 'if-changed' });
+			}
 		}
 
 		const showDetails = () => {
@@ -646,10 +1176,15 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			this.ensureDetailsPosition();
 		};
 
+		if (action === 'show-rebase-summary') {
+			void this.withDetailsPanel(panel => panel.openRebaseSummary(repoPath), 'request-mode');
+			return;
+		}
+
 		if (action === 'open-compare') {
-			await this.updateComplete;
 			const compareParams =
-				target != null
+				capturedComparison?.refs ??
+				(target != null
 					? {
 							repoPath: repoPath,
 							leftRef: this.graphState.branch?.name ?? 'HEAD',
@@ -661,22 +1196,46 @@ export class GraphApp extends SignalWatcher(LitElement) {
 							rightRef: this.graphState.branch?.name ?? 'HEAD',
 							rightRefType: 'branch' as const,
 							includeWorkingTree: true,
-						};
-			this.detailsPanelEl?.openCompareMode(compareParams, showDetails);
+						});
+			void this.withDetailsPanel(panel => panel.openCompareMode(compareParams), 'request-mode');
 			return;
 		}
 
-		showDetails();
-
-		if (action === 'enter-review' || action === 'enter-compose') {
-			// On a cold graph open the details panel mounts only after the initial graph data/layout
-			// settles. Poll for the element directly (independent of this app's `updateComplete`,
-			// which can stay pending through the busy cold load) so the mode request doesn't silently
-			// no-op via the `?.` below. `enterModeForWip` builds its own selection from repoPath/sha,
-			// so it doesn't need the panel to have reconciled to the row first.
-			const panel = await this.waitForDetailsPanel();
-			panel?.enterModeForWip(action === 'enter-review' ? 'review' : 'compose', repoPath, sha);
+		if (action === 'enter-review' || action === 'enter-compose' || action === 'enter-resolve') {
+			const mode = action === 'enter-review' ? 'review' : action === 'enter-compose' ? 'compose' : 'resolve';
+			// `filePaths` (resolve only) scopes the run to specific conflicted files; undefined = all conflicts.
+			// `composeInstructions` (compose only) seeds the AI-instructions input; ignored by review/resolve.
+			// `composeScope` (compose only) is the resolved recompose commit-range seed; absent = working-changes compose.
+			void this.withDetailsPanel(
+				panel =>
+					panel.enterModeForWip(mode, repoPath, sha, target?.filePaths, composeInstructions, composeScope),
+				'request-mode',
+			);
 			return;
+		}
+
+		// A host-resolved focus (Focus in Commit Graph on a terminal) scopes to the target worktree's
+		// branch once the selection above has landed. CONSTRAINT: `scopeBranch` must cover the target
+		// row — every producer resolves it from the target worktree's OWN current branch, so this
+		// scope can't re-hide the row `unscopeToRevealWip` just revealed. A producer scoping to some
+		// OTHER branch would break that.
+		if (scopeBranch != null) {
+			await this.scopeToBranchByName(scopeBranch.branchName, scopeBranch.upstreamName, {
+				remote: scopeBranch.remote,
+				origin: scopeOrigin,
+			});
+		}
+
+		// `revealOnly` (passive follow deliveries) selects/reveals the row above without opening the
+		// details panel.
+		const detailsAlreadyVisible = this.graphState.details?.visible === true;
+		if (revealOnly !== true) {
+			showDetails();
+		} else if (followed === true) {
+			// Only the follow controller's passive deliveries set `followed` — a manual Focus also
+			// sends `revealOnly` but must not trigger the follow coach mark.
+			// Latch — never reset; see `_followTerminalRevealed`'s own doc comment.
+			this._followTerminalRevealed = true;
 		}
 
 		await this.updateComplete;
@@ -686,6 +1245,16 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// edit and re-commit the message in the same box they'd normally type into.
 		if (commitMessage != null && action === 'show-wip') {
 			this.detailsPanelEl?.setCommitMessage(repoPath, commitMessage);
+			// Also focuses for the existing undo-commit/add-author seeds, not just fixup.
+			this.detailsPanelEl?.focusCommitMessage();
+		}
+
+		// Highlights an agent session's card in an already-open details panel. Sidebar-tree
+		// highlighting has no equivalent API, so that stays out of scope here.
+		// Passive deliveries only highlight into an ALREADY-open panel; a manual invocation that just
+		// opened the panel (`revealOnly` unset) highlights into it too.
+		if (action === 'show-wip' && agentSessionId != null && (detailsAlreadyVisible || revealOnly !== true)) {
+			void this.dispatchAgentHighlight(agentSessionId);
 		}
 	}
 
@@ -701,64 +1270,281 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		return this.detailsPanelEl;
 	}
 
+	/** What the LATEST {@link withDetailsPanel} reveal was for — lets the branch sheet's
+	 *  `{open: false}` cancellation retire an in-flight BRANCH open without cross-cancelling an
+	 *  unrelated reveal (compare/rebase/mode) that happens to be awaiting the panel: the graph fires
+	 *  `{open: false}` on ANY click-outside-dismiss while a ref is pinned, sheet or no sheet. */
+	private _detailsRevealFor: 'branch' | 'other' = 'other';
+
+	/** Single open path for "make the details panel visible, wait for it to mount (a cold graph
+	 *  open lags a few frames — see {@link waitForDetailsPanel}), then act on it". `token` guards
+	 *  against a stale reveal (e.g. rapid clicks racing a repo switch) landing its callback after a
+	 *  newer one already ran. */
+	private async withDetailsPanel(
+		fn: (panel: GlGraphDetailsPanel) => void,
+		trigger: DetailsVisibleTrigger,
+		revealFor: 'branch' | 'other' = 'other',
+	): Promise<void> {
+		const token = ++this._detailsRevealToken;
+		this._detailsRevealFor = revealFor;
+		this.setDetailsVisible(true, trigger);
+		this.ensureDetailsPosition();
+		const panel = await this.waitForDetailsPanel();
+		if (token !== this._detailsRevealToken || panel == null) return;
+
+		fn(panel);
+	}
+
 	private async scopeToBranch(): Promise<void> {
-		const branch = this.graphState.branch;
-		if (branch == null) {
-			this._pendingScopeToBranch = true;
+		const target = resolveScopeToBranchTarget(this.graphState.branch, this.fallbackRepoPath);
+		if (target == null) {
+			this.graphState.pendingScopeToBranch = true;
 			return;
 		}
 
-		this._pendingScopeToBranch = false;
-		const repoPath = this.fallbackRepoPath;
-		if (repoPath != null) {
-			const branchRef = getBranchId(repoPath, false, branch.name);
-			await this.setScope(
-				{
-					branchRef: branchRef,
-					branchName: branch.name,
-					upstreamRef: branch.upstream?.name ? getBranchId(repoPath, true, branch.upstream.name) : undefined,
-				},
-				'overview-card',
-			);
-		}
+		this.graphState.pendingScopeToBranch = false;
+		const { branch, repoPath } = target;
+		const branchRef = getBranchId(repoPath, false, branch.name);
+		await this.setScope(
+			{
+				branchRef: branchRef,
+				branchName: branch.name,
+				upstreamRef: branch.upstream?.name ? getBranchId(repoPath, true, branch.upstream.name) : undefined,
+			},
+			'overview-card',
+		);
 	}
 
-	/** Handles a WIP-row inline-button click (Compose / Review / agent indicator). Selects the
-	 *  row, opens the details panel, and routes to the requested target. Compose/Review enter
-	 *  the matching workflow mode; `agents` expands the agents section. The graph component
-	 *  fires its own selection-change for the row click in parallel; setting `_selectedCommit`
+	/** Shared WIP selection + details-open flow. Used by both the inline graph WIP row
+	 *  affordance and the WIP drawer above the graph. Sets the active selection, opens
+	 *  the details panel, and optionally drives a mode-switch action. The graph component
+	 *  fires its own selection-change for a row click in parallel; setting `_selectedCommit`
 	 *  explicitly here ensures the details panel is on the right anchor before we drive the
 	 *  target-specific action, regardless of dispatch ordering. */
-	private handleWipRowOpen = async (
-		e: CustomEvent<{ target: 'compose' | 'review' | 'agents'; row: GraphRow }>,
-	): Promise<void> => {
-		const { target, row } = e.detail;
-		const fallbackRepoPath = this.fallbackRepoPath ?? '';
-		// For secondary WIP rows the worktree path is encoded in the sha (`worktree-wip::<path>`);
-		// extract it. Primary WIP and any other row types resolve to the primary (fallback) repo.
-		const isSecondary = isSecondaryWipSha(row.sha);
-		const repoPath = isSecondary ? getSecondaryWipPath(row.sha) : fallbackRepoPath;
-		const sha = row.type === ('work-dir-changes' satisfies GitGraphRowType) ? uncommitted : row.sha;
-
+	private async openWipDetails(
+		repoPath: string,
+		sha: string,
+		target: 'compose' | 'review' | 'resolve' | 'agents' | undefined,
+		trigger: 'request-mode' | 'request-agents' | 'request-graph-wip-bar',
+	): Promise<void> {
 		this._selectedCommit = { sha: sha, repoPath: repoPath };
 		this._selectedCommits = undefined;
-
-		this.setDetailsVisible(true, target === 'agents' ? 'request-agents' : 'request-mode');
+		this.setDetailsVisible(true, trigger);
 		this.ensureDetailsPosition();
-
 		// Wait for the details panel to render with the new selection before invoking the
 		// target-specific action — otherwise both `toggleMode` (for compose/review) and the
 		// agents-section query would see stale selection in their snapshots.
 		await this.updateComplete;
 		if (target === 'agents') {
 			this.detailsPanelEl?.expandAgentsForWip();
-		} else {
+		} else if (target != null) {
 			this.detailsPanelEl?.enterModeForWip(target, repoPath, sha);
 		}
+	}
+
+	/** Force the graph into `graph` display mode so a row can actually be revealed. Returns true when it
+	 *  switched — the caller must then await a render before asking the (newly mounted) graph to reveal
+	 *  anything. Shared by the overview bar's pill selection and its row-marker jumps. */
+	private ensureGraphDisplayMode(): boolean {
+		const gs = this.graphState;
+		if (gs.displayMode === 'graph') return false;
+
+		gs.displayMode = 'graph';
+		this.persistState();
+		return true;
+	}
+
+	private handleWipRowOpen = async (
+		e: CustomEvent<{ target: 'compose' | 'review' | 'resolve' | 'agents'; row: GitGraphRow }>,
+	): Promise<void> => {
+		const { target, row } = e.detail;
+		const fallbackRepoPath = this.fallbackRepoPath ?? '';
+		// A WIP row's synthetic sha encodes its own worktree path; any other row type resolves to the
+		// graph's (fallback) repo.
+		const repoPath = getWipRowWorktreePath(row.sha) ?? fallbackRepoPath;
+		const sha = row.kind === ('workdir' satisfies GitGraphRowKind) ? uncommitted : row.sha;
+		await this.openWipDetails(repoPath, sha, target, target === 'agents' ? 'request-agents' : 'request-mode');
 	};
+
+	/** A coach mark's content-supplied action button — the mark's content declares which host command
+	 *  it runs, so no per-mark dispatch lives here. The cast is needed because `gitlens.graph.`-prefixed
+	 *  ids collide with the webview-scoped naming heuristic (`GlWebviewCommands<'graph'>`) even for
+	 *  plain `registerCommand` commands. */
+	private readonly handleCoachMarkAction = async (e: CustomEvent<{ mark: GraphCoachMarkType }>): Promise<void> => {
+		const command = graphCoachMarks[e.detail.mark]?.action?.command;
+		if (command == null) return;
+
+		const commands = await this.services?.commands;
+		void commands?.execute(command as GlExtensionCommands);
+	};
+
+	/** Resolves once `predicate` holds (or a safety timeout elapses). An RPC write resolves when the HOST
+	 *  has written and fired — the resulting state push arrives a transport hop later, so a caller that must
+	 *  re-read settled state after its own write still has to wait for it. Polls with `setTimeout` (not RAF)
+	 *  so it still resolves while the webview is hidden. */
+	private waitForState(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+		if (predicate()) return Promise.resolve();
+
+		return new Promise<void>(resolve => {
+			const start = Date.now();
+			const check = (): void => {
+				if (predicate() || Date.now() - start >= timeoutMs) {
+					resolve();
+					return;
+				}
+
+				setTimeout(check, 32);
+			};
+			setTimeout(check, 32);
+		});
+	}
+
+	/** Waits for the scope's projection to actually apply to the rendered rows (or `timeoutMs`, for
+	 *  scopes that resolve dim-only and never project) — positioning before the restructure lands
+	 *  scrolls the old layout and then yanks to the new one. Poll cadence matches waitForState. */
+	private waitForScopeProjection(timeoutMs = 800): Promise<void> {
+		const applied = (): boolean => this.graph?.isScopeProjectionActive() === true;
+		if (applied()) return Promise.resolve();
+
+		return new Promise<void>(resolve => {
+			const start = Date.now();
+			const check = (): void => {
+				if (applied() || Date.now() - start >= timeoutMs) {
+					resolve();
+					return;
+				}
+
+				setTimeout(check, 32);
+			};
+			setTimeout(check, 32);
+		});
+	}
+
+	protected override willUpdate(changedProperties: Map<PropertyKey, unknown>): void {
+		super.willUpdate(changedProperties);
+
+		// Post-sign-in welcome interstitial — arm on a live account-wall clear (sign-in completed
+		// while the account screen was showing). Skipped when the plan gate would still block the
+		// graph, or when a parked/incoming task action exists (see `_postSignInPending`).
+		const accountGated = this.isAccountGated;
+		if (accountGated) {
+			this._postSignInPending = false;
+		} else if (
+			this._wasAccountGated &&
+			(this.graphState.allowed ?? false) &&
+			this._gatedPendingAction == null &&
+			this.graphState.pendingAction == null
+		) {
+			this._postSignInPending = true;
+		}
+		this._wasAccountGated = accountGated;
+
+		// A task action arriving while the interstitial is up trumps onboarding — yield in willUpdate
+		// so the graph mounts in this same render and the action (consumed in `updated`) doesn't land
+		// in an unmounted subtree.
+		if (this._postSignInPending && this.graphState.pendingAction != null) {
+			this._postSignInPending = false;
+		}
+
+		// Access-gate action parking (#5534) — see `_gatedPendingAction`. In `willUpdate` (not
+		// `updated`) so the same render that raises the wall already has the task copy.
+		const gated = this.isAccessGated;
+		if (gated) {
+			const pending = this.graphState.pendingAction;
+			if (pending != null) {
+				this.graphState.pendingAction = undefined;
+				this._gatedPendingAction = pending;
+			}
+
+			// A sign-out or plan change interrupting a live task: capture it on the flip, before this
+			// render tears the details panel down. An explicit parked action wins over the ambient mode.
+			if (!this._wasAccessGated && this._gatedPendingAction == null) {
+				const task = this.detailsPanelEl?.activeTaskAction;
+				if (task != null) {
+					this._gatedPendingAction =
+						task.action === 'open-compare'
+							? {
+									action: task.action,
+									capturedComparison: {
+										refs: task.compare,
+										graphRepoPath: task.compareGraphRepoPath,
+									},
+								}
+							: task;
+				}
+			}
+		} else if (this._wasAccessGated) {
+			const parked = this._gatedPendingAction;
+			this._gatedPendingAction = undefined;
+			// Only the account wall's rebuild re-delivers a host-held action by itself (its `getState`
+			// early-return sends `pendingAction` without clearing it) — there the parked copy would be
+			// a duplicate. The plan gate goes through the full build, which does clear it, so the parked
+			// copy is the only one left. Consuming only when the rebuild carried nothing covers both.
+			if (parked != null && this.graphState.pendingAction == null) {
+				void this.updateComplete.then(() => this.consumePendingAction(parked));
+			}
+		}
+		this._wasAccessGated = gated;
+	}
 
 	override updated(changedProperties: Map<PropertyKey, unknown>): void {
 		super.updated(changedProperties);
+
+		const deferral = this._dismissals?.get('graph:coachMarks:bannerDeferral');
+		if (deferral != null) {
+			this._bannerDeferredBefore ??= deferral;
+			// Only when the banner is what's actually holding marks back: the header doesn't render
+			// without a repo, so there may be no banner to defer to.
+			if (
+				!deferral &&
+				this.coachMarksAllowed &&
+				isGraphWalkthroughBannerHighlighted({
+					bannerCollapsed: this._dismissals?.get('graph-walkthrough:banner'),
+					graphWalkthroughProgress: this._onboardingState.graphWalkthroughProgress.get(),
+					graphWalkthroughStarted: this.graphState.graphWalkthroughStarted,
+				})
+			) {
+				this._dismissals?.dismiss('graph:coachMarks:bannerDeferral');
+			}
+		}
+
+		// Kick the row-marker merge-target resolve for the current branch (self-deduping per branch id, so
+		// this is a no-op once resolved / while in flight). `graphState` is a `@consume`d context, so a
+		// branch change never lands in `changedProperties` — drive it every render and let the guard filter.
+		this.graphState.ensureRowMarkerMergeTarget();
+
+		// Attach the `.graph` size observer as soon as the graph tree exists — it isn't rendered on the
+		// first update when the account-access screen replaces it (signed out), and `firstUpdated` won't
+		// fire again after sign-in.
+		this.ensureGraphObserved();
+
+		// Arm/disarm the overlay side bar's Esc dismissal — every open/close/pin transition
+		// re-renders, so reconciling here covers them all (rail toggles, auto-collapse, host
+		// config changes).
+		this.sidebarOverlay.ensureEscHandling();
+
+		if (this.shouldShowWelcome && !this._introShownReported) {
+			this._introShownReported = true;
+			emitTelemetrySentEvent(this, {
+				name: 'graph/intro/shown',
+				data: { withLayoutOptions: this.layoutPromptNeeded },
+			});
+		}
+
+		// Start the Launchpad pipeline once `services` first resolves. `services` is a `@consume`d
+		// context value (not a reactive property), so it won't appear in `changedProperties` — guard
+		// with a one-shot flag instead.
+		if (!this._launchpadInitialized && this.services != null) {
+			this._launchpadInitialized = true;
+			void this.accountLaunchpad.initLaunchpad(this.services);
+		}
+
+		// Account-bar context wiring (same `services` one-shot pattern as the Launchpad pipeline above —
+		// `services` is a `@consume`d context value, so it won't appear in `changedProperties`).
+		if (!this._accountContextsInitialized && this.services != null) {
+			this._accountContextsInitialized = true;
+			void this.accountLaunchpad.initAccountContexts(this.services);
+		}
 
 		// Invalidate any captured scope-restore mode on repo switch: a captured `_modeBeforeScope`
 		// always belongs to the repo that was active when `openTimelineScope` ran. If the user
@@ -766,8 +1552,20 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// apply a stale intent. Drop the one-shot scope alongside it for the same reason.
 		const selectedRepository = this.graphState.selectedRepository;
 		if (selectedRepository !== this._wasSelectedRepository) {
-			if (this._wasSelectedRepository !== undefined && this._modeBeforeScope != null) {
+			const isRepoSwitch = this._wasSelectedRepository !== undefined;
+			if (isRepoSwitch && this._modeBeforeScope != null) {
 				this.clearTimelineScope();
+			}
+			// Back/forward history must not jump across repos — drop it on an actual switch.
+			if (isRepoSwitch) {
+				this._nav.reset();
+				this._navExpectedSha = undefined;
+			}
+			// The minimap's brush/scope zoom window is timeline-relative, not repo-relative — carrying
+			// it across a switch re-clamps the old repo's window against the new repo's bounds instead
+			// of showing the full new timeline. `resetZoom()` no-ops when already unzoomed.
+			if (isRepoSwitch) {
+				this.minimapEl?.resetZoom();
 			}
 			this._wasSelectedRepository = selectedRepository;
 		}
@@ -784,7 +1582,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			} else if (scope.focalBranchTipSha != null) {
 				const sha = scope.focalBranchTipSha;
 				this._pendingFocalTipBranchRef = undefined;
-				this.graph?.ensureAndSelectCommit(sha);
+				void this.graph?.navigateToCommit(sha, { source: 'selection-sync', reveal: 'if-changed' });
 			}
 		}
 
@@ -792,9 +1590,15 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		if (detailsVisible !== this._wasDetailsVisible) {
 			this._wasDetailsVisible = detailsVisible;
 			if (detailsVisible) {
+				// First show with no saved details location: save 'auto' to end the first-time
+				// (hidden details) experience. Single chokepoint for every show path, including
+				// host-driven (pending action) shows.
+				if (this.graphState.config?.detailsLocation == null) {
+					fireAndForget(this.updateGraphConfig({ detailsLocation: 'auto' }), 'configuration/update');
+				}
 				const pane = this.querySelector<HTMLElement>('.graph__details-pane');
 				if (pane) {
-					const isBottom = this.graphState.config?.detailsLocation === 'bottom';
+					const isBottom = this.effectiveDetailsLocation === 'bottom';
 					pane.classList.remove('details-opening', '-vertical');
 					void pane.offsetWidth;
 					pane.classList.add('details-opening');
@@ -822,10 +1626,33 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			if (this._wasDisplayMode != null && this._wasDisplayMode !== 'graph') {
 				this._altModeSelectedCommit = undefined;
 			}
+			// `closed` lifecycle telemetry for the alternate display modes. Entry impressions are
+			// emitted by the mounted components themselves (`graph/timeline|treemap|kanban/shown`);
+			// only the exit is recorded here, since this transition check is the single place every
+			// `displayMode` writer (sidebar rail, close buttons, search-request path) funnels through.
+			if (this._wasDisplayMode === 'visualizations') {
+				// Resolve through the shared gate (NOT raw `visualizationMode`) so the reported mode
+				// matches what was actually shown: with the experimental flag off, the wrapper
+				// force-routes to the timeline regardless of a persisted `treemap*` choice, so reading
+				// the raw value here would emit `treemap-*` for a session where only the timeline was
+				// shown — an inconsistent `timeline shown → treemap closed` funnel.
+				emitTelemetrySentEvent(this, {
+					name: 'graph/visualizations/closed',
+					data: {
+						mode: getEffectiveVisualizationKey(
+							this.graphState.visualizationMode,
+							this.graphState.treemapMode,
+							this.graphState.config?.experimentalVisualizationsEnabled === true,
+						),
+					},
+				});
+			} else if (this._wasDisplayMode === 'kanban') {
+				emitTelemetrySentEvent(this, { name: 'graph/kanban/closed', data: {} });
+			}
 			this._wasDisplayMode = displayMode;
 			// Notify the host so it can fetch row stats when entering Visualizations mode (stats are
 			// otherwise only loaded when the minimap or changes column is visible).
-			this._ipc.sendCommand(UpdateGraphDisplayModeCommand, { mode: displayMode });
+			fireAndForget(this.setDisplayMode(displayMode), 'configuration/setDisplayMode');
 		}
 
 		// First-render auto-restore telemetry: panel was visible from persisted state, no explicit
@@ -843,15 +1670,17 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// panel content (slide in from 4px Y — matches the sub-panel-enter used by
 		// review/compose/compare). The panel element is always mounted (always in the split-
 		// panel's `start` slot) so an unconditional `:host` animation would fire at 0 width.
-		const sidebarVisible = this.graphState.sidebar?.visible ?? false;
+		// Keyed on the composite open state, not `visible` alone: `visible` with no panel chosen renders
+		// nothing, and animating that would burn the `opening` reveal on a 0-width panel.
+		const sidebarOpen = this.sidebarOpen;
 		const sidebarActivePanel = this.graphState.sidebar?.activePanel ?? null;
-		const becameVisible = sidebarVisible && !this._wasSidebarVisible;
+		const becameVisible = sidebarOpen && !this._wasSidebarVisible;
 		const activePanelChanged =
-			sidebarVisible &&
+			sidebarOpen &&
 			!becameVisible &&
 			this._wasSidebarActivePanel !== undefined &&
 			sidebarActivePanel !== this._wasSidebarActivePanel;
-		this._wasSidebarVisible = sidebarVisible;
+		this._wasSidebarVisible = sidebarOpen;
 		this._wasSidebarActivePanel = sidebarActivePanel;
 		if (becameVisible || activePanelChanged) {
 			const sidebarPanel = this.sidebarPanelEl;
@@ -875,8 +1704,26 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			void this.updateComplete.then(() => this.consumePendingAction(pendingAction));
 		}
 
-		if (this._pendingScopeToBranch && this.graphState.branch != null) {
-			void this.updateComplete.then(() => this.scopeToBranch());
+		// Handle a cold-show compare request (e.g. a terminal-link range) — warm shows arrive via
+		// `GraphNavigationService.onRequestOpenCompareMode` instead. Mirrors the pendingAction handling above.
+		const pendingCompare = this.graphState.pendingCompare;
+		if (pendingCompare != null) {
+			this.graphState.pendingCompare = undefined;
+			void this.updateComplete.then(() => this.openCompareMode(pendingCompare));
+		}
+
+		if (
+			shouldDrainParkedScopeToBranch(
+				this.graphState.pendingScopeToBranch,
+				this.graphState.branch,
+				this.fallbackRepoPath,
+			)
+		) {
+			void this.updateComplete.then(() => {
+				if (!this.graphState.pendingScopeToBranch) return;
+
+				return this.scopeToBranch();
+			});
 		}
 
 		// Check for external search request (from file history command, etc.)
@@ -902,32 +1749,82 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	}
 
 	resetHover() {
-		this.graphHover.reset();
+		// `graphHover` is null whenever the graph tree isn't rendered — the account-access screen (early
+		// return in `render`) or the no-repository empty state. `onStateUpdate` (graph.ts) only calls this on
+		// state pushes that include `rows` (even `rows: []`), so the optional chaining keeps it safe if one
+		// arrives while either screen is shown.
+		this.graphHover?.reset();
 	}
 
 	override render() {
+		if (this.isAccountGated || this.shouldShowWelcome) {
+			return html`<gl-graph-access-account
+				.intentAction=${this._gatedPendingAction?.action}
+				.welcome=${this.shouldShowWelcome}
+				.liveSignIn=${this._postSignInPending}
+				.showLayoutOptions=${this.layoutPromptNeeded}
+				.upgradedFromPreV19=${this.graphState.upgradedFromPreV19 ?? false}
+				@gl-continue=${this.onWelcomeContinue}
+			></gl-graph-access-account>`;
+		}
+
+		if (!this.graphState.allowed) {
+			return html`<gl-graph-gate .intentAction=${this._gatedPendingAction?.action}></gl-graph-gate>`;
+		}
+
 		const detailsVisible = this.graphState.details?.visible ?? false;
-		const minimapVisible = this.graphState.minimap?.visible ?? true;
+		const minimapVisible = this.minimapShown;
 		const { single, multi } = this.activeSelection;
+		// No repository open: render only the empty state — skip the header and the whole graph subtree
+		// (graph + minimap + sidebar + details) rather than mounting them just to paint the
+		// empty state over the top. `repositories` is `undefined` during the initial load window, so `=== 0`
+		// stays false until an actual `[]` arrives and the graph still renders while loading. This
+		// intentionally mounts/unmounts the graph subtree on the no-repo↔repo transition — acceptable here
+		// because there is no prior graph state to preserve (contrast the always-render remount-avoidance in
+		// `renderDetailsPanel`/`renderGraphPaneContent`, which guards mode switches, not this).
+		const noRepos = this.graphState.repositories?.length === 0;
 		return html`
 			<div class="graph">
-				<gl-graph-header
-					class="graph__header"
-					.selectCommits=${this.selectCommits}
-					.getCommits=${this.getCommits}
-					.detailsVisible=${detailsVisible}
-					.minimapVisible=${minimapVisible}
-					.hasSelectedCommit=${single != null || multi != null}
-					@toggle-sidebar=${this.handleToggleSidebar}
-					@toggle-details=${this.handleToggleDetails}
-					@show-details=${this.handleShowDetails}
-					@toggle-minimap=${this.handleToggleMinimap}
-					@gl-graph-scope-to-branch=${this.handleScopeToBranchFromHeader}
-				></gl-graph-header>
+				${when(
+					!noRepos,
+					() => html`
+						<gl-graph-header
+							class="graph__header"
+							.navigateToCommit=${this.navigateToCommit}
+							.detailsVisible=${detailsVisible}
+							.detailsEffectiveLocation=${this.effectiveDetailsLocation}
+							.detailsLocation=${this.graphState.config?.detailsLocation ?? 'auto'}
+							.detailsAutoLocation=${this._autoEffectiveLocation}
+							.minimapVisible=${minimapVisible}
+							.hasSelectedCommit=${single != null || multi != null}
+							@toggle-sidebar=${this.handleToggleSidebar}
+							@toggle-details=${this.handleToggleDetails}
+							@select-details-location=${this.handleSelectDetailsLocation}
+							@show-details=${this.handleShowDetails}
+							@toggle-minimap=${this.handleToggleMinimap}
+							@jump-to-wip=${this.handleJumpToWip}
+							@gl-search-exit=${this.handleSearchExit}
+							@gl-graph-scope-to-branch=${this.handleScopeToBranchFromHeader}
+							@gl-graph-show-pr-sheet=${this.handleShowPrSheet}
+						></gl-graph-header>
+					`,
+				)}
 				<div class="graph__workspace">
-					${when(!this.graphState.allowed, () => html`<gl-graph-gate class="graph__gate"></gl-graph-gate>`)}
-					<gl-graph-hover id="commit-hover" distance=${0} skidding=${15}></gl-graph-hover>
-					<main id="main" class="graph__panes">${this.renderDetailsPanel()}</main>
+					${
+						noRepos
+							? html`<gl-graph-empty-state class="graph__empty-state"></gl-graph-empty-state>`
+							: html`
+									<gl-graph-hover
+										id="commit-hover"
+										.distance=${0}
+										.skidding=${15}
+										.pushOverlay=${this.pushOverlay}
+										@gl-graph-hoverpeekclosed=${this.handleHoverPeekClosed}
+									></gl-graph-hover>
+									<gl-drag-shift-overlay label="to Resume Dragging"></gl-drag-shift-overlay>
+									<main id="main" class="graph__panes">${this.renderDetailsPanel()}</main>
+								`
+					}
 				</div>
 			</div>
 		`;
@@ -943,37 +1840,79 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		const effectiveSha = single?.sha ?? (fallbackPath != null ? uncommitted : undefined);
 		const effectiveRepoPath = (single ?? multi)?.repoPath ?? fallbackPath;
 		const hasContent = effectiveSha != null || multi != null;
+		// The branch sheet has no selected commit but still fills the pane, so it needs the divider
+		// draggable and maximize live too.
+		const hasPaneContent = hasContent || this._branchSheetOpen;
 		const detailsVisible = this.graphState.details?.visible ?? false;
-		const isBottom = this.graphState.config?.detailsLocation === 'bottom';
-		const persisted = isBottom ? this.graphState.details?.bottomPosition : this.graphState.details?.position;
+		const isBottom = this.effectiveDetailsLocation === 'bottom';
+		const sameSide = isBottom ? this.graphState.details?.bottomPosition : this.graphState.details?.position;
+		// Until a side has been sized, carry the OTHER orientation's proportion across an auto-flip
+		// (an open value < 100) so a wide details panel stays wide-as-tall instead of snapping to the
+		// default. Once the user drags a side, its own key wins (see `detailsPositionKeyForEvent`).
+		const otherSide = isBottom ? this.graphState.details?.position : this.graphState.details?.bottomPosition;
+		const carried = otherSide != null && otherSide < 100 ? otherSide : undefined;
+		const persisted = sameSide ?? carried;
 		const position = detailsVisible ? (persisted ?? 100 - detailsDefaultPct) : 100;
+		// Maximize is bottom-only and a sticky split-panel STATE, not a position write — the pane
+		// overlays the whole container while the graph behind it keeps its exact size, and
+		// `position`/`bottomPosition` stay untouched underneath so restore is exact. The divider is
+		// gated on `detailsVisible` so a stray
+		// flag can't force a hidden panel open. Two independent sources feed it: `panelMaximized`
+		// (persisted panel state) and `sheetMaximized` (transient, derived from the open sheet — never
+		// persisted).
+		const panelMaximized =
+			isBottom && detailsVisible && hasPaneContent && (this.graphState.details?.maximized ?? false);
+		const sheetMaximized = isBottom && detailsVisible && hasPaneContent && this._sheetOpen && this._sheetMaximized;
+		const maximized = panelMaximized || sheetMaximized;
 		return html`<gl-split-panel
 			class=${classMap({ 'graph__details-split': true, '-vertical': isBottom })}
 			orientation=${isBottom ? 'vertical' : 'horizontal'}
 			primary="end"
 			.position=${position}
-			.snap=${hasContent ? this._detailsSnap : undefined}
-			.disabled=${!hasContent}
+			?maximized=${maximized}
+			.snap=${hasPaneContent ? this._detailsSnap : undefined}
+			.disabled=${!hasPaneContent || maximized}
+			?animate=${this._animateDetailsSplit}
 			@gl-split-panel-change=${this.handleDetailsSplitChange}
 			@gl-split-panel-drag-end=${this.handleSplitDragEnd}
 			@gl-split-panel-closed-change=${this.handleDetailsClosedChange}
+			@gl-split-panel-dblclick=${this.handleDetailsSplitDblClick}
 		>
 			<div slot="start" class="graph__graph-pane">${this.renderGraphPaneContent()}</div>
-			<div slot="end" class="graph__details-pane">
+			<div slot="end" class="graph__details-pane" ?inert=${!detailsVisible}>
 				<gl-graph-details-panel
 					sha=${effectiveSha ?? nothing}
 					repo-path=${effectiveRepoPath ?? nothing}
+					?show-maximize=${isBottom}
+					?maximized=${panelMaximized}
+					?sheet-maximized=${sheetMaximized}
+					?graph-ready=${this.detailsCoachMarksEligible}
 					.shas=${multi?.shas}
 					.graphReachability=${single?.reachability}
 					.commitLite=${single?.commitLite}
 					.commitLites=${multi?.commitLites}
 					.showSearchBox=${this.graphState.details?.showSearchBox ?? true}
 					.searchBoxFilter=${this.graphState.details?.searchBoxFilter ?? true}
+					.navigation=${this._navState}
+					.pushOverlay=${this.pushOverlay}
 					@select-commit=${this.handleSelectCommit}
+					@gl-toggle-details-maximized=${this.handleToggleDetailsMaximized}
+					@gl-graph-sheet-stack-change=${this.handleSheetStackChange}
+					@gl-detail-sheet-closing=${this.handleDetailSheetClosing}
+					@gl-nav-back=${this.handleNavBack}
+					@gl-nav-forward=${this.handleNavForward}
 					@gl-graph-details-mode-changed=${this.handleDetailsModeChanged}
+					@gl-graph-details-min-height-changed=${this.handleDetailsMinHeightChanged}
 					@gl-show-search-box-change=${this.handleDetailsShowSearchBoxChange}
 					@gl-search-box-filter-change=${this.handleDetailsSearchBoxFilterChange}
 					@next-steps-shown=${this.handleNextStepsShown}
+					@gl-graph-scope-to-branch=${this.handleScopeToBranchFromHeader}
+					@gl-graph-reveal-location=${this.handleGraphRevealLocation}
+					@gl-graph-show-pr-sheet=${this.handleShowPrSheet}
+					@gl-graph-merge-pull-request=${this.handleMergePullRequest}
+					@gl-graph-pr-compare=${this.handlePrCompare}
+					@gl-graph-pr-review=${this.handlePrReview}
+					@gl-graph-pr-review-changes=${this.handlePrReviewChanges}
 				></gl-graph-details-panel>
 			</div>
 		</gl-split-panel>`;
@@ -992,7 +1931,10 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			return;
 		}
 
-		this.graph?.selectCommits([e.detail.sha], { ensureVisible: true });
+		// A parent-SHA or autolink click usually walks to a neighbor, which the reveal rule leaves in place —
+		// the panel, not the graph, is what the user is reading. It still flashes: the click was theirs, and a
+		// selection that moves without the viewport moving has nothing else marking it.
+		void this.graph?.navigateToCommit(e.detail.sha, { source: 'details', flash: true });
 	}
 
 	private _nextStepsShownWhileHidden = false;
@@ -1003,7 +1945,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			return;
 		}
 
-		this._ipc.sendCommand(TrackGraphDetailsWipShownCommand, undefined);
+		this.trackUsage('action:gitlens.graph.details.wipShown:happened');
 	}
 
 	private renderGraphPaneContent() {
@@ -1014,7 +1956,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		const displayMode = this.effectiveDisplayMode;
 		const isGraphMode = displayMode === 'graph';
 		// Always render the graph subtree to avoid the cascade of remounts (split-panels +
-		// React root + GK GraphContainer) that produces a visible "smaller, then bigger"
+		// graph subtree) that produces a visible "smaller, then bigger"
 		// resize when returning from Visual History. Mirrors the always-render pattern used
 		// by `renderDetailsPanel`. Alternate-mode bodies still mount/unmount on demand.
 		// `gl-graph-kanban-open-session` is listened for at the pane-body level (not on
@@ -1023,40 +1965,362 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// handler. These two subtrees are mutually exclusive sibling render branches — without
 		// hoisting, a bubbled event from the treemap would never reach a listener.
 		return html`
-			<div class="graph__graph-pane-body" @gl-graph-kanban-open-session=${this.handleKanbanOpenSession}>
+			<div
+				class="graph__graph-pane-body"
+				@gl-graph-kanban-open-session=${this.handleKanbanOpenSession}
+				@gl-graph-open-branch=${this.handleOpenBranchSheet}
+			>
 				${when(
 					this.graphState.config?.sidebar,
-					() =>
-						html`<gl-graph-sidebar
-								active-panel=${this.graphState.sidebar?.activePanel ?? nothing}
-								.sidebarVisible=${this.graphState.sidebar?.visible ?? false}
-								@gl-graph-sidebar-toggle=${this.handleSidebarToggle}
-								@gl-graph-sidebar-display-mode-change=${this.handleDisplayModeChange}
-								@gl-graph-sidebar-visualizations-callout-dismiss=${this
-									.handleVisualizationsCalloutDismiss}
-								@gl-graph-sidebar-show-shortcuts=${this.handleShowShortcuts}
-							></gl-graph-sidebar>
-							<gl-graph-keyboard-shortcuts></gl-graph-keyboard-shortcuts>`,
+					() => html`<gl-graph-sidebar
+						active-panel=${this.graphState.sidebar?.activePanel ?? nothing}
+						.sidebarVisible=${this.graphState.sidebar?.visible ?? false}
+						@gl-graph-sidebar-toggle=${this.handleSidebarToggle}
+						@gl-graph-sidebar-display-mode-change=${this.handleDisplayModeChange}
+						@gl-graph-sidebar-show-shortcuts=${this.handleShowShortcuts}
+					></gl-graph-sidebar>`,
 				)}
-				${this.graphState.config?.sidebar
-					? this.renderSidebarSplit(!isGraphMode)
-					: html`<div class="graph__graph-content" ?hidden=${!isGraphMode}>${this.renderGraphMain()}</div>`}
-				${displayMode === 'visualizations'
-					? html`<div class="graph__graph-content">${this.renderVisualizationsMain()}</div>`
-					: nothing}
-				${displayMode === 'kanban'
-					? html`<div class="graph__graph-content">${this.renderKanbanMain()}</div>`
-					: nothing}
+				<!-- Rendered unconditionally (not gated on graph.config.sidebar) — otherwise
+				     keyboardShortcutsEl is undefined with the sidebar config off, and the ? shortcut silently no-ops. -->
+				<gl-graph-keyboard-shortcuts
+					.keymap=${this.keymap}
+					@gl-graph-keyboard-shortcuts-closed=${() => this.graph?.focus()}
+				></gl-graph-keyboard-shortcuts>
+				${
+					this.graphState.config?.sidebar
+						? this.renderSidebarSplit(!isGraphMode)
+						: html`<div class="graph__graph-content" ?hidden=${!isGraphMode}>
+								${this.renderGraphMain()}
+							</div>`
+				}
+				${
+					displayMode === 'visualizations'
+						? html`<div class="graph__graph-content">${this.renderVisualizationsMain()}</div>`
+						: nothing
+				}
+				${
+					displayMode === 'kanban'
+						? html`<div class="graph__graph-content">${this.renderKanbanMain()}</div>`
+						: nothing
+				}
 			</div>
 		`;
 	}
 
 	private renderKanbanMain() {
-		return html`<gl-graph-kanban @gl-graph-kanban-close=${this.handleAlternateModeClose}></gl-graph-kanban>`;
+		return html`<gl-graph-kanban
+			?graph-ready=${this.coachMarksEligible}
+			@gl-graph-kanban-close=${this.handleAlternateModeClose}
+		></gl-graph-kanban>`;
 	}
 
 	private handleShowShortcuts = (): void => {
 		this.keyboardShortcutsEl?.show();
+	};
+
+	/** Branch/tag pill focus → open/close the branch sheet in the details panel, mirroring the pill's
+	 *  pinned state (`detail.open`). Opening ensures the pane is visible. */
+	private handleOpenBranchSheet = (
+		e: CustomEvent<{
+			name?: string;
+			refType?: string;
+			remote?: string | null;
+			sha?: string | null;
+			context?: string;
+			open?: boolean;
+		}>,
+	): void => {
+		if (e.detail.open === false) {
+			// Retires a BRANCH open still waiting on the panel to mount, as well as closing a mounted
+			// one — a close arriving during that wait would otherwise be a no-op and the sheet would
+			// appear after it. Scoped by `_detailsRevealFor`: this event fires on any click-outside
+			// while a ref is pinned, and must not cancel an unrelated in-flight reveal.
+			if (this._detailsRevealFor === 'branch') {
+				this._detailsRevealToken++;
+			}
+			this._branchSheetOpen = false;
+			this.detailsPanelEl?.closeBranchSheet();
+			return;
+		}
+		if (e.detail.name == null) return;
+
+		const ref: BranchSheetRef = {
+			name: e.detail.name,
+			refType: e.detail.refType ?? 'head',
+			remote: e.detail.remote ?? null,
+			sha: e.detail.sha ?? null,
+			context: e.detail.context,
+		};
+		void this.withDetailsPanel(panel => panel.openBranchSheet(ref), 'request-mode', 'branch');
+	};
+
+	/** Whether the branch sheet is open — the details pane can hold content (and so be maximizable/
+	 *  resizable) even with no selected commit. */
+	@state()
+	private _branchSheetOpen = false;
+
+	/** Whether ANY sheet (branch, compare, conflict, rebase-summary) is currently open — the general
+	 *  counterpart of {@link _branchSheetOpen}, gating the transient sheet-maximize. */
+	@state()
+	private _sheetOpen = false;
+
+	/** Transient, derived sheet-maximize — never persisted. Seeded per-kind on open (rebase-summary
+	 *  always, compare when `detailsMaximizeOnMode` is set), toggled by the sheet's own maximize chip,
+	 *  and cleared whenever the sheet stack empties. See {@link releaseSheetMaximize}. */
+	@state()
+	private _sheetMaximized = false;
+
+	/** True for the ~400ms glide after a sheet-maximize release — opts the details split into an
+	 *  animated position change instead of its normal instant snap. Cleared by
+	 *  {@link releaseSheetMaximize}'s timer. */
+	@state()
+	private _animateDetailsSplit = false;
+
+	private _releaseSheetMaximizeTimer?: ReturnType<typeof setTimeout>;
+
+	/** Ends a sheet-maximize engagement with an animated glide back to the panel's normal split.
+	 *  No-op if not currently sheet-maximized. */
+	private releaseSheetMaximize(): void {
+		if (!this._sheetMaximized) return;
+
+		if (this._releaseSheetMaximizeTimer != null) {
+			clearTimeout(this._releaseSheetMaximizeTimer);
+		}
+
+		this._animateDetailsSplit = true;
+		this._sheetMaximized = false;
+		this._releaseSheetMaximizeTimer = setTimeout(() => {
+			this._releaseSheetMaximizeTimer = undefined;
+			this._animateDetailsSplit = false;
+		}, 400);
+	}
+
+	/** A sheet started its animated exit (Esc/X/scrim) — restore early so the maximize glide runs
+	 *  alongside the sheet's own close animation instead of snapping after it finishes. */
+	private readonly handleDetailSheetClosing = (): void => {
+		this.releaseSheetMaximize();
+	};
+
+	/** Monotonic stamp for PR-sheet opens — the payload resolution below can await network, so a
+	 *  newer open (or any newer details reveal) must win over one still resolving. */
+	private _prSheetResolveToken = 0;
+
+	/** Polls the pull requests panel's own fetch to completion (triggering it if it hasn't started) so a
+	 *  stack lookup has data to search — a 5s budget, matching what the panel's own cold load allows.
+	 *  Returns `undefined` when a newer sheet-open superseded this one mid-poll (checked against
+	 *  {@link token}), distinct from the panel legitimately returning no data. */
+	private async ensurePullRequestsPanelData(
+		data: DidGetSidebarDataParams | undefined,
+		token: number,
+	): Promise<DidGetSidebarDataParams | undefined | 'stale'> {
+		if (data?.panel === 'pullRequests') return data;
+
+		this._sidebarActions?.fetchPanel('pullRequests');
+
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline) {
+			await new Promise<void>(resolve => setTimeout(resolve, 50));
+			if (token !== this._prSheetResolveToken) return 'stale';
+
+			data = this._sidebarActions?.state.panels.pullRequests.value.get();
+			if (data?.panel === 'pullRequests') break;
+		}
+
+		return data;
+	}
+
+	/** Resolves a pull request by number to its full payload (and, when it's part of a stack, that
+	 *  stack's layers) before opening the sheet — so the sheet opens once with its final content instead
+	 *  of opening blank and re-rendering when the panel data lands. The open itself rides
+	 *  {@link withDetailsPanel}, the single reveal path every sheet shares. Returns whether a sheet was
+	 *  actually opened, so a caller with a fallback (e.g. opening the pull request on the remote) knows
+	 *  when resolution came up empty. */
+	private async resolveAndOpenPrSheet(
+		target: { number: string } | { stackNumber: number },
+		push: boolean,
+	): Promise<boolean> {
+		const token = ++this._prSheetResolveToken;
+
+		if ('stackNumber' in target) {
+			return this.resolveAndOpenStackSheet(target.stackNumber, push, token);
+		}
+
+		const number = target.number;
+		let data = this._sidebarActions?.state.panels.pullRequests.value.get();
+		let pr = data?.panel === 'pullRequests' ? data.items.find(p => p.number === number) : undefined;
+
+		if (pr == null) {
+			pr = await this._sidebarActions?.findPullRequest(number);
+			// Superseded by a newer resolve call — that call owns success/fallback, not this one.
+			if (token !== this._prSheetResolveToken) return true;
+		}
+
+		if (pr == null) return false;
+
+		let layers: GraphSidebarPullRequest[] | undefined;
+
+		if (pr.stack != null) {
+			const resolved = await this.ensurePullRequestsPanelData(data, token);
+			// Superseded by a newer resolve call, not a failed one — that call owns whether a sheet (or
+			// the url fallback) opens, so this one reports success to avoid a second, stale fallback.
+			if (resolved === 'stale') return true;
+
+			data = resolved;
+			if (data?.panel === 'pullRequests') {
+				// Built directly rather than through `groupPullRequestsByStack`: `pr` may have been
+				// resolved via `findPullRequest` rather than found in the panel's own list (a searched
+				// pull request, or one paged off the list), so the grouping's own member set can be
+				// missing the very pull request the sheet is opening for.
+				const stackNumber = pr.stack.number;
+				const prNumber = pr.number;
+				const members = data.items.filter(p => p.stack?.number === stackNumber);
+				const index = members.findIndex(p => p.number === prNumber);
+				if (index === -1) {
+					members.push(pr);
+				} else {
+					members[index] = pr;
+				}
+				members.sort((a, b) => (b.stack?.position ?? 0) - (a.stack?.position ?? 0));
+
+				layers = members.length >= 2 ? members : undefined;
+			}
+		}
+
+		void this.withDetailsPanel(panel => panel.openPrSheet(pr, layers, { push: push }), 'request-mode');
+		return true;
+	}
+
+	/** Opens the stack-root summary sheet for `stackNumber` — the top layer's own sheet with every
+	 *  layer's data alongside it. Requires the full member set (no paged-off gaps): a partial load falls
+	 *  back to the top loaded member's own (non-root) sheet rather than summarizing an incomplete stack. */
+	private async resolveAndOpenStackSheet(stackNumber: number, push: boolean, token: number): Promise<boolean> {
+		const data = await this.ensurePullRequestsPanelData(
+			this._sidebarActions?.state.panels.pullRequests.value.get(),
+			token,
+		);
+		// Superseded by a newer resolve call — that call owns success/fallback, not this one.
+		if (data === 'stale') return true;
+
+		const entry =
+			data?.panel === 'pullRequests'
+				? groupPullRequestsByStack(data.items).find(e => e.kind === 'stack' && e.number === stackNumber)
+				: undefined;
+		if (entry?.kind !== 'stack') return false;
+
+		const members = entry.members;
+		if (members.length === 0) return false;
+
+		const top = members[0];
+		if (members.length !== entry.size) {
+			void this.withDetailsPanel(panel => panel.openPrSheet(top, members, { push: push }), 'request-mode');
+			return true;
+		}
+
+		void this.withDetailsPanel(
+			panel => panel.openPrSheet(top, members, { push: push, stackRoot: true }),
+			'request-mode',
+		);
+		return true;
+	}
+
+	private handleShowPrSheet = (
+		e: CustomEvent<{ number?: string; stackNumber?: number; push?: boolean; url?: string }>,
+	): void => {
+		const target =
+			e.detail.stackNumber != null
+				? { stackNumber: e.detail.stackNumber }
+				: e.detail.number != null
+					? { number: e.detail.number }
+					: undefined;
+		if (target == null) return;
+
+		const url = e.detail.url;
+		void this.resolveAndOpenPrSheet(target, e.detail.push === true).then(opened => {
+			if (!opened && url != null) {
+				// A synthetic anchor click rides the same webview link interception every PR chip's
+				// own href uses — `window.open` is sandbox-dependent in webviews.
+				const a = document.createElement('a');
+				a.href = url;
+				document.body.appendChild(a);
+				a.click();
+				a.remove();
+			}
+		});
+	};
+
+	/** The pull request sheet's Review with Agent — Launchpad's Start Review flow, agent route, with
+	 *  the pull request pre-selected by url so no picker interrupts. Best-effort: bails if the RPC
+	 *  session is already gone (the legacy fire-and-forget command never surfaced errors either). */
+	private handlePrReview = async (e: CustomEvent<{ url: string }>): Promise<void> => {
+		const commands = await this.services?.commands;
+		// The wizard only auto-selects the pull request when useDefaults rides along with prUrl
+		void commands?.execute('gitlens.startReview', {
+			prUrl: e.detail.url,
+			useDefaults: true,
+			source: { source: 'graph' },
+			showOpenInAgent: 'agent',
+		});
+	};
+
+	/** The pull request sheet's Compare Changes — pushed over the sheet so its back chevron returns there. */
+	private handlePrCompare = (
+		e: CustomEvent<{ leftRef: string; rightRef: string; rightRefType: 'branch' | 'commit' }>,
+	): void => {
+		const repoPath = this.fallbackRepoPath;
+		if (repoPath == null) return;
+
+		void this.withDetailsPanel(
+			panel =>
+				panel.openCompareOverSheet({
+					repoPath: repoPath,
+					leftRef: e.detail.leftRef,
+					leftRefType: 'branch',
+					rightRef: e.detail.rightRef,
+					rightRefType: e.detail.rightRefType,
+				}),
+			'request-compare',
+		);
+	};
+
+	/** The pull request sheet's Review Changes — enters the graph's AI review mode scoped to the
+	 *  changes the pull request introduces (merge-base → head). */
+	private handlePrReviewChanges = (
+		e: CustomEvent<{ leftRef: string; rightRef: string; rightRefType: 'branch' | 'commit' }>,
+	): void => {
+		const repoPath = this.fallbackRepoPath;
+		if (repoPath == null) return;
+
+		void this.withDetailsPanel(
+			panel =>
+				panel.openReviewForComparison({
+					repoPath: repoPath,
+					leftRef: e.detail.leftRef,
+					leftRefType: 'branch',
+					rightRef: e.detail.rightRef,
+					rightRefType: e.detail.rightRefType,
+				}),
+			'request-compare',
+		);
+	};
+
+	private handleMergePullRequest = async (
+		e: CustomEvent<{
+			number: string;
+			stack?: { number: number; position: number };
+			mergeMethod?: 'merge' | 'squash' | 'rebase';
+			confirmed?: boolean;
+		}>,
+	): Promise<void> => {
+		const pullRequest = await this.services?.pullRequest;
+		if (pullRequest == null) return;
+
+		const response = await pullRequest.merge(e.detail.number, {
+			mergeMethod: e.detail.mergeMethod,
+			confirmed: e.detail.confirmed,
+		});
+		if (response?.merged === true) {
+			this.detailsPanelEl?.markPullRequestMerged(e.detail.number, e.detail.stack);
+		}
 	};
 
 	private handleAlternateModeClose = (): void => {
@@ -1097,22 +2361,20 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			const graphFamily = this.fallbackRepoFamily;
 			if (commonPath == null || graphFamily == null || commonPath !== graphFamily) return;
 
-			// `createWipSha` compares `worktreePath` against the GRAPH'S selected repo path (not
-			// commonPath) to decide primary-vs-secondary. Passing commonPath here would return
-			// `uncommitted` whenever `worktreePath === commonPath` — true for any session on the
-			// main worktree (where `resolveGitInfo` sets commonPath = repo.path) — and the details
-			// panel would then paint the graph's primary WIP (i.e., the currently-viewed worktree)
-			// instead of the clicked session's worktree. Mirrors sidebar-panel.ts `resolveAgentAnchor`.
-			const graphRepoPath = this.fallbackRepoPath;
-			if (graphRepoPath == null) return;
+			// Require the graph to have a resolved repo — the details panel can't reconcile a WIP anchor
+			// against a graph that hasn't settled on one yet.
+			if (this.fallbackRepoPath == null) return;
 
+			// The row id keys off the SESSION's worktree, never `commonPath`: a session on the main
+			// worktree has `worktreePath === commonPath`, and keying off the latter would point at
+			// whichever worktree the graph is showing. Mirrors sidebar-panel.ts `resolveAgentAnchor`.
 			const repoPath = worktreePath ?? commonPath;
 			if (repoPath == null || repoPath === '') return;
 
-			const sha = worktreePath != null ? createWipSha(worktreePath, graphRepoPath) : uncommitted;
+			const sha = worktreePath != null ? createWipRowId(worktreePath) : uncommitted;
 
 			// Write the alt-mode slot — kanban's `activeSelection` reads it directly. We deliberately
-			// do NOT call `graph?.ensureAndSelectCommit(sha)` here: the graph is hidden in kanban
+			// do NOT call `graph?.navigateToCommit(sha)` here: the graph is hidden in kanban
 			// mode and its async `gl-graph-change-selection` would race the alt slot via
 			// `handleGraphSelectionChanged`, snapping the details panel back to whatever row the
 			// graph resolved (typically its primary WIP) instead of the clicked session's worktree.
@@ -1136,11 +2398,61 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		}
 	}
 
+	private handleGraphRevealLocation = (
+		e: CustomEvent<{ worktreePath?: string; branchName?: string; upstreamName?: string }>,
+	): void => {
+		void this.dispatchGraphRevealLocation(e.detail);
+	};
+
+	/** Jumps the graph to a "Working in" location row from the agent sheet — reveal-only, never
+	 *  scopes/focuses like `scopeToBranchByName`. Cross-repo worktrees (no wip row, no branch match)
+	 *  silently no-op, same policy as `dispatchKanbanOpenSession`. */
+	private async dispatchGraphRevealLocation(detail: {
+		worktreePath?: string;
+		branchName?: string;
+		upstreamName?: string;
+	}): Promise<void> {
+		try {
+			const { worktreePath, branchName } = detail;
+
+			if (worktreePath != null) {
+				const rowId = createWipRowId(worktreePath);
+				if (this.graphState.wipRowsById?.[rowId] != null) {
+					// No `reveal: 'if-changed'`: an explicit click must scroll the row back into view
+					// even when it's already the selection (just scrolled away).
+					await this.navigateToCommit(rowId, { source: 'jump', flash: true });
+					return;
+				}
+			}
+
+			if (branchName != null) {
+				const repoPath = this.fallbackRepoPath;
+				if (repoPath != null) {
+					const branchId = getBranchId(repoPath, false, branchName);
+					// Overview cascade first — it prefers the branch's WIP row and resolves a tip sha
+					// even when its row isn't loaded (`navigateToCommit` jump-loads); scrape loaded
+					// rows only as the fallback for a branch the overview doesn't carry.
+					const sha =
+						this.getOverviewBranchSelectionSha(branchId) ??
+						this.graphState.rows?.find(r => r.heads?.some(h => h.id === branchId))?.sha;
+					if (sha != null) {
+						await this.navigateToCommit(sha, { source: 'jump', flash: true });
+					}
+				}
+			}
+
+			// No matching row for either the worktree or the branch — silent no-op.
+		} catch (ex) {
+			Logger.error(ex, 'GraphApp.dispatchGraphRevealLocation');
+		}
+	}
+
 	private renderVisualizationsMain() {
 		const placement: 'editor' | 'view' = this.graphState.webviewId === 'gitlens.graph' ? 'editor' : 'view';
 		return html`<gl-graph-visualizations
 			placement=${placement}
 			.scope=${this._timelineScope}
+			?graph-ready=${this.coachMarksEligible}
 			@gl-graph-visualization-mode-change=${this.handleVisualizationModeChange}
 			@gl-graph-timeline-commit-select=${this.handleTimelineCommitSelect}
 			@gl-graph-timeline-config-change=${this.handleTimelineConfigChange}
@@ -1150,10 +2462,16 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		></gl-graph-visualizations>`;
 	}
 
+	/** The side bar is open only when both hold — `visible` can be set with no panel chosen yet, and
+	 *  that combination renders nothing. Every decision about open/closed reads this. */
+	private get sidebarOpen(): boolean {
+		return (this.graphState.sidebar?.visible ?? false) && this.graphState.sidebar?.activePanel != null;
+	}
+
 	private renderSidebarSplit(hidden = false) {
-		const isOpen = (this.graphState.sidebar?.visible ?? false) && this.graphState.sidebar?.activePanel != null;
+		const isOpen = this.sidebarOpen;
 		const sidebarPosition = this.graphState.sidebar?.position ?? sidebarDefaultPct;
-		const sidebarPinned = this.graphState.config?.sidebarPinned ?? true;
+		const sidebarPinned = this.graphState.config?.sidebarPinned ?? false;
 		return html`<gl-split-panel
 			class="graph__sidebar-split"
 			?hidden=${hidden}
@@ -1167,11 +2485,16 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		>
 			<gl-graph-sidebar-panel
 				slot="start"
+				?inert=${!isOpen}
+				?open=${isOpen}
 				active-panel=${this.graphState.sidebar?.activePanel ?? nothing}
 				date-format=${this.graphState.config?.dateFormat ?? nothing}
+				?graph-ready=${this.coachMarksEligible}
 				@gl-graph-sidebar-panel-select=${this.handleSidebarPanelSelect}
+				@gl-graph-show-pr-sheet=${this.handleShowPrSheet}
 				@gl-graph-sidebar-toggle-pinned=${this.handleSidebarTogglePinned}
 				@gl-graph-sidebar-search-box-filter-change=${this.handleSidebarSearchBoxFilterChange}
+				@gl-graph-sidebar-show-past-agents-change=${this.handleSidebarShowPastAgentsChange}
 				@gl-graph-overview-branch-selected=${this.handleOverviewBranchSelected}
 				@gl-graph-overview-recent-threshold-change=${this.handleOverviewRecentThresholdChange}
 				@gl-graph-scope-to-branch=${this.handleScopeToBranchFromHeader}
@@ -1181,11 +2504,11 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	}
 
 	private renderGraphMain() {
-		if (this.graphState.config?.minimap === false) {
+		if (!this.minimapMountable) {
 			return this.renderGraphContent();
 		}
 
-		const minimapVisible = this.graphState.minimap?.visible ?? true;
+		const minimapVisible = this.minimapShown;
 		const minimapPosition = this.graphState.minimap?.position ?? 6;
 		const position = minimapVisible ? minimapPosition : 0;
 		return html`
@@ -1193,6 +2516,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				class="graph__minimap-split"
 				orientation="vertical"
 				primary="start"
+				.anchoredPosition=${true}
 				.position=${position}
 				.snap=${this._minimapSnap}
 				@gl-split-panel-change=${this.handleMinimapSplitChange}
@@ -1202,7 +2526,6 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				<gl-graph-minimap-container
 					slot="start"
 					.activeDay=${this.graphState.activeDay}
-					.disabled=${!this.graphState.config?.minimap}
 					?collapsed=${!minimapVisible}
 					.rows=${this.graphState.rows ?? []}
 					.rowsStats=${this.graphState.rowsStats}
@@ -1213,13 +2536,17 @@ export class GraphApp extends SignalWatcher(LitElement) {
 					.refMetadata=${this.graphState.refsMetadata}
 					.searchResults=${this.graphState.searchResults}
 					.scopeWindow=${this.deriveScopeWindow()}
-					.visibleDays=${this.graphState.visibleDays
-						? { ...this.graphState.visibleDays } // Need to clone the object since it is a signal proxy
-						: undefined}
-					.wipMetadataBySha=${this.graphState.wipMetadataBySha}
+					.visibleDays=${
+						this.graphState.visibleDays
+							? { ...this.graphState.visibleDays } // Need to clone the object since it is a signal proxy
+							: undefined
+					}
+					.wipRowsById=${this.graphState.wipRowsById}
+					.primaryWipRowId=${this.primaryWipRowId}
 					@gl-graph-minimap-selected=${this.handleMinimapDaySelected}
 					@gl-graph-minimap-config-change=${this.handleMinimapConfigChange}
 					@gl-graph-minimap-wheel=${this.handleMinimapWheel}
+					@gl-graph-minimap-zoom-change=${this.handleMinimapZoomChange}
 				></gl-graph-minimap-container>
 				${this.renderGraphContent('end')}
 			</gl-split-panel>
@@ -1227,22 +2554,71 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	}
 
 	private renderGraphContent(slot?: 'end') {
+		// Read once per render — the backing computed memoizes across renders, and the local var keeps
+		// the binding identity-stable for the two reads below. Empty array is the bar's hide condition —
+		// either there's no repo to anchor the primary pill to, or `overviewBar.visibility` hides it.
+		const overviewItems = this.overviewBar.items;
+		// `_selectedCommit.sha` is normalized to `uncommitted` for ALL WIP selections (the graph
+		// collapses secondary WIP rows to `uncommitted` at selection time), so the selected worktree
+		// is identified by `repoPath`, not `sha`. Resolve the selected pill by repoPath so selecting a
+		// secondary WIP highlights its own pill instead of the primary's.
+		const selectedCommit = this._selectedCommit;
+		const selectedWipId =
+			selectedCommit != null && isWipSelectionSha(selectedCommit.sha)
+				? overviewItems.find(i => i.repoPath === selectedCommit.repoPath)?.id
+				: undefined;
 		return html`
 			<div class="graph__graph-column" slot=${ifDefined(slot)}>
+				${
+					overviewItems.length > 0
+						? html`
+								<gl-graph-overview-bar
+									.items=${overviewItems}
+									.selectedId=${selectedWipId}
+									.statsOnHover=${this.graphState.config?.showWorktreeWipStats !== false}
+									?graph-ready=${this.coachMarksEligible}
+									?follow-terminal-revealed=${this._followTerminalRevealed}
+									@gl-graph-overview-bar-jump=${this.overviewBar.onJump}
+									@gl-graph-overview-bar-select=${this.overviewBar.onSelect}
+									@gl-graph-overview-bar-focus=${this.overviewBar.onFocus}
+									@gl-graph-overview-bar-stats-needed=${this.overviewBar.onStatsNeeded}
+									@gl-graph-show-pr-sheet=${this.handleShowPrSheet}
+									@gl-coachmark-action=${this.handleCoachMarkAction}
+								></gl-graph-overview-bar>
+							`
+						: nothing
+				}
+				<gl-graph-health-banner @gl-graph-show-git-health=${this.handleShowGitHealth}></gl-graph-health-banner>
 				<gl-graph-wrapper
+					.anchorShas=${this.activeAnchorShas}
+					.keymap=${this.keymap}
+					.rowMarkerMergeTarget=${this.graphState.rowMarkerMergeTarget}
+					@gl-graph-change-column-mode=${this.handleGraphChangeColumnMode}
 					@gl-graph-change-selection=${this.handleGraphSelectionChanged}
 					@gl-graph-change-visible-days=${this.handleGraphVisibleDaysChanged}
+					@gl-graph-copy-request=${this.handleGraphCopyRequest}
+					@gl-graph-enable-changes-column=${this.handleGraphEnableChangesColumn}
 					@gl-graph-filter-column=${this.handleGraphFilterColumn}
 					@gl-graph-mouse-leave=${this.handleGraphMouseLeave}
+					@gl-graph-scope-to-branch=${this.handleScopeToBranchFromHeader}
+					@gl-graph-navigation-failed=${this.jumpToast.onNavigationFailed}
+					@gl-graph-navigation-loading=${this.jumpToast.onNavigationLoading}
+					@gl-graph-edge-search=${this.jumpToast.onEdgeSearch}
 					@gl-graph-row-context-menu=${this.handleGraphRowContextMenu}
 					@gl-graph-row-double-click=${this.handleGraphRowDoubleClick}
 					@gl-graph-row-hover=${this.handleGraphRowHover}
+					@gl-graph-row-peek=${this.handleGraphRowPeek}
 					@gl-graph-row-unhover=${this.handleGraphRowUnhover}
+					@gl-graph-show-pr-sheet=${this.handleShowPrSheet}
+					@gl-graph-merge-pull-request=${this.handleMergePullRequest}
+					@gl-graph-pr-compare=${this.handlePrCompare}
+					@gl-graph-pr-review=${this.handlePrReview}
+					@gl-graph-pr-review-changes=${this.handlePrReviewChanges}
 					@gl-graph-wip-row-open=${this.handleWipRowOpen}
-					@row-action-hover=${this.handleGraphRowActionHover}
 					@rowhoverstart=${this.handleGraphRowHoverStart}
 					@rowhovertrack=${this.handleGraphRowHoverTrack}
 				></gl-graph-wrapper>
+				${this.jumpToast.render()}
 			</div>
 		`;
 	}
@@ -1261,9 +2637,11 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// Toggling to Visualizations is an in-memory affordance only; users opt back in per session.
 		// `visualizationMode` and `treemapMode` ARE persisted so the user's last visualization choice
 		// (and treemap sub-mode) carries forward across sessions when they re-enter Visualizations.
+		// `maximized` is transient/derived (panel and sheet forms both) — never persisted.
+		const { maximized: _maximized, ...persistedDetails } = gs.details ?? {};
 		const state = {
 			panels: {
-				details: { ...gs.details },
+				details: persistedDetails,
 				sidebar: { ...gs.sidebar },
 				minimap: { ...gs.minimap },
 			},
@@ -1287,12 +2665,39 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		if (e.detail.position <= 0) return;
 
 		const gs = this.graphState;
-		if (gs.minimap?.position !== e.detail.position) {
-			gs.minimap = { position: e.detail.position };
+		// Spread the existing panel state — replacing it would drop `visible`, and a drag-open of a
+		// hidden minimap would then be re-collapsed by the next render's visibility binding.
+		const updates = { ...gs.minimap, position: e.detail.position };
+		// A gesture that opens a not-currently-shown minimap is deliberate (unlike the programmatic
+		// auto-show, which `minimapClosedStateAuthoritative` gates) — pin it so the visibility binding
+		// keeps it open instead of snapping it shut on the next render.
+		if (!this.minimapShown) {
+			updates.visible = true;
 		}
+		gs.minimap = updates;
+	}
+
+	/**
+	 * Whether the split panel's closed state is authoritative for the stored value. Under the `onSearch`
+	 * policy with no pin, the divider position is derived from the search state — and `gl-split-panel`
+	 * echoes `closed-change` for programmatic position updates too, so honoring those events would
+	 * record our own auto-show as a user-chosen pin.
+	 */
+	private get minimapClosedStateAuthoritative(): boolean {
+		const gs = this.graphState;
+		return (gs.config?.minimapDefaultVisibility ?? 'onSearch') !== 'onSearch' || gs.minimap?.visible === true;
 	}
 
 	private handleMinimapClosedChange = (e: CustomEvent<{ closed: boolean; position: number }>): void => {
+		if (!this.minimapClosedStateAuthoritative) {
+			// Drag-to-close of an auto-shown minimap dismisses the current search rather than
+			// storing a value; a programmatic echo leaves everything alone.
+			if (e.detail.closed && this.minimapSearchActive) {
+				this.dismissMinimapForSearch();
+			}
+			return;
+		}
+
 		const gs = this.graphState;
 		if (e.detail.closed) {
 			if (gs.minimap?.visible !== false) {
@@ -1316,6 +2721,11 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		this.persistState();
 	};
 
+	private handleSidebarShowPastAgentsChange = (_e: CustomEvent<boolean>): void => {
+		// State has already been mutated by sidebar-panel; just trigger the debounced persist.
+		this.persistState();
+	};
+
 	private handleDetailsSearchBoxFilterChange = (e: CustomEvent<boolean>): void => {
 		const gs = this.graphState;
 		if (gs.details?.searchBoxFilter !== e.detail) {
@@ -1330,6 +2740,10 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		const gs = this.graphState;
 		if (gs.sidebar?.position !== e.detail.position) {
 			gs.sidebar = { position: e.detail.position };
+			// A pointer drag also persists on `handleSplitDragEnd`; a keyboard resize never fires
+			// that event, so persist here too — the debounced wrapper coalesces the pointer case's
+			// per-move calls into one.
+			this.persistState();
 		}
 	}
 
@@ -1349,7 +2763,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			opened = true;
 		}
 		if (gs.sidebar?.activePanel == null) {
-			next.activePanel = 'worktrees';
+			next.activePanel = 'overview';
 			opened = true;
 		}
 		next.position = e.detail.position;
@@ -1363,17 +2777,36 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		this.persistState();
 	};
 
-	private setSidebarPanel(panel: GraphSidebarPanel): void {
+	private setSidebarPanel(panel: GraphSidebarPanel, options?: { focusFilter?: boolean }): void {
 		const gs = this.graphState;
 		if (gs.sidebar?.activePanel === panel && gs.sidebar?.visible === true) return;
 
 		gs.sidebar = { activePanel: panel, visible: true };
 		this.persistState();
-		this.focusSidebarFilterAfterRender();
+		if (options?.focusFilter !== false) {
+			this.focusSidebarFilterAfterRender();
+		}
 	}
 
 	private focusSidebarFilterAfterRender(): void {
 		void this.updateComplete.then(() => this.sidebarPanelEl?.focusFilter());
+	}
+
+	/** Whether DOM focus is currently inside `root`, walking through shadow roots (an active element's own
+	 *  shadow root can itself have a focused element, and so on). Containment is checked at EVERY level of
+	 *  the descent: `contains` never crosses a shadow boundary, so testing only the deepest active element
+	 *  would miss focus sitting inside a descendant host's shadow tree — the common case here. */
+	private isFocusInside(root: Element | undefined | null): boolean {
+		if (root == null) return false;
+
+		let active: Element | null = document.activeElement;
+		while (active != null) {
+			if (root === active || root.contains(active)) return true;
+
+			active = active.shadowRoot?.activeElement ?? null;
+		}
+
+		return false;
 	}
 
 	private hideSidebar(): void {
@@ -1384,53 +2817,148 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		this.persistState();
 	}
 
+	/** The resolved details location: an explicit `right`/`bottom` config is a pin (ignores width);
+	 *  `auto` (the default) resolves to the width-driven `_autoEffectiveLocation`. Single source of
+	 *  truth for split orientation, the persisted-position key, the open animation, the WIP bar
+	 *  placement, the header toggle, and telemetry. */
+	get effectiveDetailsLocation(): 'right' | 'bottom' {
+		const configured = this.graphState.config?.detailsLocation ?? 'auto';
+		return configured === 'auto' ? this._autoEffectiveLocation : configured;
+	}
+
 	private get detailsPositionKey(): 'position' | 'bottomPosition' {
-		return this.graphState.config?.detailsLocation === 'bottom' ? 'bottomPosition' : 'position';
+		return this.effectiveDetailsLocation === 'bottom' ? 'bottomPosition' : 'position';
+	}
+
+	/** Position key for a split-change/closed-change event, derived from the split-panel's OWN live
+	 *  orientation rather than `effectiveDetailsLocation`. During an `auto` width flip,
+	 *  `_autoEffectiveLocation` updates synchronously while the split's re-render — and the position
+	 *  it emits — lags by one async render; reading the emitting panel's orientation keeps the
+	 *  persisted value in the key that matches the position's orientation. */
+	private detailsPositionKeyForEvent(e: Event): 'position' | 'bottomPosition' {
+		return (e.currentTarget as HTMLElement | null)?.getAttribute('orientation') === 'vertical'
+			? 'bottomPosition'
+			: 'position';
 	}
 
 	private ensureDetailsPosition(): void {
 		const gs = this.graphState;
 		const key = this.detailsPositionKey;
-		// Reset to the default when the stored position is missing or snapped to closed — so
-		// reopening after a drag-to-close shows a usable width instead of a zero-width pane.
-		// Snap lands at exact 100 when the pane is closed; anything less is a usable open width.
+		// Only reset a position that snapped to closed (exact 100) so reopening after a drag-to-close
+		// shows a usable width. Leave an UNSET side unset — `renderDetailsPanel` falls back to the
+		// default, and carries the other orientation's proportion across a flip; persisting a default
+		// here would mark the side "sized" and suppress that carry.
 		const stored = gs.details?.[key];
-		if (stored != null && stored < 100) return;
+		if (stored == null || stored < 100) return;
 
 		gs.details = { [key]: 100 - detailsDefaultPct };
 		this.persistState();
 	}
 
-	private setDetailsVisible(
-		visible: boolean,
-		trigger?: 'toggle' | 'request-compare' | 'request-mode' | 'request-agents' | 'auto-restore',
-	): void {
+	private setDetailsVisible(visible: boolean, trigger?: DetailsVisibleTrigger): void {
 		const gs = this.graphState;
 		if (gs.details?.visible === visible) return;
 
-		gs.details = { visible: visible };
+		// Clear maximize on hide so reopening isn't stuck full-height.
+		gs.details = visible ? { visible: visible } : { visible: visible, maximized: false };
 		this.persistState();
 		this.emitDetailsVisibilityTelemetry(visible, trigger ?? 'toggle');
 	}
 
-	private emitDetailsVisibilityTelemetry(
-		visible: boolean,
-		trigger: 'toggle' | 'request-compare' | 'request-mode' | 'request-agents' | 'auto-restore',
-	): void {
+	/** Persists an explicit placement pick (from the split-toggle's chevron popover). Picking a
+	 *  placement implies wanting to see it, so a hidden panel is shown as part of the pick. */
+	private setDetailsLocation(location: 'auto' | 'right' | 'bottom'): void {
+		const effectiveSide = location === 'auto' ? this._autoEffectiveLocation : location;
+		// Maximize is bottom-only — drop it when the pick lands on the right.
+		if (effectiveSide === 'right' && this.graphState.details?.maximized) {
+			this.graphState.details = { maximized: false };
+		}
+
+		fireAndForget(this.updateGraphConfig({ detailsLocation: location }), 'configuration/update');
+
+		if (!this.graphState.details?.visible) {
+			this.setDetailsVisible(true, 'placement');
+			this.ensureDetailsPosition();
+		}
+	}
+
+	private handleToggleDetailsMaximized = (e: CustomEvent<{ sheet?: boolean } | undefined>): void => {
+		if (e.detail?.sheet) {
+			if (this._sheetMaximized) {
+				this.releaseSheetMaximize();
+			} else {
+				// Engaging is an instant snap, same as the panel's own toggle — only the RELEASE glides.
+				this._sheetMaximized = true;
+			}
+			return;
+		}
+
+		const gs = this.graphState;
+		gs.details = { maximized: !(gs.details?.maximized ?? false) };
+		this.persistState();
+	};
+
+	private handleSheetStackChange = (e: CustomEvent<{ kinds: SheetKind[]; prevKinds: SheetKind[] }>): void => {
+		this.handleBranchSheetStackChange(e.detail.kinds, e.detail.prevKinds);
+
+		const { kinds, prevKinds } = e.detail;
+		this._sheetOpen = kinds.length > 0;
+
+		// Seed per-kind auto-maximize on kind-add; a manual toggle persists across in-stack replaces.
+		if (kinds.includes('rebaseSummary') && !prevKinds.includes('rebaseSummary')) {
+			this._sheetMaximized = true;
+		} else if (
+			kinds.includes('compare') &&
+			!prevKinds.includes('compare') &&
+			(this.graphState.config?.detailsMaximizeOnMode ?? true)
+		) {
+			this._sheetMaximized = true;
+		}
+
+		if (kinds.length === 0 && prevKinds.length > 0) {
+			this.releaseSheetMaximize();
+		}
+	};
+
+	/** The branch sheet opening/closing. Close is an "any path" signal — Esc/X/scrim, the Focus
+	 *  action, the pane's own close request, the selection auto-close, or a graph-initiated close
+	 *  round-tripping through `closeBranchSheet`. Clear the graph's click-pinned ref focus so it
+	 *  never outlives the sheet; `clearRefFocus` is idempotent, so a graph-initiated close looping
+	 *  back here is a no-op. */
+	private handleBranchSheetStackChange(kinds: SheetKind[], prevKinds: SheetKind[]): void {
+		const wasOpen = prevKinds.includes('branch');
+		const isOpen = kinds.includes('branch');
+		if (wasOpen === isOpen) return;
+
+		if (!isOpen) {
+			this._branchSheetOpen = false;
+			this.graph?.clearRefFocus();
+			return;
+		}
+
+		this._branchSheetOpen = true;
+	}
+
+	private emitDetailsVisibilityTelemetry(visible: boolean, trigger: DetailsVisibleTrigger): void {
 		if (visible) {
-			this._detailsShownAt = performance.now();
+			// `??=`, not `=`: the WIP-bar re-anchors an already-open panel by calling this directly
+			// (setDetailsVisible short-circuits when visibility is unchanged). Only start the dwell
+			// clock on a genuine open — a re-anchor must not reset it, or `graphDetails/closed`
+			// `duration` would measure from the last pill click instead of the original open.
+			// `_detailsShownAt` is cleared to undefined on close, so genuine opens still set it.
+			this._detailsShownAt ??= performance.now();
 			const { single, multi } = this.activeSelection;
 			const selectionCount = multi != null ? multi.shas.length : single != null ? 1 : 0;
 			const selectedSha = single?.sha;
 			const effectivelyUncommitted =
-				isWipSha(selectedSha) || (single == null && multi == null && this.fallbackRepoPath != null);
+				isWipSelectionSha(selectedSha) || (single == null && multi == null && this.fallbackRepoPath != null);
 			if (effectivelyUncommitted && this._nextStepsShownWhileHidden) {
 				this._nextStepsShownWhileHidden = false;
-				this._ipc.sendCommand(TrackGraphDetailsWipShownCommand, undefined);
+				this.trackUsage('action:gitlens.graph.details.wipShown:happened');
 			}
-			const host = this.graphState.webviewId === 'gitlens.graph' ? 'editor' : 'panel';
-			const location = this.graphState.config?.detailsLocation === 'bottom' ? 'bottom' : 'right';
-			this._telemetry.sendEvent({
+			const host = this.graphState.webviewId === 'gitlens.graph' ? 'editor' : 'view';
+			const location = this.effectiveDetailsLocation;
+			emitTelemetrySentEvent(this, {
 				name: 'graphDetails/shown',
 				data: {
 					trigger: trigger,
@@ -1445,14 +2973,48 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		} else {
 			const duration = this._detailsShownAt != null ? performance.now() - this._detailsShownAt : 0;
 			this._detailsShownAt = undefined;
-			this._telemetry.sendEvent({
+			emitTelemetrySentEvent(this, {
 				name: 'graphDetails/closed',
 				data: { duration: duration, mode: this.detailsPanelEl?.currentMode ?? 'none' },
 			});
 		}
 	}
 
+	/** The details panel re-measured its rigid minimum (fired from the panel's own `updated()`, so it
+	 *  can't race the panel's first render). Re-clamp the bottom-docked split so a persisted or
+	 *  default position below the minimum is corrected without a gesture; horizontal (right-docked)
+	 *  placement is width-driven and must not be height-clamped. */
+	private handleDetailsMinHeightChanged = () => {
+		if (this.effectiveDetailsLocation !== 'bottom') return;
+
+		this.detailsSplitEl?.refreshSnap();
+	};
+
 	private handleDetailsModeChanged = (e: CustomEvent<{ previous: GraphDetailsMode; current: GraphDetailsMode }>) => {
+		// compose/review opened/closed track real activeMode transitions and fire regardless of
+		// panel visibility (programmatic exits like compose/applyPlan clear activeMode without a
+		// user-driven open/close).
+		this.trackModeOpenedClosed('compose', e.detail.previous, e.detail.current);
+		this.trackModeOpenedClosed('review', e.detail.previous, e.detail.current);
+		this.trackModeOpenedClosed('resolve', e.detail.previous, e.detail.current);
+
+		// `graph.details.maximizeOnMode`: auto-maximize the bottom-docked details panel when entering a
+		// mode (compose/review/resolve/compare), and restore when leaving it. Mode→mode transitions leave
+		// the state alone, so a manual toggle mid-mode is respected.
+		if (this.graphState.config?.detailsMaximizeOnMode ?? true) {
+			const wasMode = this.isMaximizeMode(e.detail.previous);
+			const isMode = this.isMaximizeMode(e.detail.current);
+			if (isMode && !wasMode) {
+				if (this.effectiveDetailsLocation === 'bottom' && !(this.graphState.details?.maximized ?? false)) {
+					this.graphState.details = { maximized: true };
+					this.persistState();
+				}
+			} else if (wasMode && !isMode && this.graphState.details?.maximized) {
+				this.graphState.details = { maximized: false };
+				this.persistState();
+			}
+		}
+
 		// `shown`/`closed` already capture mode at open/close — only emit transitions while the
 		// panel stays visible (e.g. swap-to-close, mode chip toggles), so the event isolates
 		// in-panel transitions from open/close noise.
@@ -1460,36 +3022,67 @@ export class GraphApp extends SignalWatcher(LitElement) {
 
 		switch (e.detail.current) {
 			case 'review':
-				this._ipc.sendCommand(TrackGraphDetailsReviewModeCommand, undefined);
+				this.trackUsage('action:gitlens.graph.details.reviewMode:happened');
 				break;
 			case 'compose':
-				this._ipc.sendCommand(TrackGraphDetailsComposeModeCommand, undefined);
+				this.trackUsage('action:gitlens.graph.details.composeMode:happened');
+				break;
+			case 'resolve':
+				this.trackUsage('action:gitlens.graph.details.resolveMode:happened');
 				break;
 			case 'compare':
-				this._ipc.sendCommand(TrackGraphDetailsCompareModeCommand, undefined);
+				this.trackUsage('action:gitlens.graph.details.compareMode:happened');
 				break;
 		}
 
-		this._telemetry.sendEvent({
+		emitTelemetrySentEvent(this, {
 			name: 'graphDetails/mode/changed',
 			data: { 'mode.old': e.detail.previous, 'mode.new': e.detail.current },
 		});
 	};
+
+	/** The panel modes that auto-maximize the bottom-docked panel on entry (gated by
+	 *  `graph.details.maximizeOnMode`). Compare only ever reports as a sheet — see
+	 *  {@link handleSheetStackChange}'s own auto-maximize seeding. */
+	private isMaximizeMode(mode: GraphDetailsMode): boolean {
+		return mode === 'compose' || mode === 'review' || mode === 'resolve';
+	}
+
+	private trackModeOpenedClosed(
+		mode: 'compose' | 'review' | 'resolve',
+		previous: GraphDetailsMode,
+		current: GraphDetailsMode,
+	): void {
+		if (current === mode && previous !== mode) {
+			emitTelemetrySentEvent(this, { name: `graphDetails/${mode}/opened`, data: {} });
+		} else if (previous === mode && current !== mode) {
+			emitTelemetrySentEvent(this, { name: `graphDetails/${mode}/closed`, data: {} });
+		}
+	}
 
 	private handleDetailsSplitChange(e: CustomEvent<{ position: number }>) {
 		// Skip the closed-edge position (snap lands at exact 100). `handleDetailsClosedChange`
 		// owns visibility; recording position=100 here would clobber the last open width.
 		if (e.detail.position >= 100) return;
 
-		this.graphState.details = { [this.detailsPositionKey]: e.detail.position };
+		this.graphState.details = { [this.detailsPositionKeyForEvent(e)]: e.detail.position };
 	}
+
+	private handleDetailsSplitDblClick = (e: Event): void => {
+		// The agent-status split inside the details panel emits the same composed event — only
+		// reset when the double-click came from this splitter's own divider.
+		if (e.target !== e.currentTarget) return;
+
+		this.graphState.details = { [this.detailsPositionKeyForEvent(e)]: 100 - detailsDefaultPct };
+		this.persistState();
+	};
 
 	private handleDetailsClosedChange = (e: CustomEvent<{ closed: boolean; position: number }>): void => {
 		const gs = this.graphState;
 		if (e.detail.closed) {
 			this.setDetailsVisible(false);
 		} else if (gs.details?.visible !== true) {
-			gs.details = { [this.detailsPositionKey]: e.detail.position };
+			gs.details = { [this.detailsPositionKeyForEvent(e)]: e.detail.position };
 			this.setDetailsVisible(true, 'toggle');
 		}
 	};
@@ -1501,58 +3094,166 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		}
 	};
 
+	private handleJumpToWip = (): void => {
+		if (this.effectiveDisplayMode !== 'graph') return;
+
+		const scope = this.graphState.scope;
+		const { branchesVisibility, includeOnlyRefs, branch } = this.graphState;
+		// Only clear the scope when the WIP row isn't actually rendered under it — and ask the very
+		// predicate the wrapper renders by rather than re-deriving it. The old `scope.branchRef !==
+		// branch?.id` re-derivation drifted the moment that predicate stopped treating an unknown branch
+		// as a mismatch: it kept clearing the scope for a row that was already on screen. It also read
+		// "match" for a detached HEAD scoped from the overview (a detached id is SHA-keyed, so both sides
+		// agreed) and skipped the clear for a row the gate hides — foreclosed now that `setScope` rejects
+		// detached scopes at creation, so that leg is defense-in-depth against relaxing THAT guard.
+		// Same rows-derived signal the wrapper feeds the predicate — omitting it here answered a different
+		// question from the one that decided what's on screen, so an unknown branch with a loaded
+		// off-HEAD focal had the wrapper hiding the row while this believed it existed and tried to
+		// select it.
+		const scopeFocalIsHead = branch == null ? isScopeFocalHead(this.graphState.rows, scope) : undefined;
+		if (
+			scope != null &&
+			!shouldShowPrimaryWipRow(branchesVisibility, includeOnlyRefs, branch, scope, scopeFocalIsHead)
+		) {
+			// Nothing to jump to if it wouldn't render unscoped either — leave the scope alone.
+			if (!shouldShowPrimaryWipRow(branchesVisibility, includeOnlyRefs, branch, undefined)) return;
+
+			this.graphState.clearScope();
+		}
+
+		void this.graph?.navigateToCommit(uncommitted, { source: 'wip', flash: true });
+	};
+
 	private handleToggleDetails(e: CustomEvent<{ altKey?: boolean } | void>) {
 		if (e.detail?.altKey) {
-			const next = this.graphState.config?.detailsLocation === 'bottom' ? 'right' : 'bottom';
-			this._ipc.sendCommand(UpdateGraphConfigurationCommand, { changes: { detailsLocation: next } });
+			// Pin to the opposite of the current effective side — this disables `auto` (the value is
+			// an explicit `right`/`bottom`) and gives immediate visual feedback. Reset to `auto` via
+			// the placement popover to re-enable width-aware behavior.
+			const next = this.effectiveDetailsLocation === 'bottom' ? 'right' : 'bottom';
+			this.setDetailsLocation(next);
 			return;
 		}
 
 		const gs = this.graphState;
 		if (gs.details?.visible) {
+			const focusWasInside = this.isFocusInside(this.detailsPanelEl);
 			this.setDetailsVisible(false);
+			void this.updateComplete.then(() => {
+				if (focusWasInside) {
+					this.graph?.focus();
+				}
+			});
 		} else {
 			this.setDetailsVisible(true, 'toggle');
 			this.ensureDetailsPosition();
 		}
 	}
 
+	private handleSelectDetailsLocation(e: CustomEvent<{ location: 'auto' | 'right' | 'bottom' }>) {
+		this.setDetailsLocation(e.detail.location);
+	}
+
+	/**
+	 * Toggles the minimap by writing the stored per-workspace value — never the
+	 * `gitlens.graph.minimap.defaultVisibility` policy, so `onSearch` stays reachable
+	 * (pin → unpin → on-search). The one exception is hiding a minimap that's only up because of a
+	 * search: that dismisses the current search rather than storing anything, so the next search
+	 * brings it back.
+	 */
 	private handleToggleMinimap() {
-		if (this.graphState.config?.minimap === false) {
-			this._ipc.sendCommand(UpdateGraphConfigurationCommand, { changes: { minimap: true } });
+		const gs = this.graphState;
+		if (this.minimapShown && !this.minimapClosedStateAuthoritative) {
+			this.dismissMinimapForSearch();
 			return;
 		}
 
-		const gs = this.graphState;
-		gs.minimap = { visible: !(gs.minimap?.visible ?? true) };
+		gs.minimap = { visible: !this.minimapShown };
 		this.persistState();
 	}
 
 	private handleToggleSidebar() {
 		const gs = this.graphState;
-		const stashed = this._sidebarVisibleAtAutoCollapse;
-		this._sidebarVisibleAtAutoCollapse = undefined;
-		const wasVisible = stashed ?? gs.sidebar?.visible ?? false;
-		if (wasVisible) {
+		const stashed = this.sidebarOverlay.takeOpenAtAutoCollapse();
+		const wasOpen = stashed ?? this.sidebarOpen;
+		if (wasOpen) {
+			const focusWasInside = this.isFocusInside(this.sidebarPanelEl);
 			this.hideSidebar();
+			if (focusWasInside) {
+				this.graph?.focus();
+			}
 		} else {
-			this.setSidebarPanel(gs.sidebar?.activePanel ?? 'branches');
+			this.setSidebarPanel(gs.sidebar?.activePanel ?? 'overview');
+		}
+	}
+
+	private onWelcomeContinue(e: CustomEvent<{ layoutChoice?: 'sidebar' | 'panel' | 'dismissed' }>): void {
+		this._postSignInPending = false;
+		// Optimistic dismissal — flips `graph:intro` locally so `shouldShowWelcome` goes false and the
+		// welcome unmounts without waiting for the host echo; persists via the onboarding RPC.
+		this._dismissals?.dismiss('graph:intro');
+
+		const choice = e.detail?.layoutChoice ?? 'dismissed';
+		// Preserve layout analytics: fire only when the layout section was actually shown.
+		if (this.layoutPromptNeeded) {
+			emitTelemetrySentEvent(this, {
+				name: 'graph/layoutPrompt/choice',
+				data: { choice: choice },
+			});
+		}
+
+		// One-and-done: dismisses `graph:layoutPrompt` host-side and moves the view for sidebar/panel;
+		// `dismissed` just dismisses with no move. Rides the `welcome` service, not the shared
+		// navigation plane, so the
+		// dismissal write and the view move ride the same causally-ordered RPC message (see
+		// docs/webview-architecture.md).
+		if (this.services != null) {
+			notifyService(this.services.welcome, 'welcome/continueToGraph', svc =>
+				svc.continueToGraph({ layoutChoice: choice }),
+			);
+		}
+	}
+
+	/** Opens `panel` with the same semantics the rail icon click uses: from a non-graph display mode,
+	 *  switch to graph and open the panel; clicking/pressing the already-open active panel closes the
+	 *  sidebar; otherwise switches the sidebar to that panel. Shared by the rail click
+	 *  (`handleSidebarToggle`) and the Alt+digit shortcut, so the two can't drift. */
+	private activateSidebarPanel(panel: GraphSidebarPanel, options?: { focusFilter?: boolean }): void {
+		const gs = this.graphState;
+
+		// From a visualization/kanban mode the rail icons return to the graph with the chosen panel
+		// open rather than toggling — a click here always means "show me this in the graph". Written
+		// inline (not via `setSidebarPanel`) so the `displayMode` change is always persisted: the
+		// preserved `gs.sidebar` state can already match this panel, and `setSidebarPanel` early-returns
+		// without persisting in that case.
+		if ((gs.displayMode ?? 'graph') !== 'graph') {
+			gs.displayMode = 'graph';
+			gs.sidebar = { activePanel: panel, visible: true };
+			this.persistState();
+			if (options?.focusFilter !== false) {
+				this.focusSidebarFilterAfterRender();
+			}
+
+			return;
+		}
+
+		if (gs.sidebar?.visible && gs.sidebar?.activePanel === panel) {
+			const focusWasInside = this.isFocusInside(this.sidebarPanelEl);
+			this.hideSidebar();
+			if (focusWasInside) {
+				this.graph?.focus();
+			}
+		} else {
+			this.setSidebarPanel(panel, options);
 		}
 	}
 
 	private handleSidebarToggle(e: CustomEvent<GraphSidebarToggleEventDetail>) {
-		const gs = this.graphState;
-		const panel = e.detail.panel;
-		if (gs.sidebar?.visible && gs.sidebar?.activePanel === panel) {
-			this.hideSidebar();
-		} else {
-			this.setSidebarPanel(panel);
-		}
+		this.activateSidebarPanel(e.detail.panel);
 	}
 
 	private handleSidebarTogglePinned = (): void => {
-		const next = !(this.graphState.config?.sidebarPinned ?? true);
-		this._ipc.sendCommand(UpdateGraphConfigurationCommand, { changes: { sidebarPinned: next } });
+		const next = !(this.graphState.config?.sidebarPinned ?? false);
+		fireAndForget(this.updateGraphConfig({ sidebarPinned: next }), 'configuration/update');
 	};
 
 	private handleDisplayModeChange = (e: CustomEvent<GraphSidebarDisplayModeChangeEventDetail>): void => {
@@ -1574,15 +3275,24 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		this.persistState();
 	};
 
-	private handleVisualizationsCalloutDismiss = (): void => {
-		const gs = this.graphState;
-		if (gs.visualizationsButtonCalloutDismissed) return;
+	/** Toggles into/out of a display mode with the same semantics as the rail's bottom toggle click
+	 *  (`sidebar.ts`'s `handleDisplayModeToggle`): the active mode returns to graph, any other mode
+	 *  switches directly to it. Routes through `handleDisplayModeChange` — the same handler the rail's
+	 *  click drives via `gl-graph-sidebar-display-mode-change` — so there is one behavior, not two. */
+	private toggleDisplayMode(mode: Exclude<GraphDisplayMode, 'graph'>): void {
+		const current = this.graphState.displayMode ?? 'graph';
+		const next: GraphDisplayMode = current === mode ? 'graph' : mode;
+		this.handleDisplayModeChange(
+			new CustomEvent<GraphSidebarDisplayModeChangeEventDetail>('gl-graph-sidebar-display-mode-change', {
+				detail: { mode: next },
+			}),
+		);
+	}
 
-		// Optimistic flip — the host echo via `DidChangeVisualizationsButtonCallout` would otherwise
-		// leave the callout glowing for a frame after the user has already clicked.
-		gs.visualizationsButtonCalloutDismissed = true;
-		this._ipc.sendCommand(DismissVisualizationsButtonCalloutCommand, undefined);
-	};
+	/** One-shot guard: `shown` telemetry per webview session, not per mount — the welcome screen's
+	 *  full-viewport early-return can unmount/remount (e.g. a sign-out/sign-in cycle, or the Pro gate
+	 *  toggling), and a remount must not mint a second impression. */
+	private _introShownReported = false;
 
 	private handleTimelineCommitSelect = (e: CustomEvent<GlGraphTimelineCommitSelectDetail>): void => {
 		// Defensive — the timeline element only exists in timeline mode, but a queued event could
@@ -1633,6 +3343,29 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		this.persistState();
 	};
 
+	/** Opens Repository Health from the in-graph health banner — same target as picking Health from
+	 *  the visualizations switcher, plus the graph→visualizations entry the switcher never needs
+	 *  because it only renders once already in visualizations mode. */
+	private handleShowGitHealth = (): void => {
+		const gs = this.graphState;
+		gs.visualizationMode = 'health';
+		// Mirrors `handleVisualizationModeChange`'s guard: a user-driven pick must clear any pending
+		// scope-restore mode, or `handleTimelineScopeApplied` could clobber this choice later.
+		this._modeBeforeScope = undefined;
+
+		if (gs.displayMode !== 'visualizations') {
+			// Mirrors `handleDisplayModeChange`'s own gate on entering 'visualizations' — a fresh
+			// entry primes rowsStats the same way the sidebar rail toggle and the visualizations
+			// switcher already do, in case the user switches to Visual History from here.
+			if (!gs.rowsStatsIncluded) {
+				gs.rowsStatsLoading = true;
+			}
+			gs.displayMode = 'visualizations';
+		}
+
+		this.persistState();
+	};
+
 	private handleVisualizationModeChange = (e: CustomEvent<GraphVisualizationModeChangeDetail>): void => {
 		const gs = this.graphState;
 		if (gs.visualizationMode === e.detail.mode) return;
@@ -1654,9 +3387,24 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	};
 
 	private handleSidebarPanelSelect(e: CustomEvent<GraphSidebarPanelSelectEventDetail>): void {
-		this.graph?.ensureAndSelectCommit(e.detail.sha);
-		if (this.shouldAutoCollapseOverlay()) {
-			this.graph?.focus();
+		const navigate = () =>
+			void this.graph?.navigateToCommit(e.detail.sha, { source: 'sidebar', flash: true, ref: e.detail.name });
+
+		if (e.detail.scoped) {
+			// The select's own scope event is restructuring the view — position once that lands, not
+			// against the outgoing layout.
+			void this.waitForScopeProjection().then(navigate);
+		} else if (e.detail.canFocus) {
+			this.sidebarOverlay.deferSelectNavigation(navigate);
+		} else {
+			// This select supersedes any navigation still held for a previous row — without the clear,
+			// the stale timer fires after this immediate navigation and snaps the graph back.
+			this.sidebarOverlay.cancelSelectNavigation();
+			navigate();
+		}
+
+		if (this.sidebarOverlay.shouldAutoCollapse()) {
+			this.sidebarOverlay.deferFocusHandoff();
 		}
 
 		// Agent leaves carry a `sessionId`; when present, open the details panel anchored on the
@@ -1685,7 +3433,10 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	private async dispatchAgentHighlight(sessionId: string): Promise<void> {
 		try {
 			await this.updateComplete;
-			this.detailsPanelEl?.highlightAgentSession(sessionId);
+			// On a cold graph the panel mounts a few frames after `setDetailsVisible(true)` — one
+			// update cycle isn't enough when the highlight's own invocation just opened it.
+			const panel = this.detailsPanelEl ?? (await this.waitForDetailsPanel());
+			panel?.highlightAgentSession(sessionId);
 		} catch (ex) {
 			Logger.error(ex, 'GraphApp.dispatchAgentHighlight');
 		}
@@ -1695,7 +3446,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		const gs = this.graphState;
 		if (gs.overviewRecentThreshold === e.detail.threshold) return;
 
-		// The overview panel sends the `GetOverviewRequest` itself — graph-app only owns the
+		// The overview panel sends the `getOverview` RPC call itself — graph-app only owns the
 		// persisted signal + `graph:state` memento write (mirrors `handleTimelineConfigChange`).
 		gs.overviewRecentThreshold = e.detail.threshold;
 		this.persistState();
@@ -1704,19 +3455,47 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	private async handleOverviewBranchSelected(
 		e: CustomEvent<{ branchId: string; branchName: string; mergeTargetTipSha?: string }>,
 	): Promise<void> {
-		// Await scope publish so the post-scope `ensureAndSelectCommit` runs against the settled
+		// Toggle: clicking the card whose branch is already the active scope clears the scope
+		// instead of re-scoping. Mirror the overview bar's scope-clearing click — clear, wait for
+		// the host round-trip to settle, then re-reveal the branch so the user keeps their place.
+		if (this.graphState.scope?.branchRef === e.detail.branchId) {
+			this.graphState.clearScope();
+			// Same settled-state predicate as the overview bar's scope-clearing click.
+			await this.waitForState(
+				() => this.graphState.scope == null && this.graph?.isScopeProjectionActive() !== true,
+			);
+
+			const sha = this.getOverviewBranchSelectionSha(e.detail.branchId);
+			if (sha != null) {
+				void this.graph?.navigateToCommit(sha, { source: 'overview', flash: true, ref: e.detail.branchName });
+			}
+
+			if (this.sidebarOverlay.shouldAutoCollapse()) {
+				this.graph?.focus();
+			}
+
+			return;
+		}
+
+		// Await scope publish so the post-scope `navigateToCommit` runs against the settled
 		// GK row index — eliminates the "WIP-not-selected on first scope" race where the bare
 		// publish hadn't yet been replaced by the anchored publish at selection time.
 		await this.scopeToBranchById(e.detail.branchId, e.detail.mergeTargetTipSha);
 		// Supersession guard: a concurrent click on another branch can land while our `await` is
 		// parked, publishing a different scope. If `this.graphState.scope` is no longer for our
 		// branch by the time we resume, the newer scope owns the selection — don't fire a stale
-		// `ensureAndSelectCommit` against the wrong scope.
+		// `navigateToCommit` against the wrong scope.
+		if (this.graphState.scope?.branchRef !== e.detail.branchId) return;
+
+		// Wait for the projection to actually restructure the rows before positioning — otherwise the
+		// scroll runs against the outgoing layout and then yanks to the new one once it lands.
+		await this.waitForScopeProjection();
+		// Same supersession guard: a newer scope can land during this second wait too.
 		if (this.graphState.scope?.branchRef !== e.detail.branchId) return;
 
 		const sha = this.getOverviewBranchSelectionSha(e.detail.branchId);
 		if (sha != null) {
-			this.graph?.ensureAndSelectCommit(sha);
+			void this.graph?.navigateToCommit(sha, { source: 'overview', flash: true, ref: e.detail.branchName });
 		}
 
 		// If the user clicked the card without first hovering, the merge-target tip SHA isn't known
@@ -1727,7 +3506,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			void this.ensureOverviewBranchMergeTarget(e.detail.branchId);
 		}
 
-		if (this.shouldAutoCollapseOverlay()) {
+		if (this.sidebarOverlay.shouldAutoCollapse()) {
 			this.graph?.focus();
 		}
 	}
@@ -1759,43 +3538,98 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		if (branch == null) return undefined;
 
 		return getOverviewBranchSelectionSha(branch, {
-			wipMetadataBySha: this.graphState.wipMetadataBySha,
+			wipRowsById: this.graphState.wipRowsById,
+			primaryWipRowId: this.primaryWipRowId,
 			rows: this.graphState.rows,
 			branchesVisibility: this.graphState.branchesVisibility,
 			includeOnlyRefs: this.graphState.includeOnlyRefs,
+			scope: this.graphState.scope,
+			currentBranch: this.graphState.branch,
 		});
 	}
 
-	private async handleScopeToBranchFromHeader(
-		e: CustomEvent<{ branchName: string; upstreamName?: string }>,
+	private handleScopeToBranchFromHeader(
+		e: CustomEvent<
+			GraphScopeBranch & {
+				source?: GraphScopeSource;
+				additional?: { branchName: string; remote?: boolean }[];
+				origin?: GraphScopeOrigin;
+			}
+		>,
+	): Promise<void> {
+		// A scope supersedes a sidebar select's held navigation — the scope path navigates on its own.
+		this.sidebarOverlay.cancelSelectNavigation();
+
+		// The scope carries additional branches as ref ids, so resolve them against the same repo path
+		// `scopeToBranchByName` builds the focal ref from — a mismatched path yields ids that match no row.
+		const repoPath = this.fallbackRepoPath;
+		const additional = e.detail.additional;
+		return this.scopeToBranchByName(e.detail.branchName, e.detail.upstreamName, {
+			remote: e.detail.remote,
+			source: e.detail.source,
+			origin: e.detail.origin,
+			additionalBranchRefs:
+				additional?.length && repoPath != null
+					? additional.map(b => getBranchId(repoPath, b.remote ?? false, b.branchName))
+					: undefined,
+		});
+	}
+
+	/** Focuses (scopes) the graph onto an arbitrary branch by name. Shared by the header popover, the
+	 *  sidebar/overview events, and the Focus on Branch/Worktree context-menu commands (via the
+	 *  `scope-to-branch` action). */
+	private async scopeToBranchByName(
+		branchName: string,
+		upstreamName?: string,
+		options?: {
+			remote?: boolean;
+			source?: GraphScopeSource;
+			additionalBranchRefs?: string[];
+			origin?: GraphScopeOrigin;
+		},
 	): Promise<void> {
 		// Use the selected repo's actual path (the opened workspace's path). That's what the host
 		// passes as `this.repository.path` when building the graph's row index AND the
-		// `wipMetadataBySha` branchRefs, so any scope/lookup branchRef constructed here must use
+		// `wipRowsById` branchRefs, so any scope/lookup branchRef constructed here must use
 		// the same path to match. In primary-repo workspaces `path === commonPath`; in worktree
 		// workspaces they differ — picking `commonPath` produces a synthetic id that won't match
 		// any row or WIP entry.
 		const repoPath = this.fallbackRepoPath;
 		if (repoPath == null) return;
 
-		const { branchName, upstreamName } = e.detail;
+		const remote = options?.remote ?? false;
+		const source = options?.source ?? 'popover';
 
 		// Prefer the overview path so the merge target is resolved consistently with the overview card.
-		const overview = this.graphState.overview;
+		// Skipped for a remote branch — the overview lists local branches, so a name hit there would be
+		// a different ref entirely (a local `origin/x` is a legal, and distinct, branch).
+		const overview = remote ? undefined : this.graphState.overview;
 		const branch =
 			overview?.active.find(b => b.name === branchName) ?? overview?.recent.find(b => b.name === branchName);
 		if (branch != null) {
 			const mergeTargetTipSha = this.graphState.overviewEnrichment?.[branch.id]?.mergeTarget?.sha;
-			await this.scopeToBranchById(branch.id, mergeTargetTipSha, 'popover');
+			await this.scopeToBranchById(
+				branch.id,
+				mergeTargetTipSha,
+				source,
+				options?.additionalBranchRefs,
+				options?.origin,
+			);
 			// Supersession guard: a concurrent `setScope` for a different branch can land while
 			// our `await` is parked. If `this.graphState.scope` is no longer for our branch by the
 			// time we resume, the newer call owns the selection — don't fire a stale one against
 			// the wrong scope (would land selection on the previous click's WIP/tip).
 			if (this.graphState.scope?.branchRef !== branch.id) return;
 
+			// Position against the restructured rows, not the outgoing layout — the projection moves
+			// rows after the publish, so navigating early scrolls to a stale position. Re-guard after:
+			// a newer scope can land during the wait.
+			await this.waitForScopeProjection();
+			if (this.graphState.scope?.branchRef !== branch.id) return;
+
 			const sha = this.getOverviewBranchSelectionSha(branch.id);
 			if (sha != null) {
-				this.graph?.ensureAndSelectCommit(sha);
+				this.overviewBar.revealForScope(sha, branchName, branch.id, 'sidebar');
 			}
 			return;
 		}
@@ -1804,22 +3638,32 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// `OverviewBranch` and route through the helper — keeps a single source of truth for
 		// the selection cascade. Without this, the inline cascade silently drifted from the
 		// helper (e.g., missed the `loadedShas` gate, kept a stale `stats > 0` predicate).
-		const branchRef = getBranchId(repoPath, false, branchName);
+		const branchRef = getBranchId(repoPath, remote, branchName);
 		await this.setScope(
 			{
 				branchRef: branchRef,
 				branchName: branchName,
 				upstreamRef: upstreamName != null ? getBranchId(repoPath, true, upstreamName) : undefined,
+				additionalBranchRefs: options?.additionalBranchRefs,
+				origin: options?.origin,
 			},
-			'popover',
+			source,
 		);
 		// Same supersession guard as above.
 		if (this.graphState.scope?.branchRef !== branchRef) return;
 
-		const isCurrent = this.graphState.branch?.name === branchName;
-		const tipSha = this.graphState.rows?.find(r => r.heads?.some(h => h.id === branchRef))?.sha;
+		// Same restructure-first positioning as the overview path — and the tip lookup below must run
+		// against the settled rows too.
+		await this.waitForScopeProjection();
+		if (this.graphState.scope?.branchRef !== branchRef) return;
+
+		const isCurrent = !remote && this.graphState.branch?.name === branchName;
+		// A remote branch's tip is carried by `row.remotes`, never `row.heads`.
+		const tipSha = this.graphState.rows?.find(r =>
+			remote ? r.remotes?.some(re => re.id === branchRef) : r.heads?.some(h => h.id === branchRef),
+		)?.sha;
 		// `worktree: undefined` is correct here — no overview hit means we don't know the
-		// worktree affiliation, and the helper's case (2) recovers via `wipMetadataBySha`
+		// worktree affiliation, and the helper's case (2) recovers via `wipRowsById`
 		// lookup by `branch.id`. Synthesizes the minimal `SelectionBranch` shape so the same
 		// cascade serves both overview-card and header-popover paths.
 		const synthesizedBranch: SelectionBranch = {
@@ -1829,16 +3673,19 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			reference: { sha: tipSha },
 		};
 		const sha = getOverviewBranchSelectionSha(synthesizedBranch, {
-			wipMetadataBySha: this.graphState.wipMetadataBySha,
+			wipRowsById: this.graphState.wipRowsById,
+			primaryWipRowId: this.primaryWipRowId,
 			rows: this.graphState.rows,
 			branchesVisibility: this.graphState.branchesVisibility,
 			includeOnlyRefs: this.graphState.includeOnlyRefs,
+			scope: this.graphState.scope,
+			currentBranch: this.graphState.branch,
 		});
 		if (sha != null && sha !== '') {
-			// If the helper returned the tip and tip isn't loaded, the IPC `EnsureRowRequest`
-			// fallback in `ensureAndSelectCommit` will fetch it; otherwise the fast path or
+			// If the helper returned the tip and tip isn't loaded, the `rows.loadRow`
+			// fallback in `navigateToCommit` will fetch it; otherwise the fast path or
 			// synthetic-WIP retry handles it.
-			this.graph?.ensureAndSelectCommit(sha);
+			this.overviewBar.revealForScope(sha, branchName, branchRef, 'overview');
 			return;
 		}
 
@@ -1852,7 +3699,9 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	private async scopeToBranchById(
 		branchId: string,
 		mergeTargetTipSha?: string,
-		source: 'popover' | 'overview-card' = 'overview-card',
+		source: GraphScopeSource = 'overview-card',
+		additionalBranchRefs?: string[],
+		origin?: GraphScopeOrigin,
 	): Promise<void> {
 		const overview = this.graphState.overview;
 		if (overview == null) return;
@@ -1876,29 +3725,57 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				branchName: branch.name,
 				upstreamRef: upstreamRef,
 				mergeTargetTipSha: sha,
+				additionalBranchRefs: additionalBranchRefs,
+				origin: origin,
 			},
 			source,
 		);
 	}
 
-	private async setScope(
-		scope: NonNullable<typeof this.graphState.scope>,
-		source: 'popover' | 'overview-card',
-	): Promise<void> {
-		// Skip re-assignment when structurally equal so GraphContainer doesn't re-evaluate
-		// scope highlighting on unrelated graph updates.
+	private async setScope(scope: NonNullable<typeof this.graphState.scope>, source: GraphScopeSource): Promise<void> {
+		// A detached HEAD is a `current` branch, so `getOverviewData` lists it and the Focus Branch
+		// popover / overview cards route it here like any other branch. Its `branchName` is the
+		// synthesized `(sha…)` label, which matches no row's head — the scope resolves nothing and only
+		// hides the primary WIP row. Guarded here because this is the single choke point every entry
+		// point funnels through (header, popover, overview card, sidebar, `scope-to-branch` command).
+		//
+		// Matched against the detached branch's OWN id and name — never a `(…)` shape test, which would
+		// reject the legal branch `(release)`. Both are needed: the overview path builds `branchRef` from
+		// `branch.id` (SHA-keyed when detached) while `scopeToBranch` builds it from `branch.name` (the
+		// synthesized `(sha…)` label), so an id-only check let the name-built path straight through.
+		const currentBranch = this.graphState.branch;
+		if (
+			currentBranch?.detached &&
+			(scope.branchRef === currentBranch.id || scope.branchName === currentBranch.name)
+		) {
+			return;
+		}
+
+		// An accepted focus retires the parked walkthrough request — after the detached rejection
+		// (the park must survive it), before the equality early-out (which skips `setScope`'s own cancel).
+		this.graphState.pendingScopeToBranch = false;
+
+		// Skip re-assignment when structurally equal so the graph doesn't re-evaluate
+		// scope highlighting on unrelated graph updates. `additionalBranchRefs` and `origin` are part of
+		// that identity: a stack and its base layer resolve to the SAME focal branch, so comparing the
+		// focal fields alone made "Focus on Stack" a silent no-op right after focusing its base pull
+		// request (and the reverse leave the header naming a stack it no longer shows).
 		const current = this.graphState.scope;
 		if (
 			current?.branchRef === scope.branchRef &&
 			current?.branchName === scope.branchName &&
 			current?.upstreamRef === scope.upstreamRef &&
-			current?.mergeTargetTipSha === scope.mergeTargetTipSha
+			current?.mergeTargetTipSha === scope.mergeTargetTipSha &&
+			current?.origin?.kind === scope.origin?.kind &&
+			current?.origin?.number === scope.origin?.number &&
+			(current?.additionalBranchRefs?.length ?? 0) === (scope.additionalBranchRefs?.length ?? 0) &&
+			(current?.additionalBranchRefs ?? []).every((ref, i) => ref === scope.additionalBranchRefs?.[i])
 		) {
 			return;
 		}
 
-		this._ipc.sendCommand(TrackGraphScopeChangedCommand, undefined);
-		emitTelemetrySentEvent<'graph/scope/changed'>(this, {
+		this.trackUsage('action:gitlens.graph.scope.changed:happened');
+		emitTelemetrySentEvent(this, {
 			name: 'graph/scope/changed',
 			data: {
 				source: source,
@@ -1908,7 +3785,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		});
 		// `stateProvider.setScope` resolves after the final scope publish (anchored when the
 		// anchor IPC supplies a usable merge base, bare otherwise). Awaiting keeps the post-scope
-		// selection cascade timed correctly — `ensureAndSelectCommit` sees the GK row index in
+		// selection cascade timed correctly — `navigateToCommit` sees the graph row index in
 		// the settled state and can lock onto the WIP/tip without racing the bare→anchored render.
 		await this.graphState.setScope(scope);
 	}
@@ -1916,7 +3793,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	private _cachedScopeWindow:
 		| {
 				scope: AppState['scope'];
-				rows: GraphRow[] | undefined;
+				rows: GitGraphRow[] | undefined;
 				result: { start: number; end: number } | undefined;
 		  }
 		| undefined;
@@ -1949,7 +3826,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 
 	private computeScopeWindow(
 		scope: NonNullable<AppState['scope']>,
-		rows: GraphRow[] | undefined,
+		rows: GitGraphRow[] | undefined,
 	): { start: number; end: number } | undefined {
 		if (scope.mergeBase == null) return undefined;
 
@@ -1984,16 +3861,50 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		return result;
 	}
 
-	private selectCommits = (shas: string[], options?: SelectCommitsOptions) => {
-		return this.graph.selectCommits(shas, options);
-	};
-
-	private getCommits = (shas: string[]) => {
-		return this.graph.getCommits(shas);
-	};
+	// Resolves `not-found` when no repository is open: `this.graph` isn't rendered then (see `render`),
+	// and the header is gated on the same condition.
+	private navigateToCommit = (sha: string, options?: GraphNavigationOptions): Promise<GraphNavigationResult> =>
+		this.graph?.navigateToCommit(sha, options) ?? Promise.resolve({ status: 'not-found' });
 
 	private handleMinimapWheel(e: GraphMinimapWheelEvent) {
 		this.graph?.scrollGraphBy(e.detail.deltaY);
+	}
+
+	/** Esc in the search box, once its own ladder (autocomplete, then a running search) is exhausted: the
+	 *  box keeps its query and the keyboard returns to the rows. The event bubbles up from `gl-search-box`
+	 *  through the header; other hosts of that shared component simply don't listen for it.
+	 *
+	 *  The overlay stack outranks the exit: the input consumes Esc before the document dispatcher can see
+	 *  it, so an open transient surface (pinned hover card, minimap zoom) is popped HERE instead — focus
+	 *  stays in the box, and the next Esc performs the exit. One action per press, stack-first. */
+	private handleSearchExit(): void {
+		if (this.keymap.closeTopOverlay()) return;
+
+		this.graph?.focus();
+	}
+
+	/** Live overlay-stack registration for a zoomed minimap — non-null exactly while it's zoomed. */
+	private _minimapZoomOverlay: Disposable | undefined;
+
+	/** The minimap has no Esc handler of its own — the zoom joins the Esc overlay stack here, so exiting it
+	 *  queues behind any transient surface opened over it instead of firing alongside. Driven off the
+	 *  zoom-change event, which is the minimap's existing announcement of both directions. */
+	private handleMinimapZoomChange(e: GraphMinimapZoomChangeEvent) {
+		if (e.detail.zoomed) {
+			this._minimapZoomOverlay ??= this.keymap.pushOverlay({
+				id: 'graph-minimap-zoom',
+				onClose: () => {
+					if (this.minimapEl == null) return false;
+
+					this.minimapEl.resetZoom();
+					return true;
+				},
+			});
+			return;
+		}
+
+		this._minimapZoomOverlay?.dispose();
+		this._minimapZoomOverlay = undefined;
 	}
 
 	private handleMinimapDaySelected(e: CustomEvent<GraphMinimapDaySelectedEventDetail>) {
@@ -2004,19 +3915,25 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			const date = e.detail.date?.getTime();
 			if (date == null) return;
 
-			// Find closest row to the date
+			// Find the closest row to the date. Compare against COMMITTER date (what the minimap buckets
+			// by) — `row.date` follows the user's ordering setting (author date when so configured), which
+			// for rebased commits can be far off and would land on the wrong row.
 			const closest = this.graphState.rows.reduce((prev, curr) => {
-				return Math.abs(curr.date - date) < Math.abs(prev.date - date) ? curr : prev;
+				return Math.abs(getCommitDateFromRow(curr) - date) < Math.abs(getCommitDateFromRow(prev) - date)
+					? curr
+					: prev;
 			});
 			sha = closest.sha;
 		}
 
-		this.graph.selectCommits([sha], { ensureVisible: true });
+		// A landing: the click happened on the minimap, so the row's resting position is the only thing that
+		// tells the user which day they hit.
+		this.graph.selectCommits([sha], { ensureVisible: true, flash: true });
 
 		if (e.target != null) {
 			const { target } = e;
 			queueMicrotask(() =>
-				emitTelemetrySentEvent<'graph/minimap/day/selected'>(target, {
+				emitTelemetrySentEvent(target, {
 					name: 'graph/minimap/day/selected',
 					data: {},
 				}),
@@ -2028,16 +3945,12 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		const { minimapDataType, minimapReversed, markerType, checked } = e.detail;
 
 		if (minimapDataType != null) {
-			this._ipc.sendCommand(UpdateGraphConfigurationCommand, {
-				changes: { minimapDataType: minimapDataType },
-			});
+			fireAndForget(this.updateGraphConfig({ minimapDataType: minimapDataType }), 'configuration/update');
 			return;
 		}
 
 		if (minimapReversed != null) {
-			this._ipc.sendCommand(UpdateGraphConfigurationCommand, {
-				changes: { minimapReversed: minimapReversed },
-			});
+			fireAndForget(this.updateGraphConfig({ minimapReversed: minimapReversed }), 'configuration/update');
 			return;
 		}
 
@@ -2055,28 +3968,31 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				minimapMarkerTypes = [...currentTypes];
 				minimapMarkerTypes.splice(index, 1);
 			}
-			this._ipc.sendCommand(UpdateGraphConfigurationCommand, {
-				changes: { minimapMarkerTypes: minimapMarkerTypes },
-			});
+			fireAndForget(this.updateGraphConfig({ minimapMarkerTypes: minimapMarkerTypes }), 'configuration/update');
 		}
 	}
 
 	private handleGraphSelectionChanged(e: CustomEventType<'gl-graph-change-selection'>) {
 		this.graphHover.hide();
 
-		const { selection, reachability, commits } = e.detail;
+		const { selection, reachability, commits, userIntent } = e.detail;
+
+		// Never clear the inspection anchor on an empty selection. The wrapper only dispatches genuine
+		// (non-empty) intent here; an empty report is a scope/visibility filter-out or a transient GK
+		// race, both of which must KEEP the details anchor (graph shows no highlight, details stay put).
+		if (selection.length === 0) return;
+
 		const fallbackRepoPath = this.fallbackRepoPath ?? '';
 
 		if (selection.length >= 2) {
-			const shas = selection
-				.filter(s => s.type !== ('work-dir-changes' satisfies GitGraphRowType))
-				.map(s => s.id);
+			const shas = selection.filter(s => s.type !== ('workdir' satisfies GitGraphRowKind)).map(s => s.id);
 
 			if (shas.length >= 2) {
 				this._selectedCommit = undefined;
 				// `commits` from the wrapper is already scoped to the current selection (WIP rows
 				// excluded), so it can be forwarded directly as the per-sha lite map.
 				this._selectedCommits = { shas: shas, repoPath: fallbackRepoPath, commitLites: commits };
+				// Multi-select (compare) isn't part of single-commit history; leave the guard intact.
 			} else if (shas.length === 1) {
 				// Multi-select included WIP + 1 commit — treat as single-select on the commit
 				const sha = shas[0];
@@ -2086,13 +4002,15 @@ export class GraphApp extends SignalWatcher(LitElement) {
 					commitLite: commits?.[sha],
 				};
 				this._selectedCommits = undefined;
+				this.recordNavSelection(sha, fallbackRepoPath, commits?.[sha]);
 			} else {
 				this._selectedCommit = undefined;
 				this._selectedCommits = undefined;
+				this._navExpectedSha = undefined;
 			}
-		} else if (selection.length === 1) {
+		} else {
 			const active = selection[0];
-			const sha = active.type === ('work-dir-changes' satisfies GitGraphRowType) ? uncommitted : active.id;
+			const sha = active.type === ('workdir' satisfies GitGraphRowKind) ? uncommitted : active.id;
 			// Prefer per-row repoPath (for multi-worktree WIP); fall back to selected repo
 			const repoPath = active.repoPath ?? fallbackRepoPath;
 
@@ -2104,23 +4022,82 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			};
 			this._selectedCommits = undefined;
 
-			// When `graph.showWorktreeWipStats` is disabled, secondary worktree WIP rows start
-			// stats-less. Force-fetch stats for the selected row so it populates its pill.
-			if (isSecondaryWipSha(active.id) && this.graphState.config?.showWorktreeWipStats === false) {
+			// Record every viewed selection (commits, stashes, AND WIP) so back/forward is a true
+			// history of what the details panel showed — Back from WIP returns to the prior commit.
+			this.recordNavSelection(sha, repoPath, commits?.[active.id]);
+
+			// When `graph.showWorktreeWipStats` is disabled, PEER worktree WIP rows start stats-less
+			// (the graph's own rides the working-tree push). Force-fetch stats for the selected row so
+			// it populates its pill.
+			const selectedWorktreePath = getWipRowWorktreePath(active.id);
+			if (
+				selectedWorktreePath != null &&
+				selectedWorktreePath !== fallbackRepoPath &&
+				this.graphState.config?.showWorktreeWipStats === false
+			) {
 				void this.fetchSelectedWorktreeWipStats(active.id);
 			}
-		} else {
-			this._selectedCommit = undefined;
-			this._selectedCommits = undefined;
+		}
+
+		// First-time experience: with no saved details location the panel starts hidden — the first
+		// user-intent selection (row click / keyboard select) shows it, and the visibility transition
+		// in `updated` then saves the location as 'auto'. Programmatic selection echoes (e.g. a
+		// scope-to-branch focal-tip sync) must not open the panel uninvited.
+		if (userIntent && !this.graphState.details?.visible && this.graphState.config?.detailsLocation == null) {
+			this.setDetailsVisible(true);
+			this.ensureDetailsPosition();
 		}
 
 		const count = this._selectionTrackingCounter.next();
 		if (count === 1 || count % 100 === 0) {
 			queueMicrotask(() =>
-				this._telemetry.sendEvent({
+				emitTelemetrySentEvent(this, {
 					name: 'graph/row/selected',
 					data: { rows: selection.length, count: count },
 				}),
+			);
+		}
+	}
+
+	/** Records a viewed single selection (commit, stash, or WIP) into back/forward history. Suppresses the
+	 *  selection echo(es) of our own {@link navigateTo} re-drive. The guard is STICKY (matched by
+	 *  sha, not cleared on the first match) because the graph component can re-emit the same
+	 *  selection multiple times (RAF retries / focus-row churn) — clearing on the first echo would
+	 *  let a later duplicate re-record the target and clobber the forward history. It stays armed
+	 *  until a genuinely different commit arrives, which records and disarms it. */
+	private recordNavSelection(sha: string, repoPath: string, commitLite?: CommitDetails): void {
+		if (sha === this._navExpectedSha) return;
+
+		this._navExpectedSha = undefined;
+		// Capture the commit shell so back/forward can paint synchronously (no skeleton/IPC wait),
+		// matching a row click — and so it still works when the row has since been paged out.
+		this._nav.record({ sha: sha, repoPath: repoPath, commitLite: commitLite });
+	}
+
+	private handleNavBack = (): void => this.navigateTo(this._nav.back());
+	private handleNavForward = (): void => this.navigateTo(this._nav.forward());
+
+	/** Navigates the details panel to a recorded commit. The panel always updates (we set the
+	 *  selection slot directly); re-selecting the graph row is best-effort and may no-op for
+	 *  filtered/paged-out/synthetic rows — the guard then clears on the next real selection. */
+	private navigateTo(target: { sha: string; repoPath: string; commitLite?: CommitDetails } | undefined): void {
+		if (target == null) return;
+
+		this._navExpectedSha = target.sha;
+		if (this.effectiveDisplayMode !== 'graph') {
+			this._altModeSelectedCommit = { sha: target.sha, repoPath: target.repoPath, commitLite: target.commitLite };
+		} else {
+			// Carry the recorded commit shell so the details panel paints from cache — including when
+			// the row has been paged out of the graph — then re-select the row in the graph.
+			this._selectedCommit = { sha: target.sha, repoPath: target.repoPath, commitLite: target.commitLite };
+			// WIP selections are recorded as the bare `uncommitted` revision + the worktree they came from;
+			// re-select THAT worktree's row, or navigation maps the revision to our own WIP row.
+			// Stepping back and forward mostly revisits rows still in view, which the reveal rule leaves
+			// alone, so the graph follows the panel without fighting it for attention. Flashes because the
+			// user pressed back/forward, and the row taking the selection needs to say so.
+			void this.graph?.navigateToCommit(
+				target.sha === uncommitted && target.repoPath ? createWipRowId(target.repoPath) : target.sha,
+				{ source: 'history', flash: true },
 			);
 		}
 	}
@@ -2130,14 +4107,14 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	}
 
 	/**
-	 * Fetches working-tree stats for a single secondary-worktree WIP row and writes them into
-	 * `wipMetadataBySha` so the GK component's pill renders. Used when `graph.showWorktreeWipStats`
-	 * is disabled — the server's `onGetWipStats` ignores non-`force` calls in that mode, and the GK
-	 * component's `requestedMissingWipStats` dedup is persistent, so this is the only way to show
-	 * stats for a row once the user opts in by selecting it.
+	 * Fetches working-tree stats for a single peer-worktree WIP row and writes them into
+	 * `wipStateById` so the row's stats pill renders. Used when `graph.showWorktreeWipStats`
+	 * is disabled — the host's `onGetWipStats` ignores non-`force` calls in that mode, and the
+	 * graph's visible-scan dedup never re-asks for an unchanged missing set, so this is the only
+	 * way to show stats for a row once the user opts in by selecting it.
 	 */
 	private async fetchSelectedWorktreeWipStats(sha: string): Promise<void> {
-		const existing = this.graphState.wipMetadataBySha;
+		const existing = this.graphState.wipStateById;
 		if (existing == null) return;
 
 		const current = existing[sha];
@@ -2146,32 +4123,60 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// Already have stats for this row (user re-selected it) — nothing to do.
 		if (current.workDirStats != null && !current.workDirStatsStale) return;
 
-		const response = await this._ipc.sendRequest(GetWipStatsRequest, { shas: [sha], force: true });
-		if (response == null) return;
+		const services = this.services;
+		if (services == null) return;
 
-		const map = this.graphState.wipMetadataBySha;
+		const ticket = this.graphState.claimWipStatsRequest([sha]);
+		const response = (await (await services.wip).getStats([sha], { force: true })) ?? {};
+
+		// A newer request for this row supersedes ours regardless of which response lands first — batches
+		// no longer cancel each other, and the responses carry no revision to order by.
+		if (!this.graphState.isCurrentWipStatsRequest(sha, ticket)) return;
+
+		const map = this.graphState.wipStateById;
 		if (map == null) return;
 
 		const prev = map[sha];
 		if (prev == null) return;
 
 		const stats = response[sha];
-		// `force: true` bypasses the disabled-feature short-circuit on the host, so a missing
-		// entry here means the underlying `git status` failed. Preserve any prior `workDirStats`
-		// (including a sticky-restored value) rather than clobbering it with `undefined`. When the
-		// response does land, also pick up the secondary's `pausedOpStatus` so the row reflects
-		// any in-progress rebase/merge/cherry-pick.
-		const updated =
-			stats === undefined
-				? { ...prev, workDirStatsStale: false }
-				: {
-						...prev,
-						workDirStats: stats.workDirStats,
-						workDirStatsStale: false,
-						pausedOpStatus: stats.pausedOpStatus,
-					};
+		// `force: true` bypasses the disabled-feature short-circuit on the host, so a missing entry here
+		// means the status read failed, or a later batch cancelled this one. Preserve any prior
+		// `workDirStats` (including a sticky-restored value) rather than clobbering it with `undefined` —
+		// and leave it stale, since nothing verified it. When the response does land, also pick up the
+		// secondary's `pausedOpStatus` so the row reflects any in-progress rebase/merge/cherry-pick.
+		if (stats === undefined) return;
+
+		const updated = {
+			...prev,
+			workDirStats: stats.workDirStats,
+			workDirStatsStale: false,
+			// Retire the probe's bit against these counts, same as the other two authoritative writers
+			// (`mergeWipState`, `graph-wrapper`'s stats merge) — a preserved `true` outlives the status that
+			// disproved it and resurfaces as a phantom pill once these counts go stale.
+			hasChanges: hasDirtyCounts(stats.workDirStats),
+			pausedOpStatus: stats.pausedOpStatus,
+			hasConflicts: stats.hasConflicts,
+		};
 		const next = { ...map, [sha]: updated };
-		this.graphState.wipMetadataBySha = next;
+		this.graphState.wipStateById = next;
+	}
+
+	// The Changes header mode picker's pick — a dedicated host write (not the columns persist, which drops
+	// echoed `mode`), keeping the mode host-authoritative. Mirrors `gl-graph-filter-column`'s route.
+	private handleGraphChangeColumnMode(e: CustomEventType<'gl-graph-change-column-mode'>): void {
+		const services = this.services;
+		if (services == null) return;
+
+		notifyService(services.columns, 'set column mode', svc => svc.setColumnMode(e.detail.name, e.detail.mode));
+	}
+
+	// The dormant Changes column's one-time opt-in — a dedicated consent write (`graph.changesColumn.enabled`).
+	private handleGraphEnableChangesColumn(_e: CustomEventType<'gl-graph-enable-changes-column'>): void {
+		const services = this.services;
+		if (services == null) return;
+
+		notifyService(services.columns, 'enable changes column', svc => svc.enableChangesColumn());
 	}
 
 	private handleGraphFilterColumn(e: CustomEventType<'gl-graph-filter-column'>) {
@@ -2199,21 +4204,109 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		}
 	}
 
+	/** `Ctrl`/`Cmd`+`C` inside the graph — `gl-lit-graph` serializes the focused/selected row's own
+	 *  `data-vscode-context` string (same format the right-click menu uses) and we forward it to the
+	 *  existing `gitlens.graph.copy` command, which already prefers `worktreePath` and newline-joins a
+	 *  multi-selection — no new command needed. */
+	private async handleGraphCopyRequest(e: CustomEventType<'gl-graph-copy-request'>): Promise<void> {
+		const { context, selectionContexts } = e.detail;
+		let item: GraphItemContext | undefined;
+		try {
+			item = context != null ? (JSON.parse(context) as GraphItemContext) : undefined;
+		} catch {
+			item = undefined;
+		}
+		if (item != null) {
+			// The parsed item only carries `webviewItem`/`webviewItemValue` — the host's
+			// `isWebviewItemContext` guard also needs `webview`/`webviewInstance`, which a real
+			// right-click gets for free from the root element's merged `data-vscode-context`.
+			item.webview = this.graphState.webviewId;
+			item.webviewInstance = this.graphState.webviewInstanceId;
+
+			if (selectionContexts != null && selectionContexts.length > 1) {
+				const parsedContexts: GraphItemContext[] = [];
+				for (const s of selectionContexts) {
+					let parsed: GraphItemContext | undefined;
+					try {
+						parsed = JSON.parse(s) as GraphItemContext;
+					} catch {
+						parsed = undefined;
+					}
+
+					if (parsed == null) continue;
+
+					parsedContexts.push(parsed);
+				}
+
+				item.webviewItems = mergeWebviewItems(parsedContexts.map(c => c.webviewItem));
+				item.webviewItemsValues = parsedContexts.map(c => ({
+					webviewItem: c.webviewItem,
+					webviewItemValue: c.webviewItemValue,
+				}));
+				item.listMultiSelection = true;
+			}
+		}
+		// Best-effort like the fire-and-forget command send it replaces — bails if the RPC session
+		// is already gone (e.g. copy during teardown)
+		const commands = await this.services?.commands;
+		void commands?.execute('gitlens.graph.copy' as GlExtensionCommands, ...(item != null ? [item] : []));
+	}
+
 	private handleGraphRowContextMenu(_e: CustomEventType<'gl-graph-row-context-menu'>) {
+		// A pinned keyboard peek would sit behind the context menu — end it explicitly, since `hide()`
+		// is peek-inert by design (see GlGraphHover.hide).
+		this.graphHover.closePeek();
 		this.graphHover.hide();
 	}
 
-	private handleGraphRowDoubleClick(_e: CustomEventType<'gl-graph-row-double-click'>) {
-		if (this.graphState.details?.visible) return;
+	/** Opens the details panel (unless already open) and, for a WIP row, also toggles the graph's
+	 *  scope onto that row's branch — same behavior as the header's Focus button, reached from the
+	 *  WIP row itself. Additive: runs regardless of whether the details panel was already open. */
+	private handleGraphRowDoubleClick(e: CustomEventType<'gl-graph-row-double-click'>) {
+		if (!this.graphState.details?.visible) {
+			this.setDetailsVisible(true);
+			this.ensureDetailsPosition();
+		}
 
-		this.setDetailsVisible(true);
-		this.ensureDetailsPosition();
+		if (e.detail.graphRow.kind === 'workdir') {
+			this.toggleScopeFromWipRow(e.detail.graphRow.sha);
+		}
+	}
+
+	private toggleScopeFromWipRow(sha: string): void {
+		let branchRef: string | undefined;
+		let branchName: string | undefined;
+		let upstreamName: string | undefined;
+
+		if (isPrimaryWipRowId(sha, this.fallbackRepoPath)) {
+			const branch = this.graphState.branch;
+			if (branch == null || branch.detached || branch.id == null) return;
+
+			branchRef = branch.id;
+			branchName = branch.name;
+			upstreamName = branch.upstream?.missing ? undefined : branch.upstream?.name;
+		} else {
+			const wip = this.graphState.wipRowsById?.[sha];
+			if (wip?.branchRef == null || wip.branch == null) return;
+
+			branchRef = wip.branchRef;
+			branchName = wip.branch.name;
+			upstreamName = wip.branch.upstream?.missing ? undefined : wip.branch.upstream?.name;
+		}
+
+		if (this.graphState.scope?.branchRef === branchRef) {
+			this.graphState.clearScope();
+
+			return;
+		}
+
+		void this.scopeToBranchByName(branchName, upstreamName, { source: 'wip-row' });
 	}
 
 	private handleGraphRowHover({
 		detail: { graphZoneType, graphRow, clientX, currentTarget },
 	}: CustomEventType<'gl-graph-row-hover'>) {
-		if (graphZoneType === refZone) return;
+		if (graphZoneType === 'ref') return;
 
 		const hover = this.graphHover;
 		if (hover == null) return;
@@ -2242,10 +4335,37 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		hover.onRowHovered(graphRow, anchor);
 	}
 
-	private handleGraphRowHoverTrack({ detail: { graphZoneType, graphRow } }: CustomEventType<'rowhovertrack'>) {
-		if (graphZoneType === refZone) return;
+	/** Keyboard peek (`i` / `mod+I`) — the same hover card the pointer opens, driven
+	 *  by the graph's focused row. The graph reads `detail.open` back off the event to learn the card's
+	 *  state (it has no other view of it), so this handler must answer synchronously. */
+	/** The hover closed a keyboard peek by a path the graph can't observe (Esc's overlay pop) — relay it
+	 *  down so the graph syncs its peek flag and announces the close. */
+	private handleHoverPeekClosed() {
+		this.graph?.notifyPeekClosed();
+	}
 
-		this.minimapEl?.select(graphRow.date, true);
+	private handleGraphRowPeek({ detail }: CustomEventType<'gl-graph-row-peek'>) {
+		const hover = this.graphHover;
+		if (hover == null) return;
+
+		if (detail.action === 'close') {
+			hover.closePeek();
+			return;
+		}
+
+		hover.requestMarkdown ??= this.getRowHoverPromise.bind(this);
+		detail.open =
+			detail.action === 'toggle'
+				? hover.togglePeek(detail.graphRow, detail.anchor)
+				: hover.repeek(detail.graphRow, detail.anchor);
+	}
+
+	private handleGraphRowHoverTrack({
+		detail: { graphZoneType, graphRow, minimapDate },
+	}: CustomEventType<'rowhovertrack'>) {
+		if (graphZoneType === 'ref') return;
+
+		this.minimapEl?.select(minimapDate ?? graphRow.date, true);
 		this.graphHover?.onRowChanged(graphRow);
 	}
 
@@ -2259,20 +4379,22 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		this.graphHover.resetUnhoverTimer();
 	}
 
-	private handleGraphRowActionHover() {
-		this.graphHover.hide();
-	}
-
-	private async getRowHoverPromise(row: GraphRow) {
+	private async getRowHoverPromise(row: GitGraphRow): Promise<DidGetRowHoverParams> {
 		try {
-			const request = await this._ipc.sendRequest(GetRowHoverRequest, {
-				type: row.type,
-				id: row.sha,
-			});
+			this._hoverAbort?.abort();
+			const abort = new AbortController();
+			this._hoverAbort = abort;
+
+			const hover = await this.services?.hover;
+			if (hover == null) throw new Error('Graph hover service unavailable');
+
+			const request = await hover.getRowHover(row.kind, row.sha, abort.signal);
 
 			const count = this._hoverTrackingCounter.next();
 			if (count === 1 || count % 100 === 0) {
-				queueMicrotask(() => this._telemetry.sendEvent({ name: 'graph/row/hovered', data: { count: count } }));
+				queueMicrotask(() =>
+					emitTelemetrySentEvent(this, { name: 'graph/row/hovered', data: { count: count } }),
+				);
 			}
 
 			return request;

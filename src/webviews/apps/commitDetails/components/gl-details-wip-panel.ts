@@ -1,7 +1,6 @@
 import type { PropertyValueMap, TemplateResult } from 'lit';
 import { css, html, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { repeat } from 'lit/directives/repeat.js';
 import { when } from 'lit/directives/when.js';
 import type { AgentSessionPhase } from '@gitlens/agents/types.js';
 import { isActiveAgentPhase } from '@gitlens/agents/types.js';
@@ -10,14 +9,10 @@ import { uncommitted } from '@gitlens/git/models/revision.js';
 import { canStageCurrent, canStageIncoming } from '@gitlens/git/utils/conflictResolution.utils.js';
 import { isConflictStatus } from '@gitlens/git/utils/fileStatus.utils.js';
 import { isDescendant, normalizePath, relative } from '@gitlens/utils/path.js';
-import { equalsIgnoreCase } from '@gitlens/utils/string.js';
 import type { AgentSessionState } from '../../../../agents/models/agentSessionState.js';
-import type { Draft } from '../../../../plus/drafts/models/drafts.js';
-import { createCommandLink } from '../../../../system/commands.js';
 import { serializeWebviewItemContext } from '../../../../system/webview.js';
-import type { DetailsItemTypedContext, DraftState, Wip } from '../../../commitDetails/protocol.js';
+import type { DetailsItemTypedContext, Wip } from '../../../commitDetails/protocol.js';
 import { buildFolderContext } from '../../../commitDetails/protocol.js';
-import type { ComposerCommandArgs } from '../../../plus/composer/registration.js';
 import type { Change } from '../../../plus/patchDetails/protocol.js';
 import type { TreeItemAction, TreeItemBase, TreeItemCheckedDetail } from '../../shared/components/tree/base.js';
 import { detailsBaseStyles } from './gl-details-base.css.js';
@@ -25,66 +20,144 @@ import type { File } from './gl-details-base.js';
 import { GlDetailsBase } from './gl-details-base.js';
 import { detailsWipPanelStyles } from './gl-details-wip-panel.css.js';
 import type { CreatePatchState, GenerateState } from './gl-inspect-patch.js';
+import '../../plus/graph/components/gl-details-wip-empty-pane.js';
+import '../../plus/shared/components/merge-rebase-status.js';
+import '../../shared/components/actions/action-nav.js';
+import '../../shared/components/avatar/avatar.js';
+import '../../shared/components/branch-name.js';
 import '../../shared/components/button.js';
 import '../../shared/components/button-container.js';
-import '../../shared/components/branch-name.js';
-import '../../shared/components/code-icon.js';
-import '../../shared/components/panes/pane-group.js';
-import '../../shared/components/avatar/avatar.js';
 import '../../shared/components/chips/action-chip.js';
+import '../../shared/components/code-icon.js';
 import '../../shared/components/commit/commit-stats.js';
+import '../../shared/components/formatted-date.js';
+import '../../shared/components/panes/pane-group.js';
 import '../../shared/components/pills/tracking.js';
+import '../../shared/components/rich/issue-pull-request.js';
 import '../../shared/components/tree/gl-wip-tree-pane.js';
-import '../../plus/shared/components/merge-rebase-status.js';
-import '../../plus/graph/components/gl-details-wip-empty-pane.js';
-import './gl-inspect-patch.js';
+import '../../shared/components/tree/tree.js';
+import '../../shared/components/tree/tree-item.js';
+import '../../shared/components/webview-pane.js';
 
 // Stable references for the inline tree-item actions so each render reuses the same objects
 // instead of allocating fresh ones per file. Lit's array diffing in gl-tree-item is identity-
 // based, so reusing these also avoids spurious re-renders downstream.
+// `single`: conflict-specific diffs (current/incoming side) only make sense for the clicked conflicted
+// row — fanning them out to non-conflicted selected files would open wrong/empty content.
 const openCurrentChangesAction: TreeItemAction = {
 	icon: 'gl-diff-left',
 	label: 'Open Current Changes',
 	action: 'file-open-current',
+	multiBehavior: 'single',
 };
 const openIncomingChangesAction: TreeItemAction = {
 	icon: 'gl-diff-right',
 	label: 'Open Incoming Changes',
 	action: 'file-open-incoming',
+	multiBehavior: 'single',
 };
-const stageConflictAction: TreeItemAction = { icon: 'add', label: 'Stage', action: 'file-stage' };
-const stageAction: TreeItemAction = { icon: 'plus', label: 'Stage Changes', action: 'file-stage' };
-const unstageAction: TreeItemAction = { icon: 'remove', label: 'Unstage Changes', action: 'file-unstage' };
-const discardAction: TreeItemAction = { icon: 'discard', label: 'Discard Changes', action: 'file-discard' };
-// Mixed rows (both staged + unstaged) discard only the unstaged portion on the first click — the
-// staged content survives until a second discard. Same `file-discard` action (the host detects
-// mixed and applies the partial semantics); only the label differs so it matches that behavior and
-// the bulk toolbar button.
-const discardUnstagedAction: TreeItemAction = {
+const stageConflictAction: TreeItemAction = {
+	icon: 'add',
+	label: 'Stage',
+	action: 'file-stage',
+	multiBehavior: 'batch',
+};
+// `batch`: an inline stage/unstage on a multi-selection fires ONE event carrying the whole set
+// (detail.files) so the host runs a single atomic `git add`/`git reset` — N concurrent single-file
+// ops would collide on the index lock and leave some files behind.
+const stageAction: TreeItemAction = {
+	icon: 'plus',
+	label: 'Stage Changes',
+	action: 'file-stage',
+	multiBehavior: 'batch',
+};
+const unstageAction: TreeItemAction = {
+	icon: 'remove',
+	label: 'Unstage Changes',
+	action: 'file-unstage',
+	multiBehavior: 'batch',
+};
+// `batch`: discarding an inline button on a multi-selection fires ONE `file-discard` carrying the
+// whole set (detail.files) so the host shows a single combined confirm, not one per file. Also used
+// (via `checkboxMixedActions`) for mixed rows (both staged + unstaged): a single click there discards
+// only the unstaged portion — the staged content survives until a second discard, by which point the
+// row is no longer mixed. That per-click nuance is stated at the point of consent instead of in the
+// label — `confirmDiscardChanges`'s mixed copy for a single row, and the mixed section of the batch
+// confirm for a selection — so one label covers every row without misdescribing a multi-selection
+// batch that also touches purely-staged rows elsewhere in the selection.
+const discardAction: TreeItemAction = {
 	icon: 'discard',
-	label: 'Discard Unstaged Changes',
+	label: 'Discard Changes...',
 	action: 'file-discard',
+	multiBehavior: 'batch',
 };
 const openFileAction: TreeItemAction = { icon: 'go-to-file', label: 'Open File', action: 'file-open' };
 // `file-compare-wip-staged` is bridged by gl-wip-tree-pane into `file-compare-wip` with
 // `staged: true` overridden so the diff resolves to staged ↔ HEAD even though the deduped
 // row carries `staged: false` (preferred-unstaged precedence from the tree pane dedup).
+// `single`: a specific "staged side" diff for the clicked mixed row; fanning it out to selected files
+// without staged changes would open an empty/wrong diff.
 const openStagedChangesAction: TreeItemAction = {
 	icon: 'diff-single',
 	label: 'Open Staged Changes',
 	action: 'file-compare-wip-staged',
+	multiBehavior: 'single',
+};
+const stashAction: TreeItemAction = {
+	icon: 'gl-stash-save',
+	label: 'Stash Changes...',
+	action: 'file-stash',
+	multiBehavior: 'batch',
 };
 
+// `single`: opens the conflicted row's two-sided details sheet — meaningless fanned out to other rows.
+const openConflictDetailsAction: TreeItemAction = {
+	icon: 'eye',
+	label: 'Conflict Details',
+	action: 'file-conflict-details',
+	multiBehavior: 'single',
+};
+// Per-row resolve action on a conflicted file — enters AI resolve mode focused on just that file.
+// `single`: resolve is row-specific; fanning it out would scope the wrong files.
+const resolveFileAction: TreeItemAction = {
+	icon: 'gl-merge',
+	label: 'Resolve Conflicts',
+	action: 'file-resolve-conflict',
+	multiBehavior: 'single',
+};
 const conflictedCheckboxActions: TreeItemAction[] = [
-	openFileAction,
+	openConflictDetailsAction,
 	openCurrentChangesAction,
 	openIncomingChangesAction,
 ];
 const conflictedActions: TreeItemAction[] = [...conflictedCheckboxActions, stageConflictAction];
-const checkboxDiscardOnly: TreeItemAction[] = [openFileAction, discardAction];
-const checkboxMixedActions: TreeItemAction[] = [openFileAction, openStagedChangesAction, discardUnstagedAction];
-const stagedActions: TreeItemAction[] = [openFileAction, unstageAction, discardAction];
-const unstagedActions: TreeItemAction[] = [openFileAction, stageAction, discardAction];
+// Graph host opt-in (`conflict-details`): adds the "Conflict Details" chip before Stage so the
+// stage action stays rightmost. Separate stable arrays keep gl-tree-item's identity diffing happy.
+const conflictedCheckboxActionsWithDetails: TreeItemAction[] = [...conflictedCheckboxActions];
+const conflictedActionsWithDetails: TreeItemAction[] = [...conflictedCheckboxActions, stageConflictAction];
+// Resolve-enabled (graph host + aiEnabled): the resolve action sits right after the eye, keeping "Conflict
+// Details" leftmost and Stage rightmost.
+const conflictedCheckboxActionsWithDetailsResolve: TreeItemAction[] = [
+	openConflictDetailsAction,
+	resolveFileAction,
+	openCurrentChangesAction,
+	openIncomingChangesAction,
+];
+const conflictedActionsWithDetailsResolve: TreeItemAction[] = [
+	...conflictedCheckboxActionsWithDetailsResolve,
+	stageConflictAction,
+];
+const checkboxDiscardOnly: TreeItemAction[] = [openFileAction, stashAction, discardAction];
+const checkboxMixedActions: TreeItemAction[] = [openFileAction, openStagedChangesAction, stashAction, discardAction];
+const stagedActions: TreeItemAction[] = [openFileAction, unstageAction, stashAction, discardAction];
+const unstagedActions: TreeItemAction[] = [openFileAction, stageAction, stashAction, discardAction];
+
+/** Grace period after `editing` flips off during which a file stays marked. The host's
+ *  `editing === true` window is the literal in-flight refcount window — milliseconds for
+ *  Edit/Write tool calls — so without grace the mark flashes and is gone before the eye can
+ *  register it. The grace is preempted the moment any *other* file becomes `editing === true`
+ *  (see {@link GlDetailsWipPanel.computeAgentTouchedFiles}); the indicator follows the agent. */
+const agentTouchedGraceMs = 5000;
 
 @customElement('gl-details-wip-panel')
 export class GlDetailsWipPanel extends GlDetailsBase {
@@ -104,12 +177,6 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 	@property({ type: Object })
 	pullRequest?: PullRequestShape;
 
-	@property({ type: Array })
-	codeSuggestions?: Omit<Draft, 'changesets'>[];
-
-	@property({ type: Object })
-	draftState?: DraftState;
-
 	@property({ type: Object })
 	generate?: GenerateState;
 
@@ -125,32 +192,106 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 	@property({ type: Boolean, attribute: 'bulk-conflict-actions' })
 	bulkConflictActions = false;
 
+	/** Opt-in for the per-row "Conflict Details" chip that opens the two-sided conflict sheet.
+	 *  Set true only by the graph host, which mounts the sheet and wires `file-conflict-details`. */
+	@property({ type: Boolean, attribute: 'conflict-details' })
+	conflictDetails = false;
+
+	/** Opt-in for the AI Resolve Conflicts entry points (toolbar button + per-row resolve action). Set true
+	 *  only by the graph host when `aiEnabled`; gates the affordances that route into resolve mode. */
+	@property({ type: Boolean, attribute: 'resolve-enabled' })
+	resolveEnabled = false;
+
 	/** Active agent sessions matched to this worktree (already filtered by the graph host).
 	 *  Used to compute per-file editing decorations — see {@link _agentTouchedFiles}. */
 	@property({ attribute: false })
 	agentSessions?: AgentSessionState[];
 
-	/** Repo-relative normalized paths the connected agent(s) are actively editing right now,
-	 *  mapped to the most-active phase. Recomputed in {@link willUpdate} only when
-	 *  {@link agentSessions} or {@link wip} changes so unrelated WIP snapshot pushes (file stats,
-	 *  tracking info) don't churn the downstream tree-pane model. */
+	/** Repo-relative normalized paths the connected agent(s) are actively editing right now (or
+	 *  within {@link agentTouchedGraceMs} of last edit, see {@link computeAgentTouchedFiles}),
+	 *  mapped to the most-active phase. Recomputed in {@link willUpdate} when {@link agentSessions}
+	 *  or {@link wip} changes, AND on a one-shot timer for the earliest grace expiry so the mark
+	 *  drops cleanly without waiting for the next host snapshot. */
 	@state()
 	private _agentTouchedFiles?: ReadonlyMap<string, AgentSessionPhase>;
 
+	/** `performance.now()` at which the current `agentSessions` snapshot was received. Used to
+	 *  age `editedAt` locally — the wire value only advances when the host fires a new snapshot,
+	 *  which stops when the agent goes idle. Without local aging a grace mark would persist until
+	 *  the next event (or until the host's full `activityDecayMs` eviction, minutes later). */
+	private _agentSnapshotReceivedAt = 0;
+
+	/** Per-session structural signatures (id + per-path read/edit flags, NOT timestamps) behind the
+	 *  last `_agentSnapshotReceivedAt` stamp. The aging baseline must only reset when the host actually
+	 *  re-stamps `editedAt` (solely on a file-tool sync, in lockstep with a structural change) — NOT on
+	 *  the far more frequent `agentSessions` fires for status/lastActivity/other sessions, which leave
+	 *  `editedAt` frozen. The `fileActivity` array reference can't be the key: postMessage recreates it
+	 *  on every push, so reference comparison always reports a change and would pin `effectiveAge` near
+	 *  zero, so the grace mark would never expire while the agent runs non-file tools. */
+	private _lastFileActivitySigs = new Set<string>();
+
+	/** Timer that fires when the earliest grace tail expires so we drop the mark on schedule
+	 *  even with no fresh host snapshot. Replaced on each recompute; cleared on disconnect. */
+	private _agentGraceTimer: ReturnType<typeof setTimeout> | undefined;
+
+	override disconnectedCallback(): void {
+		super.disconnectedCallback?.();
+		if (this._agentGraceTimer != null) {
+			clearTimeout(this._agentGraceTimer);
+			this._agentGraceTimer = undefined;
+		}
+	}
+
+	/** Strict realtime with a small grace tail: a file is marked when an agent is *editing* it
+	 *  right now, OR — only while nothing else is currently being edited — for a short
+	 *  {@link agentTouchedGraceMs} window after its last edit so the user actually sees it. The
+	 *  moment any other file becomes `editing === true`, the global "active" gate kicks in and
+	 *  every grace-only mark drops, so the indicator follows the agent rather than accumulating.
+	 *
+	 *  Aging is local: `editedAt` on the wire is host-ms at serialization time and doesn't advance
+	 *  between snapshots, so we add `(performance.now() - _agentSnapshotReceivedAt)` to compute
+	 *  the live age. A one-shot timer (re-armed here) triggers a re-render at the earliest grace
+	 *  expiry so the drop happens on schedule even when the agent goes idle. */
 	private computeAgentTouchedFiles(): ReadonlyMap<string, AgentSessionPhase> | undefined {
 		const sessions = this.agentSessions;
 		const repoPath = this.wip?.repo?.path;
 		if (!sessions?.length || repoPath == null) return undefined;
 
+		// First pass: any actively-editing file across all sessions? When true, the grace branch
+		// is skipped — current activity preempts any tail from a previous edit.
+		let hasAnyActive = false;
+		for (const s of sessions) {
+			if (!isActiveAgentPhase(s.phase)) continue;
+			if (s.fileActivity?.some(e => e.editing === true)) {
+				hasAnyActive = true;
+				break;
+			}
+		}
+
+		const elapsedSinceSnapshot = Math.max(0, performance.now() - this._agentSnapshotReceivedAt);
 		let touched: Map<string, AgentSessionPhase> | undefined;
+		let earliestGraceRemainingMs = Infinity;
+
 		for (const s of sessions) {
 			if (!isActiveAgentPhase(s.phase)) continue;
 
-			const files = s.currentFiles;
-			if (!files?.length) continue;
+			const entries = s.fileActivity;
+			if (!entries?.length) continue;
 
-			for (const abs of files) {
-				const normalized = normalizePath(abs);
+			for (const entry of entries) {
+				const isLive = entry.editing === true;
+				let inGrace = false;
+				let graceRemainingMs = Infinity;
+				if (!isLive && !hasAnyActive && entry.editedAt != null) {
+					const effectiveAge = entry.editedAt + elapsedSinceSnapshot;
+					if (effectiveAge < agentTouchedGraceMs) {
+						inGrace = true;
+						graceRemainingMs = agentTouchedGraceMs - effectiveAge;
+					}
+				}
+				if (!isLive && !inGrace) continue;
+
+				const normalized = normalizePath(entry.path);
 				if (!isDescendant(normalized, repoPath)) continue;
 
 				const rel = relative(repoPath, normalized);
@@ -162,29 +303,83 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 				if (existing !== 'working') {
 					touched.set(rel, s.phase);
 				}
+				if (inGrace && graceRemainingMs < earliestGraceRemainingMs) {
+					earliestGraceRemainingMs = graceRemainingMs;
+				}
 			}
 		}
 
+		// Re-arm the one-shot timer for the earliest grace expiry. Adding a small slack (50ms) so
+		// the re-render lands just past the boundary and the file definitively drops on this pass.
+		if (this._agentGraceTimer != null) {
+			clearTimeout(this._agentGraceTimer);
+			this._agentGraceTimer = undefined;
+		}
+		if (Number.isFinite(earliestGraceRemainingMs)) {
+			this._agentGraceTimer = setTimeout(() => {
+				this._agentGraceTimer = undefined;
+				this._agentTouchedFiles = this.computeAgentTouchedFiles();
+			}, earliestGraceRemainingMs + 50);
+		}
+
 		return touched;
+	}
+
+	/** True when the per-session `fileActivity` STRUCTURE (paths + read/edit flags, ignoring the
+	 *  editedAt/readAt timestamps) differs from the last stamp — i.e. the host actually re-synced file
+	 *  activity (the only event that refreshes `editedAt`, in lockstep with a structural change).
+	 *  Order-independent; updates the stored set as a side effect. Keyed on structure rather than the
+	 *  `fileActivity` reference because postMessage recreates that reference on every push. */
+	private fileActivityStructureChanged(): boolean {
+		const current = new Set<string>();
+		for (const s of this.agentSessions ?? []) {
+			const fa = s.fileActivity;
+			if (fa == null) continue;
+
+			let sig = s.id;
+			for (const e of fa) {
+				sig += `\u0001${e.path}:${e.reading ? 'r' : ''}${e.editing ? 'e' : ''}`;
+			}
+			current.add(sig);
+		}
+		let changed = current.size !== this._lastFileActivitySigs.size;
+		if (!changed) {
+			for (const sig of current) {
+				if (!this._lastFileActivitySigs.has(sig)) {
+					changed = true;
+					break;
+				}
+			}
+		}
+		this._lastFileActivitySigs = current;
+		return changed;
 	}
 
 	protected override willUpdate(changedProperties: PropertyValueMap<any> | Map<PropertyKey, unknown>): void {
 		super.willUpdate?.(changedProperties);
 
 		if (changedProperties.has('agentSessions') || changedProperties.has('wip')) {
+			// Stamp the local receipt time so `editedAt` (host-ms-at-serialization) can be aged
+			// locally between snapshots. Only re-stamp when the `fileActivity` STRUCTURE actually
+			// changed — that is the only time the host re-stamps `editedAt`. Re-stamping on every
+			// `agentSessions` fire (status ticks, lastActivity, other sessions — all of which leave the
+			// structure and thus `editedAt` unchanged) would keep `effectiveAge` pinned near zero and the
+			// grace mark would never expire while the agent runs non-file tools.
+			if (changedProperties.has('agentSessions') && this.fileActivityStructureChanged()) {
+				this._agentSnapshotReceivedAt = performance.now();
+			}
 			this._agentTouchedFiles = this.computeAgentTouchedFiles();
 		}
-	}
-
-	@state()
-	get inReview(): boolean {
-		return this.draftState?.inReview ?? false;
 	}
 
 	get isUnpublished(): boolean {
 		const branch = this.wip?.branch;
 		return branch?.upstream == null || branch.upstream.missing === true;
 	}
+
+	/** Inline Cloud Patch creation is showing. Parked: no trigger sets this yet. */
+	@state()
+	private creatingPatch = false;
 
 	get draftsEnabled(): boolean {
 		return this.orgSettings?.drafts === true;
@@ -250,92 +445,11 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		}
 	}
 
-	protected override renderChangedFilesSlottedContent(): TemplateResult<1> | typeof nothing {
-		if (this.variant === 'embedded' || !this.files?.length) return nothing;
-
-		return html`<div slot="before-tree" class="section section--actions">
-			<button-container>
-				<gl-button
-					full
-					.href=${createCommandLink<ComposerCommandArgs>('gitlens.composeCommits', {
-						repoPath: this.wip?.repo.path,
-						source: 'inspect',
-					})}
-					><code-icon icon="wand" slot="prefix"></code-icon>Compose Commits...<span slot="tooltip"
-						><strong>Compose Commits</strong> (Preview)<br /><i
-							>Automatically or interactively organize changes into meaningful commits</i
-						></span
-					></gl-button
-				>
-				<gl-button appearance="secondary" href="command:workbench.view.scm" tooltip="Commit via SCM"
-					><code-icon rotate="45" icon="arrow-up"></code-icon
-				></gl-button>
-			</button-container>
-		</div>`;
-	}
-
 	private renderSecondaryAction(hasPrimary = true) {
-		if (!this.draftsEnabled || this.inReview) return undefined;
+		if (!this.draftsEnabled || this.creatingPatch) return undefined;
 
-		let label = 'Share as Cloud Patch';
-		let action = 'create-patch';
-		const pr = this.pullRequest;
-		if (pr?.state === 'opened' && equalsIgnoreCase(pr.provider.domain, 'github.com')) {
-			// const isMe = pr.author.name.endsWith('(you)');
-			// if (isMe) {
-			// 	label = 'Share with PR Participants';
-			// 	action = 'create-patch';
-			// } else {
-			// 	label = `Start Review for PR #${pr.id}`;
-			// 	action = 'create-patch';
-			// }
-
-			if (!this.inReview) {
-				label = 'Suggest Changes for PR';
-				action = 'start-patch-review';
-			} else {
-				label = 'Close Suggestion for PR';
-				action = 'end-patch-review';
-			}
-
-			if ((this.wip?.changes?.files.length ?? 0) === 0) {
-				return html`
-					<gl-button
-						?full=${!hasPrimary}
-						appearance="secondary"
-						data-action="${action}"
-						@click=${() => this.onToggleReviewMode(!this.inReview)}
-						.tooltip=${hasPrimary ? label : undefined}
-					>
-						<code-icon icon="gl-code-suggestion" .slot=${!hasPrimary ? 'prefix' : nothing}></code-icon
-						>${!hasPrimary ? label : nothing}
-					</gl-button>
-				`;
-			}
-
-			return html`
-				<gl-button
-					?full=${!hasPrimary}
-					appearance="secondary"
-					data-action="${action}"
-					.tooltip=${hasPrimary ? label : undefined}
-					@click=${() => this.onToggleReviewMode(!this.inReview)}
-				>
-					<code-icon icon="gl-code-suggestion" .slot=${!hasPrimary ? 'prefix' : nothing}></code-icon
-					>${!hasPrimary ? label : nothing}
-				</gl-button>
-				<gl-button
-					appearance="secondary"
-					density="compact"
-					data-action="create-patch"
-					tooltip="Share as Cloud Patch"
-					@click=${() => this.onDataActionClick('create-patch')}
-				>
-					<code-icon icon="gl-cloud-patch-share"></code-icon>
-				</gl-button>
-			`;
-		}
-
+		const label = 'Share as Cloud Patch';
+		const action = 'create-patch';
 		if ((this.wip?.changes?.files.length ?? 0) === 0) return undefined;
 
 		return html`
@@ -396,41 +510,6 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		</div>`;
 	}
 
-	private renderSuggestedChanges() {
-		if (!this.codeSuggestions?.length) return nothing;
-		// src="${this.issue!.author.avatarUrl}"
-		// title="${this.issue!.author.name} (author)"
-		return html`
-			<gl-tree>
-				<gl-tree-item branch .expanded=${true} .level=${0}>
-					<code-icon slot="icon" icon="gl-code-suggestion"></code-icon>
-					Code Suggestions
-				</gl-tree-item>
-				${repeat(
-					this.codeSuggestions,
-					draft => draft.id,
-					draft => html`
-						<gl-tree-item
-							.expanded=${true}
-							.level=${1}
-							@gl-tree-item-selected=${() => this.onShowCodeSuggestion(draft.id)}
-						>
-							<gl-avatar
-								class="author-icon"
-								src="${draft.author.avatarUri}"
-								name="${draft.author.name} (author)"
-							></gl-avatar>
-							${draft.title}
-							<span slot="description"
-								><formatted-date .date=${new Date(draft.updatedAt)}></formatted-date
-							></span>
-						</gl-tree-item>
-					`,
-				)}
-			</gl-tree>
-		`;
-	}
-
 	private renderPullRequest() {
 		if (this.pullRequest == null) return nothing;
 
@@ -466,13 +545,15 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 						url="${this.pullRequest.url}"
 						identifier="#${this.pullRequest.id}"
 						status="${this.pullRequest.state}"
+						.stack=${this.pullRequest.stack}
+						.author=${this.pullRequest.author?.name}
+						date-label="updated"
 						.date=${this.pullRequest.updatedDate}
 						.dateFormat="${this.preferences?.dateFormat}"
 						.dateStyle="${this.preferences?.dateStyle}"
 						details
 					></issue-pull-request>
 				</div>
-				${this.renderSuggestedChanges()}
 			</webview-pane>
 		`;
 	}
@@ -500,7 +581,13 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 	}
 
 	private renderPatchCreation() {
-		if (!this.inReview) return nothing;
+		if (!this.creatingPatch) return nothing;
+
+		// NOTE: `gl-inspect-patch` is deliberately NOT imported by this module. Nothing sets
+		// `creatingPatch`, so a top-level side-effect import pulled that element and its patch-create tree
+		// into every bundle rendering working changes, to draw something that can never appear. Whoever
+		// un-parks this feature must import it again — an unregistered element renders inert — and should
+		// do it lazily here rather than at module scope.
 
 		return html`<gl-inspect-patch
 			.orgSettings=${this.orgSettings}
@@ -508,7 +595,7 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 			.generate=${this.generate}
 			.createState=${this.patchCreateState}
 			@gl-patch-create-patch=${(e: CustomEvent) => {
-				void this.dispatchEvent(new CustomEvent('gl-inspect-create-suggestions', { detail: e.detail }));
+				void this.dispatchEvent(new CustomEvent('gl-inspect-create-patch', { detail: e.detail }));
 			}}
 		></gl-inspect-patch>`;
 	}
@@ -521,7 +608,7 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		}
 
 		const hasFiles = (this.files?.length ?? 0) > 0;
-		if (!hasFiles && !this.inReview) {
+		if (!hasFiles && !this.creatingPatch) {
 			return html`
 				${this.renderActions()} ${this.renderPausedOpStatus()}
 				<gl-details-wip-empty-pane
@@ -544,7 +631,7 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 			${this.renderActions()} ${this.renderPausedOpStatus()}
 			<webview-pane-group flexible>
 				${this.renderPullRequest()}
-				${when(this.inReview === false, () => this.renderChangedFiles('wip'))}${this.renderPatchCreation()}
+				${when(this.creatingPatch === false, () => this.renderChangedFiles('wip'))}${this.renderPatchCreation()}
 			</webview-pane-group>
 		`;
 	}
@@ -556,6 +643,8 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		return html`<div class="paused-op">
 			<gl-merge-rebase-status
 				?conflicts=${this.wip?.changes?.hasConflicts ?? false}
+				.conflictsCount=${this.wip?.stats?.conflictsCount}
+				?continuing=${this.wip?.changes?.pausedOpContinuing ?? false}
 				.pausedOpStatus=${pausedOpStatus}
 			></gl-merge-rebase-status>
 		</div>`;
@@ -583,11 +672,14 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 				.collapsable=${this.filesCollapsable}
 				?show-file-icons=${this.fileIcons}
 				?checkable=${this.checkboxMode}
+				?multi-selectable=${true}
 				?bulk-conflict-actions=${this.bulkConflictActions}
+				?resolve-enabled=${this.resolveEnabled}
 				.showSearchBox=${this.showSearchBox}
 				.searchBoxFilter=${this.searchBoxFilter}
 				.fileActions=${this._getFileActions}
 				.fileContext=${this._getFileContext}
+				.contextRevision=${this.fileContextRevision}
 				.folderContext=${this._getFolderContext}
 				.searchContext=${this.searchContext}
 				.multiDiff=${this.getMultiDiffRefs()}
@@ -612,6 +704,12 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		return { repoPath: repoPath, lhs: 'HEAD', rhs: '', wip: true, title: 'Working Changes' };
 	}
 
+	// Coalesces the selection-aware checkbox fan-out — gl-file-tree-pane dispatches one synchronous
+	// `file-checked` per selected file — into a single stage/unstage, so the host runs ONE atomic
+	// `git add`/`git reset` instead of N concurrent ops that collide on `.git/index.lock` and leave
+	// some files behind. Flushed on a microtask, after the synchronous fan-out has drained.
+	private _checkedBatch?: { checked: boolean; repoPath: string; files: File[] };
+
 	protected override onFileChecked(e: CustomEvent<TreeItemCheckedDetail>): void {
 		if (!e.detail.context) return;
 
@@ -619,15 +717,33 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		const repoPath = file.repoPath ?? this.wip?.repo?.path;
 		if (!repoPath) return;
 
+		// Start a new batch when none is pending or the action flips (check vs uncheck); the fan-out
+		// applies a single action across the whole selection, so a batch is action-homogeneous.
+		if (this._checkedBatch?.checked !== e.detail.checked) {
+			this._checkedBatch = { checked: e.detail.checked, repoPath: repoPath, files: [] };
+			queueMicrotask(() => this.flushCheckedBatch());
+		}
+		this._checkedBatch.files.push(file);
+	}
+
+	private flushCheckedBatch(): void {
+		const batch = this._checkedBatch;
+		this._checkedBatch = undefined;
+		if (batch == null) return;
+		if (!batch.files.length) return;
+
+		const [first] = batch.files;
 		const detail = {
-			path: file.path,
-			repoPath: repoPath,
-			status: file.status,
-			staged: file.staged,
+			path: first.path,
+			repoPath: batch.repoPath,
+			status: first.status,
+			staged: first.staged,
+			// >1 → carry the whole set so the host stages/unstages them in one atomic op.
+			files: batch.files.length > 1 ? batch.files : undefined,
 		};
 
 		this.dispatchEvent(
-			new CustomEvent(e.detail.checked ? 'file-stage' : 'file-unstage', {
+			new CustomEvent(batch.checked ? 'file-stage' : 'file-unstage', {
 				detail: detail,
 			}),
 		);
@@ -648,11 +764,15 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 				<div class="header__identity-left">
 					<span class="header__wip-title">Working Changes</span>
 					<span class="header__wip-subtitle">
-						${this.worktreePath
-							? html`<code-icon icon="folder"></code-icon> ${this.worktreePath}`
-							: html`${stagedCount > 0 || unstagedCount > 0
-									? `${stagedCount} staged · ${unstagedCount} unstaged`
-									: 'No changes'}`}
+						${
+							this.worktreePath
+								? html`<code-icon icon="folder"></code-icon> ${this.worktreePath}`
+								: html`${
+										stagedCount > 0 || unstagedCount > 0
+											? `${stagedCount} staged · ${unstagedCount} unstaged`
+											: 'No changes'
+									}`
+						}
 					</span>
 				</div>
 				<div class="header__identity-right">
@@ -668,16 +788,20 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 				</div>
 			</div>
 			<div class="header__branch-row">
-				${branchName
-					? html`<gl-branch-name
-							class="header__branch-pill"
-							appearance="pill"
-							.name=${branchName}
-						></gl-branch-name>`
-					: nothing}
-				${filesCount > 0
-					? html`<commit-stats modified="${filesCount}" symbol="icons" appearance="pill"></commit-stats>`
-					: nothing}
+				${
+					branchName
+						? html`<gl-branch-name
+								class="header__branch-pill"
+								appearance="pill"
+								.name=${branchName}
+							></gl-branch-name>`
+						: nothing
+				}
+				${
+					filesCount > 0
+						? html`<commit-stats modified="${filesCount}" symbol="icons" appearance="pill"></commit-stats>`
+						: nothing
+				}
 			</div>
 			${this.renderPausedOpStatus()}
 		</div>`;
@@ -689,6 +813,14 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		// performs staging. Stage routes through the existing `file-stage` event, which prompts
 		// when unresolved conflict markers remain.
 		if (isConflictStatus(file.status)) {
+			if (this.conflictDetails) {
+				if (this.resolveEnabled) {
+					return this.checkboxMode
+						? conflictedCheckboxActionsWithDetailsResolve
+						: conflictedActionsWithDetailsResolve;
+				}
+				return this.checkboxMode ? conflictedCheckboxActionsWithDetails : conflictedActionsWithDetails;
+			}
 			return this.checkboxMode ? conflictedCheckboxActions : conflictedActions;
 		}
 
@@ -707,7 +839,14 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		return buildFolderContext(this.wip?.repo?.path, folder);
 	}
 
-	override getFileContext(file: File): string | undefined {
+	/** `getFileContext` returns nothing until the repo path is known, and the working-changes payload
+	 *  arrives after the files do — without this the rows keep those empty contexts and no per-file menu
+	 *  ever gates on, since the callback cannot invalidate the tree's cached model by itself. */
+	protected override get fileContextRevision(): unknown {
+		return this.wip?.repo?.path;
+	}
+
+	override getFileContext(file: File, options?: Partial<TreeItemBase>): string | undefined {
 		if (!this.wip?.repo?.path) return undefined;
 
 		// Two-char `XY` conflict statuses (UU/AA/UD/DU/AU/UA/DD) carry the side semantics
@@ -728,6 +867,12 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 			webviewItem = `gitlens:file${modifiers.join('')}`;
 		} else {
 			webviewItem = file.staged ? 'gitlens:file+staged' : 'gitlens:file+unstaged';
+			// Checkbox mode dedupes a mixed file (staged + unstaged) to its unstaged row; gl-wip-tree-pane
+			// flags that row via `options.mixed` (same source as the inline Stage/Unstage actions) so the
+			// context menu can offer the staged/combined diffs the single row otherwise can't reach.
+			if (options?.mixed) {
+				webviewItem += '+mixed';
+			}
 		}
 
 		const context: DetailsItemTypedContext = {
@@ -747,14 +892,6 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 
 	private onDataActionClick(name: string) {
 		void this.dispatchEvent(new CustomEvent('data-action', { detail: { name: name } }));
-	}
-
-	private onToggleReviewMode(inReview: boolean) {
-		this.dispatchEvent(new CustomEvent('draft-state-changed', { detail: { inReview: inReview } }));
-	}
-
-	private onShowCodeSuggestion(id: string) {
-		this.dispatchEvent(new CustomEvent('gl-show-code-suggestion', { detail: { id: id } }));
 	}
 }
 

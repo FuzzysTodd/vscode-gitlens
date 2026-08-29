@@ -1,22 +1,21 @@
+import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
-import { html, LitElement, nothing } from 'lit';
-import { customElement, property, query, state } from 'lit/decorators.js';
+import { html, LitElement } from 'lit';
+import { customElement, property, query } from 'lit/decorators.js';
 import { urls } from '../../../../constants.js';
 import { SubscriptionState } from '../../../../constants.subscription.js';
 import type { GraphWalkthroughContextKeys } from '../../../../constants.walkthroughs.js';
 import { createCommandLink } from '../../../../system/commands.js';
-import type { State } from '../../../welcome/protocol.js';
 import { scrollableBase } from '../../shared/components/styles/lit/base.css.js';
-import { ipcContext } from '../../shared/contexts/ipc.js';
-import type { TelemetryContext } from '../../shared/contexts/telemetry.js';
-import { telemetryContext } from '../../shared/contexts/telemetry.js';
-import { stateContext } from '../context.js';
+import { welcomeStateContext } from '../state.js';
+import type { WelcomeState } from '../state.js';
 import { welcomeStyles } from './welcome-page.css.js';
 import '../../shared/components/gitlens-logo-circle.js';
 import '../../shared/components/button.js';
 import '../../shared/components/code-icon.js';
+import '../../shared/components/icons/icon-cube.js';
 import './welcome-parts.js';
-import type { GlWalkthrough, WalkthroughStep } from './welcome-parts.js';
+import type { GlWalkthrough, WalkthroughStep, WalkthroughStepConditionState } from './welcome-parts.js';
 
 type GraphWalkthroughStep = {
 	id: string;
@@ -197,21 +196,6 @@ const walkthroughSteps: WalkthroughStep[] = [
 	},
 
 	{
-		id: 'home-view',
-		walkthroughKey: 'homeView',
-		title: 'Streamline Workflow with the Home View',
-		body: html`
-			<p>
-				Streamline your workflow — effortlessly track, manage, and collaborate on your branches and pull
-				requests, all in one intuitive hub.
-			</p>
-			<div class="card-part--centered">
-				<gl-button href="command:gitlens.welcome.showHomeView">Open Home View</gl-button>
-			</div>
-		`,
-	},
-
-	{
 		id: 'ai-features',
 		walkthroughKey: 'aiFeatures',
 		title: 'Commit smarter, not harder',
@@ -237,7 +221,7 @@ const walkthroughSteps: WalkthroughStep[] = [
 				and model to fit your needs.
 			</p>
 			<div class="card-part--centered">
-				<gl-button href="command:gitlens.welcome.showComposer">Compose Commits with AI</gl-button>
+				<gl-button href="command:gitlens.welcome.showComposer">Compose Commits</gl-button>
 			</div>
 		`,
 	},
@@ -282,6 +266,26 @@ const walkthroughSteps: WalkthroughStep[] = [
 	},
 
 	{
+		id: 'kepler',
+		walkthroughKey: 'kepler',
+		title: 'Take your agent workflows further',
+		body: html`
+			<p>
+				GitLens helps you understand and review agent-generated work inside your IDE. Kepler, GitKraken's
+				Agentic Development Environment (ADE), gives you a dedicated workspace to coordinate AI agents, organize
+				Tasks, and manage complex development workflows from one place.
+			</p>
+			<p>
+				Start from an issue or pull request, and Kepler creates the environment, launches the agent, and keeps
+				related work organized in a single Task across repositories.
+			</p>
+			<div class="card-part--centered">
+				<gl-button href="command:gitlens.welcome.openKepler">Get Kepler</gl-button>
+			</div>
+		`,
+	},
+
+	{
 		id: 'mcp-bundled',
 		walkthroughKey: 'mcpFeatures',
 		title: 'GitKraken MCP',
@@ -291,7 +295,7 @@ const walkthroughSteps: WalkthroughStep[] = [
 				perform actions. You can also connect MCP to other agents on your machine.
 			</p>
 			<div class="card-part--centered">
-				<gl-button href="${createCommandLink('gitlens.ai.mcp.selectAgents', { source: 'welcome' })}"
+				<gl-button href="${createCommandLink('gitlens.ai.mcp.installForAllAgents', { source: 'welcome' })}"
 					>Connect More Agents</gl-button
 				>
 			</div>
@@ -309,7 +313,7 @@ const walkthroughSteps: WalkthroughStep[] = [
 				perform actions. You can also connect MCP to other agents on your machine.
 			</p>
 			<div class="card-part--centered">
-				<gl-button href="${createCommandLink('gitlens.ai.mcp.selectAgents', { source: 'welcome' })}"
+				<gl-button href="${createCommandLink('gitlens.ai.mcp.installForAllAgents', { source: 'welcome' })}"
 					>Connect More Agents</gl-button
 				>
 			</div>
@@ -383,7 +387,7 @@ const graphWalkthroughSteps: GraphWalkthroughStep[] = [
 	{
 		id: 'graph-ai-review',
 		graphWalkthroughKey: 'graphAiReview',
-		title: 'Review changes with AI in the details panel',
+		title: 'Review changes in the details panel',
 		body: html`
 			<p>
 				The new Review mode in the details panel reads through any commits or WIP and surfaces severity-tagged
@@ -451,8 +455,8 @@ const graphWalkthroughSteps: GraphWalkthroughStep[] = [
 ];
 
 @customElement('gl-welcome-page')
-export class GlWelcomePage extends LitElement {
-	static override styles = [scrollableBase, welcomeStyles];
+export class GlWelcomePage extends SignalWatcher(LitElement) {
+	static override styles = [scrollableBase, ...welcomeStyles];
 
 	@property({ type: Boolean })
 	closeable = false;
@@ -463,15 +467,8 @@ export class GlWelcomePage extends LitElement {
 	@property({ type: Boolean })
 	private isLightTheme = false;
 
-	@consume<State>({ context: stateContext, subscribe: true })
-	@state()
-	private _state!: State;
-
-	@consume({ context: ipcContext })
-	_ipc!: typeof ipcContext.__context__;
-
-	@consume({ context: telemetryContext as { __context__: TelemetryContext } })
-	_telemetry!: TelemetryContext;
+	@consume({ context: welcomeStateContext })
+	private _state!: WelcomeState;
 
 	@query('gl-walkthrough')
 	private walkthrough?: GlWalkthrough;
@@ -493,14 +490,6 @@ export class GlWelcomePage extends LitElement {
 
 	override connectedCallback(): void {
 		super.connectedCallback?.();
-		this._telemetry.sendEvent({
-			name: 'welcome/action',
-			data: {
-				name: 'shown',
-			},
-			source: { source: 'welcome' },
-		});
-
 		window.addEventListener('gl-walkthrough-focus-command', this.handleWalkthroughFocusCommand);
 		this.addEventListener('click', this.handleClick);
 	}
@@ -511,16 +500,25 @@ export class GlWelcomePage extends LitElement {
 		this.removeEventListener('click', this.handleClick);
 	}
 
-	override render(): unknown {
-		if (!this._state) return nothing;
+	/** Snapshot of the condition inputs the step definitions evaluate — see `WalkthroughStepConditionState`. */
+	private getStepConditionState(): WalkthroughStepConditionState {
+		return {
+			plusState: this._state.plusState.get(),
+			mcpNeedsInstall: this._state.mcpNeedsInstall.get(),
+			mcpShowCleanupNotice: this._state.mcpShowCleanupNotice.get(),
+		};
+	}
 
-		if (this._state.mode === 'graph') {
+	override render(): unknown {
+		if (this._state.mode.get() === 'graph') {
 			return this.renderGraphWalkthrough();
 		}
 		return this.renderMainWalkthrough();
 	}
 
 	private renderMainWalkthrough(): unknown {
+		const progress = this._state.walkthroughProgress.get();
+
 		return html`
 			<div part="page" class="welcome scrollable">
 				<div class="section header">
@@ -532,26 +530,28 @@ export class GlWelcomePage extends LitElement {
 				</div>
 				<gl-walkthrough-progress
 					class="section"
-					.doneCount=${this._state.walkthroughProgress?.doneCount ?? 0}
-					.allCount=${this._state.walkthroughProgress?.allCount ?? 0}
+					.doneCount=${progress?.main.doneCount ?? 0}
+					.allCount=${progress?.main.allCount ?? 0}
 				></gl-walkthrough-progress>
 				<div class="section section--centered">
 					<p>
 						<a class="back-link" href="${createCommandLink('gitlens.showWelcomeView', { mode: 'graph' })}"
-							>See what's new in the Commit Graph &rarr;</a
+							>Get Started with the Commit Graph &rarr;</a
 						>
 					</p>
 				</div>
 				<gl-walkthrough class="section">
 					${walkthroughSteps
-						.filter(step => !step.condition || step.condition(this._state))
+						.filter(step => !step.condition || step.condition(this.getStepConditionState()))
 						.map(
 							step => html`
 								<gl-walkthrough-step
 									class="card"
 									stepId=${step.id}
-									.completed=${step.walkthroughKey != null &&
-									this._state.walkthroughProgress?.state[step.walkthroughKey] === true}
+									.completed=${
+										step.walkthroughKey != null &&
+										progress?.main.state[step.walkthroughKey] === true
+									}
 								>
 									<h1 slot="title">${step.title}</h1>
 									${step.body}
@@ -572,20 +572,25 @@ export class GlWelcomePage extends LitElement {
 	}
 
 	private renderGraphWalkthrough(): unknown {
+		const progress = this._state.walkthroughProgress.get();
+
 		return html`
 			<div part="page" class="welcome scrollable">
 				<div class="section section--back">
 					<a href="${createCommandLink('gitlens.showWelcomeView')}" class="back-link"
-						>&larr; Back to the GitLens walkthrough</a
+						>&larr; Back to Get Started with GitLens</a
 					>
 				</div>
 				<div class="section header">
-					<h1><gitlens-logo-circle></gitlens-logo-circle><span>What's new in GitLens 18</span></h1>
+					<h1 class="header__title--graph">
+						<gl-icon-cube appearance="brand" icon="gl-graph"></gl-icon-cube>
+						<span>Get Started with the Graph</span>
+					</h1>
 				</div>
 				<gl-walkthrough-progress
 					class="section"
-					.doneCount=${this._state.graphWalkthroughProgress?.doneCount ?? 0}
-					.allCount=${this._state.graphWalkthroughProgress?.allCount ?? 0}
+					.doneCount=${progress?.graph.doneCount ?? 0}
+					.allCount=${progress?.graph.allCount ?? 0}
 				></gl-walkthrough-progress>
 				<gl-walkthrough class="section">
 					${graphWalkthroughSteps.map(
@@ -593,8 +598,7 @@ export class GlWelcomePage extends LitElement {
 							<gl-walkthrough-step
 								class="card"
 								stepId=${step.id}
-								.completed=${this._state.graphWalkthroughProgress?.state[step.graphWalkthroughKey] ===
-								true}
+								.completed=${progress?.graph.state[step.graphWalkthroughKey] === true}
 							>
 								<h1 slot="title">${step.title}</h1>
 								${step.body}

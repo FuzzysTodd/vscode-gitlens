@@ -32,7 +32,15 @@ export class OrganizationService implements Disposable {
 	) {
 		this._disposable = Disposable.from(
 			once(container.onReady)(async () => {
-				const orgId = await this.getActiveOrganizationId();
+				// Always resolve org permissions on ready — including no account/org (orgId undefined),
+				// which applies the fallback defaults (AI allowed). Guard the lookup so a failure still
+				// applies those defaults rather than leaving the org context unset (which would gate AI off).
+				let orgId: string | undefined;
+				try {
+					orgId = await this.getActiveOrganizationId();
+				} catch {
+					orgId = undefined;
+				}
 				void this.updateOrganizationPermissions(orgId);
 			}),
 			container.subscription.onDidCheckIn(this.onUserCheckedIn, this),
@@ -59,10 +67,11 @@ export class OrganizationService implements Disposable {
 		}
 
 		if (this._organizations === undefined || options?.force) {
-			if (!options?.force) {
+			if (this._organizations == null) {
 				this.loadStoredOrganizations(userId);
-				if (this._organizations != null) return this._organizations;
 			}
+
+			if (!options?.force && this._organizations != null) return this._organizations;
 
 			let rsp;
 			try {
@@ -86,7 +95,9 @@ export class OrganizationService implements Disposable {
 					`Unable to get organizations due to error: ${getPresentableErrorMessage(ex)}`,
 					'OK',
 				);
-				this.updateOrganizations(undefined);
+				if (this._organizations == null) {
+					this.updateOrganizations(undefined);
+				}
 				return this._organizations;
 			}
 
@@ -96,8 +107,10 @@ export class OrganizationService implements Disposable {
 
 				void window.showErrorMessage(`Unable to get organizations; Status: ${rsp.statusText}`, 'OK');
 
-				// Setting to null prevents hitting the API again until you reload
-				this.updateOrganizations(null);
+				if (this._organizations == null) {
+					// Setting to null prevents hitting the API again until you reload
+					this.updateOrganizations(null);
+				}
 				return this._organizations;
 			}
 

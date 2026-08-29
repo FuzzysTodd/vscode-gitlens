@@ -11,7 +11,7 @@
 			@font-face {
 				font-family: 'glicons';
 				font-display: block;
-				src: url('#{root}/dist/glicons.woff2?6d6df3d609ab75f20b22aecdd3ed6c98') format('woff2');
+				src: url('#{root}/dist/glicons.woff2?a1ae374da018b0b3806653d327a4a2d9') format('woff2');
 			}
 			@font-face {
 				font-family: 'seti';
@@ -29,6 +29,6 @@
 		data-placement="#{placement}"
 		data-vscode-context='{ "preventDefaultContextMenuItems": true, "webview": "#{webviewId}", "webviewInstance": "#{webviewInstanceId}" }'
 	>
-		<gl-graph-apphost name="GraphView" placement="#{placement}" bootstrap="#{state}"></gl-graph-apphost>
+		<gl-graph-apphost name="GraphView" placement="#{placement}" context="#{state}"></gl-graph-apphost>
 	</body>
 </html>

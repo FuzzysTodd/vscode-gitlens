@@ -3,11 +3,23 @@ import type { AgentSessionPhase } from '@gitlens/agents/types.js';
 import type { GitFileStatus } from '@gitlens/git/models/fileStatus.js';
 import type { DraftPatchFileChange } from '../../../../../plus/drafts/models/drafts.js';
 
+/** `dataTransfer` type used when a draggable file row (opt-in `draggableFiles`) is dragged; the
+ *  payload is the row's file `path`. Consumers key their drop handling off this type. */
+export const treeItemFileDragDataType = 'application/x-gitlens-file-path';
+
 export interface TreeItemBase {
 	// node properties
 	branch: boolean;
 	expanded: boolean;
 	path: string;
+	/**
+	 * Optional unique identity for the row. Defaults to {@link path}. Grouped trees (e.g. WIP
+	 * Conflicts/Staged/Unstaged) build an independent folder hierarchy per group, so the same
+	 * folder/file `path` can appear under multiple groups — `key` disambiguates them so the tree's
+	 * path-keyed machinery (node map, virtualizer, selection, expansion) stays collision-free.
+	 * `path` remains the real file/folder path for display and file resolution.
+	 */
+	key?: string;
 
 	// parent
 	parentPath?: string;
@@ -20,6 +32,10 @@ export interface TreeItemBase {
 	checkable: boolean;
 	checked?: boolean | 'indeterminate';
 	disableCheck?: boolean;
+	/** When set, the checkbox is fully controlled by `checked` (model-driven): a user toggle does NOT
+	 *  optimistically flip the box — it stays put until the model updates. Use for checkboxes whose
+	 *  action can be blocked or cancelled (e.g. staging a conflicted file behind a confirm prompt). */
+	controlledCheck?: boolean;
 	checkableTooltip?: string;
 	/** Alt-action tooltip — surfaced only when the checkbox has a distinct alt+click behavior
 	 *  (currently set by `gl-file-tree-pane` for mixed-state files where alt+click flips to
@@ -45,6 +61,16 @@ export interface TreeItemAction {
 	altLabel?: string;
 	altAction?: string;
 	altArguments?: any[];
+
+	/**
+	 * How the action applies when clicked on a row that's part of a multi-selection (VS Code SCM
+	 * inline-action behavior). `'fanOut'` (default) repeats the action per selected file (for ops that
+	 * apply to any row, e.g. Open File); `'batch'` dispatches a single event carrying the whole
+	 * selection (`detail.files`) so ops like stage/unstage/discard act once; `'single'` ignores the
+	 * selection and acts only on the clicked row — for row-specific actions (conflict Open Current/
+	 * Incoming, a staged-changes diff) that would open wrong/empty content if fanned out.
+	 */
+	multiBehavior?: 'fanOut' | 'batch' | 'single';
 }
 
 export interface TreeItemDecorationBase {
@@ -54,22 +80,19 @@ export interface TreeItemDecorationBase {
 	position?: 'before' | 'after';
 }
 
+/** Color treatment for an icon decoration, keyed to the Launchpad indicator colors. */
+export type TreeItemDecorationIconKind = 'launchpad-mergeable' | 'launchpad-blocked' | 'launchpad-attention';
+
 export interface TreeItemDecorationIcon extends TreeItemDecorationBase {
 	type: 'icon';
 	icon: string;
+	/** Renders in the description color — for a glyph that marks state rather than demanding attention. */
+	muted?: boolean;
+	/** When set, colors the icon — rendered as a `decoration-icon--<kind>` class (see `tree.css.ts`). */
+	kind?: TreeItemDecorationIconKind;
 }
 
-export type TreeItemDecorationKind =
-	| 'added'
-	| 'deleted'
-	| 'modified'
-	| 'untracked'
-	| 'renamed'
-	| 'conflict'
-	| 'muted'
-	| 'agent-working'
-	| 'agent-waiting'
-	| 'agent-idle';
+export type TreeItemDecorationKind = 'added' | 'deleted' | 'modified' | 'untracked' | 'renamed' | 'conflict' | 'muted';
 
 export interface TreeItemDecorationText extends TreeItemDecorationBase {
 	type: 'text';
@@ -102,12 +125,22 @@ export interface TreeItemDecorationAgent extends TreeItemDecorationBase {
 	tooltip?: string;
 }
 
+/** Clean/dirty only — the badge renders a pencil or a check and nothing finer. A row wanting the `+N ~M -K`
+ *  breakdown fetches it for its tooltip; carrying the numbers here would oblige every producer to run a
+ *  `git status` per row to fill fields the badge doesn't draw. */
 export interface TreeItemDecorationWip extends TreeItemDecorationBase {
 	type: 'wip';
 	hasChanges: boolean;
-	added?: number;
-	changed?: number;
-	deleted?: number;
+}
+
+/** A row's position within an ordered stack. Rendered as a glyph plus `layer/size`: the glyph names the
+ *  concept, which the fraction alone can't — `2/3` beside a title reads as a checklist or a review count. */
+export interface TreeItemDecorationStack extends TreeItemDecorationBase {
+	type: 'stack';
+	/** 1-based, where 1 is closest to the stack's base. */
+	layer: number;
+	size: number;
+	tooltip?: string;
 }
 
 export type TreeItemDecoration =
@@ -117,7 +150,8 @@ export type TreeItemDecoration =
 	| TreeItemDecorationTracking
 	| TreeItemDecorationConflict
 	| TreeItemDecorationAgent
-	| TreeItemDecorationWip;
+	| TreeItemDecorationWip
+	| TreeItemDecorationStack;
 
 interface TreeModelBase<Context = any[]> extends TreeItemBase {
 	label: string;
@@ -126,7 +160,8 @@ interface TreeModelBase<Context = any[]> extends TreeItemBase {
 		| { type: 'status'; name: GitFileStatus }
 		| { type: 'branch'; status?: string; worktree?: boolean; hasChanges?: boolean }
 		| { type: 'file-icon'; filename: string }
-		| { type: 'agent'; phase: AgentSessionPhase };
+		| { type: 'agent'; phase: AgentSessionPhase; provider?: string }
+		| { type: 'pull-request'; state?: string; draft?: boolean };
 	description?: string;
 	context?: Context;
 	actions?: TreeItemAction[];
@@ -136,10 +171,15 @@ interface TreeModelBase<Context = any[]> extends TreeItemBase {
 	 *  is rendered directly, bypassing markdown — letting callers produce richer layouts with
 	 *  their own scoped styles when a markdown string would be too constrained. */
 	tooltip?: string | TemplateResult;
+	/** Overrides the tooltip's wrapping behavior under the tree's default placement. */
+	tooltipWrap?: 'break-all';
 	filterText?: string;
 	matched?: boolean;
 	/** Lower sorts first within its parent; treated as `0` when unset. */
 	priority?: number;
+	/** Dims the whole row (label, icon, description) to de-emphasize it while keeping it legible and
+	 *  its actions clickable — e.g. an ended agent session shown as done history. */
+	muted?: boolean;
 }
 
 export interface TreeModel<Context = any[]> extends TreeModelBase<Context> {
@@ -158,6 +198,21 @@ export interface TreeItemSelectionDetail {
 	altKey: boolean;
 	ctrlKey: boolean;
 	metaKey: boolean;
+	/** Optional so existing synthetic-detail constructors (keyboard activation, branch toggle, host
+	 *  re-dispatch) need no change; absence is treated as "shift not held". */
+	shiftKey?: boolean;
+}
+
+/**
+ * Emitted by a multi-selectable `gl-tree-view` whenever the selected set changes. Carries the full
+ * ordered selection (leaf rows) so hosts can act on the batch. Empty `nodes` means selection cleared.
+ */
+export interface TreeSelectionChangedDetail {
+	nodes: TreeModelFlat[];
+	paths: string[];
+	contexts: unknown[];
+	/** The id that most recently changed the selection (anchor / last-clicked), if any. */
+	lastPath: string | undefined;
 }
 
 export interface TreeItemActionDetail extends TreeItemSelectionDetail {

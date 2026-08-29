@@ -129,7 +129,7 @@ export const FeedbackQuickInputButton: QuickInputButton = {
 export const FetchQuickInputButton: QuickInputButton = {
 	iconPath: new ThemeIcon('repo-fetch'),
 	tooltip: 'Fetch',
-	location: getQuickInputButtonLocation(QuickInputButtonLocation.Inline),
+	location: getQuickInputButtonLocation(QuickInputButtonLocation.Input),
 };
 
 export const GenerateStashMessageQuickInputButton: QuickInputButton = {
@@ -216,23 +216,6 @@ export const PickCommitQuickInputButton: QuickInputButton = {
 	tooltip: 'Choose a Specific Commit',
 };
 
-export const PickCommitToggleQuickInputButton = class extends ToggleQuickInputButton {
-	constructor(on = false, context: { showTags: boolean }, onDidClick?: (quickInput: QuickInput) => void) {
-		super(
-			() => ({
-				on: { tooltip: 'Choose a Specific Commit', icon: new ThemeIcon('git-commit') },
-				off: {
-					tooltip: `Choose a Branch${context.showTags ? ' or Tag' : ''}`,
-					icon: new ThemeIcon('git-branch'),
-				},
-			}),
-			on,
-		);
-
-		this.onDidClick = onDidClick;
-	}
-};
-
 export const LearnAboutProQuickInputButton: QuickInputButton = {
 	iconPath: new ThemeIcon('info'),
 	tooltip: 'Learn about GitLens Pro',
@@ -241,6 +224,11 @@ export const LearnAboutProQuickInputButton: QuickInputButton = {
 export const MergeQuickInputButton: QuickInputButton = {
 	iconPath: new ThemeIcon('merge'),
 	tooltip: 'Merge...',
+};
+
+export const OpenLogsQuickInputButton: QuickInputButton = {
+	iconPath: new ThemeIcon('output'),
+	tooltip: 'Open Logs',
 };
 
 export const OpenOnJiraQuickInputButton: QuickInputButton = {
@@ -316,6 +304,11 @@ export const RevealInSideBarQuickInputButton: QuickInputButton = {
 export const SetRemoteAsDefaultQuickInputButton: QuickInputButton = {
 	iconPath: new ThemeIcon('settings-gear'),
 	tooltip: 'Set as Default Remote',
+};
+
+export const SkipConfirmationsSettingsQuickInputButton: QuickInputButton = {
+	iconPath: new ThemeIcon('gear'),
+	tooltip: 'Open the Skipped Confirmations Setting',
 };
 
 export const ShowDetailsViewQuickInputButton: QuickInputButton = {

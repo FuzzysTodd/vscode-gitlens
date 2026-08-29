@@ -16,7 +16,7 @@ import type { ViewFilesLayout } from '../../../../../config.js';
 import { serializeWebviewItemContext } from '../../../../../system/webview.js';
 import type { DetailsItemTypedContext } from '../../../../plus/graph/detailsProtocol.js';
 import { buildFolderContext } from '../../../../plus/graph/detailsProtocol.js';
-import type { ScopeSelection } from '../../../../plus/graph/graphService.js';
+import type { ScopeFile, ScopeSelection } from '../../../../plus/graph/graphService.js';
 import type { AiModelInfo } from '../../../../rpc/services/types.js';
 import { redispatch } from '../../../shared/components/element.js';
 import {
@@ -25,12 +25,15 @@ import {
 	subPanelEnterStyles,
 } from '../../../shared/components/styles/lit/base.css.js';
 import type { TreeItemAction, TreeItemCheckedDetail } from '../../../shared/components/tree/base.js';
-import { countIncludedFiles, pruneExcludedToFiles, syncAiExcluded } from './aiExclusion.js';
+import { renderOpenChangesAction } from '../../../shared/components/tree/file-tree-utils.js';
+import type { FileChangeListItemDetail } from '../../../shared/components/tree/gl-file-tree-pane.js';
+import { countIncludedFiles, prunePathsToFiles, syncAiExcluded } from './aiExclusion.js';
 import type { GlCommitsScopePane, ScopeItem } from './gl-commits-scope-pane.js';
 import {
 	panelActionInputStyles,
 	panelErrorStyles,
 	panelHostStyles,
+	panelLoadingStageStyles,
 	panelLoadingStyles,
 	panelScopeSplitStyles,
 	panelStaleBannerStyles,
@@ -38,7 +41,13 @@ import {
 	reviewModePanelStyles,
 } from './gl-details-review-mode-panel.css.js';
 import { formatFindingAsMarkdown, formatFocusAreaAsMarkdown, formatReviewAsMarkdown } from './reviewFormat.js';
-import { getScopeSplitPickerChrome, renderErrorState, renderLoadingState } from './shared-panel-templates.js';
+import {
+	checkAllExclusion,
+	fileCheckedExclusion,
+	scopeSplitSnap,
+	wipScopeSelectionIds,
+} from './shared-panel-helpers.js';
+import { renderErrorState, renderLoadingState } from './shared-panel-templates.js';
 import '../../../shared/components/actions/action-item.js';
 import '../../../shared/components/actions/action-nav.js';
 import '../../../shared/components/ai-input.js';
@@ -97,6 +106,7 @@ export class GlDetailsReviewModePanel extends LitElement {
 		panelHostStyles,
 		panelActionInputStyles,
 		panelLoadingStyles,
+		panelLoadingStageStyles,
 		panelErrorStyles,
 		panelStaleBannerStyles,
 		panelScopeSplitStyles,
@@ -134,7 +144,7 @@ export class GlDetailsReviewModePanel extends LitElement {
 	scopeLoading = false;
 
 	@property({ type: Array })
-	files?: readonly GitFileChangeShape[];
+	files?: readonly ScopeFile[];
 
 	@property({ type: Array })
 	aiExcludedFiles?: readonly string[];
@@ -179,6 +189,8 @@ export class GlDetailsReviewModePanel extends LitElement {
 	lastPrompt?: string;
 
 	@state() private _excludedFiles = new Set<string>();
+	/** Mirrors the pane's multi-selection so the "Open Changes" chip can swap to "Open Selected". */
+	@state() private _selectedFiles: readonly { path: string }[] = [];
 
 	/**
 	 * Pushed by the orchestrator from `state.reviewForwardAvailable`. True after the user clicked
@@ -215,6 +227,9 @@ export class GlDetailsReviewModePanel extends LitElement {
 	@state() private _errorAreas = new Set<string>();
 	@state() private _aiExcludedSet: ReadonlySet<string> | undefined;
 
+	/** Explicit user toggle of the follow-up input; `undefined` = no override (see `refineOpen`). */
+	@state() private _refineExpanded?: boolean;
+
 	override willUpdate(changedProperties: Map<string, unknown>): void {
 		if (changedProperties.has('aiExcludedFiles')) {
 			const result = syncAiExcluded(this.aiExcludedFiles, this._aiExcludedSet, this._excludedFiles);
@@ -227,10 +242,11 @@ export class GlDetailsReviewModePanel extends LitElement {
 		}
 
 		if (changedProperties.has('files')) {
-			const pruned = pruneExcludedToFiles(this._excludedFiles, this.files);
+			const pruned = prunePathsToFiles(this._excludedFiles, this.files);
 			if (pruned != null) {
 				this._excludedFiles = pruned;
 			}
+			this._selectedFiles = [];
 		}
 
 		// Per-result derived state (expand/dismiss/load/error sets) is keyed by area + finding
@@ -253,6 +269,9 @@ export class GlDetailsReviewModePanel extends LitElement {
 				this._dismissedFindings = new Set();
 				this._loadingAreas = new Set();
 				this._errorAreas = new Set();
+				// Drop any explicit follow-up toggle; a fresh result falls back to the default
+				// (open when this run has a prompt to recall — see `refineOpen`).
+				this._refineExpanded = undefined;
 
 				// Auto-expand when there's only a single focus area on a freshly-set result.
 				// Runs against the just-cleared expanded set so a Forward/anchor-switch with a
@@ -308,7 +327,42 @@ export class GlDetailsReviewModePanel extends LitElement {
 			<div class="review-results scrollable">
 				${this.stale ? this.renderStaleBanner() : nothing} ${this.renderOverview()} ${this.renderFocusAreas()}
 			</div>
-			${this.renderReadyFooter()}`;
+			${this.renderReadyFooter()}${this.renderRefineInput()}`;
+	}
+
+	/** Disclosure state for the follow-up input: `undefined` follows the default (open once a
+	 *  refine has run — `lastPrompt` is set), `true`/`false` is an explicit user toggle that
+	 *  overrides the default until the next fresh result. */
+	get refineOpen(): boolean {
+		return this._refineExpanded ?? this.lastPrompt != null;
+	}
+
+	private renderRefineInput() {
+		if (!this.refineOpen) return nothing;
+
+		return html`<gl-ai-input
+			id="review-refine-input"
+			class="review-action-input"
+			multiline
+			active
+			rows="2"
+			button-label="Follow Up"
+			busy-label="Updating review…"
+			event-name="review-refine"
+			placeholder='Follow up — e.g. "Also check for error handling"'
+			.recall=${this.lastPrompt}
+		>
+			<gl-ai-model-chip slot="footer" .model=${this.aiModel}></gl-ai-model-chip>
+		</gl-ai-input>`;
+	}
+
+	private async handleToggleRefine() {
+		const open = !this.refineOpen;
+		this._refineExpanded = open;
+		if (open) {
+			await this.updateComplete;
+			this.renderRoot.querySelector<HTMLElement>('#review-refine-input')?.focus();
+		}
 	}
 
 	private renderReadyFooter() {
@@ -333,15 +387,29 @@ export class GlDetailsReviewModePanel extends LitElement {
 					<code-icon icon="copy"></code-icon>
 				</gl-button>
 			</gl-copy-container>
+			<gl-button
+				class="review-footer__followup"
+				appearance="secondary"
+				aria-expanded=${this.refineOpen ? 'true' : 'false'}
+				@click=${this.handleToggleRefine}
+			>
+				<code-icon icon="sparkle" slot="prefix"></code-icon>
+				Follow-Up
+				<code-icon class="review-footer__followup-chevron" icon="chevron-down" slot="suffix"></code-icon>
+			</gl-button>
+			<gl-button appearance="secondary" @click=${this.handleDiscard}>Discard</gl-button>
 		</div>`;
 	}
 
 	private renderLoadingWithCancel() {
 		// Animation sits behind the spinner/cancel as decoration; uses the review color triplet
 		// (green/yellow/red) and self-disables under prefers-reduced-motion.
-		return html`<div class="review-loading-stage">
-			<gl-categorizing-loading-animation variant="review"></gl-categorizing-loading-animation>
-			<div class="review-loading-wrap">
+		return html`<div class="panel-loading-stage">
+			<gl-categorizing-loading-animation
+				class="panel-loading-stage__anim"
+				variant="review"
+			></gl-categorizing-loading-animation>
+			<div class="panel-loading-stage__foreground review-loading-wrap">
 				${renderLoadingState('Analyzing changes...')}
 				<gl-button class="review-cancel" appearance="secondary" @click=${this.handleCancel}>Cancel</gl-button>
 			</div>
@@ -435,11 +503,13 @@ export class GlDetailsReviewModePanel extends LitElement {
 					icon="git-commit"
 				></gl-commit-sha-copy>
 			</div>
-			${includedCount > 0
-				? html`<div class="review-metadata__right">
-						<span class="review-metadata__count">${pluralize('commit', includedCount)} selected</span>
-					</div>`
-				: nothing}
+			${
+				includedCount > 0
+					? html`<div class="review-metadata__right">
+							<span class="review-metadata__count">${pluralize('commit', includedCount)} selected</span>
+						</div>`
+					: nothing
+			}
 		</div>`;
 	}
 
@@ -513,7 +583,7 @@ export class GlDetailsReviewModePanel extends LitElement {
 
 	private renderIdleState() {
 		// Fallback: compute scope from files if not provided
-		const scope = this.scope || (this.files?.length ? { type: 'commit' as const, sha: '' } : undefined);
+		const scope = this.scope ?? (this.files?.length ? { type: 'commit' as const, sha: '' } : undefined);
 		if (!scope) return nothing;
 
 		// Disable Start Review when there are no effectively-included files (after both user
@@ -521,27 +591,29 @@ export class GlDetailsReviewModePanel extends LitElement {
 		const hasSelectedFiles = this.getEffectiveFileCount() > 0;
 
 		return html`
-			${scope.type === 'wip'
-				? html`<gl-split-panel
-						orientation="vertical"
-						primary="start"
-						class="scope-split"
-						position="40"
-						.snap=${this._scopeSplitSnap}
-					>
-						<div slot="start" class="scope-split__picker">
-							<gl-commits-scope-pane
-								.items=${this.scopeItems}
-								.selection=${this.scopeSelectionIds()}
-								?loading=${this.scopeLoading}
-								mode="review"
-							></gl-commits-scope-pane>
-						</div>
-						<div slot="end" class="scope-split__files">
-							<div class="scope-files">${this.renderFileCuration()}</div>
-						</div>
-					</gl-split-panel>`
-				: html`<div class="scope-files">${this.renderFileCuration()}</div>`}
+			${
+				scope.type === 'wip'
+					? html`<gl-split-panel
+							orientation="vertical"
+							primary="start"
+							class="scope-split"
+							position="40"
+							.snap=${this._scopeSplitSnap}
+						>
+							<div slot="start" class="scope-split__picker">
+								<gl-commits-scope-pane
+									.items=${this.scopeItems}
+									.selection=${this.scopeSelectionIds()}
+									?loading=${this.scopeLoading}
+									mode="review"
+								></gl-commits-scope-pane>
+							</div>
+							<div slot="end" class="scope-split__files">
+								<div class="scope-files">${this.renderFileCuration()}</div>
+							</div>
+						</gl-split-panel>`
+					: html`<div class="scope-files">${this.renderFileCuration()}</div>`
+			}
 			<div class="review-input-row">
 				${keyed(
 					this.lastPrompt,
@@ -569,6 +641,10 @@ export class GlDetailsReviewModePanel extends LitElement {
 		this.dispatchEvent(new CustomEvent('review-cancel', { bubbles: true, composed: true }));
 	};
 
+	private handleDiscard = (): void => {
+		this.dispatchEvent(new CustomEvent('review-discard', { bubbles: true, composed: true }));
+	};
+
 	private handleForward = (): void => {
 		// Orchestrator owns the snapshot — it'll mutate the resource back to the prior value
 		// without firing a new AI request.
@@ -582,7 +658,35 @@ export class GlDetailsReviewModePanel extends LitElement {
 		}
 	};
 
-	private renderFileCuration(files?: readonly GitFileChangeShape[]) {
+	/** Memoized `.filesLayout` payload for the inner pane — a fresh literal per render would trip
+	 * the pane's tree-model rebuild via Lit's reference-equality dirty check. */
+	private _paneFilesLayout?: { layout: ViewFilesLayout };
+	private get paneFilesLayout(): { layout: ViewFilesLayout } {
+		let cached = this._paneFilesLayout;
+		if (cached?.layout !== this.fileLayout) {
+			cached = { layout: this.fileLayout };
+			this._paneFilesLayout = cached;
+		}
+		return cached;
+	}
+
+	/** Cache key for the baked-in row contexts: `getFileContext` reads both `scope` and `repoPath`,
+	 * so both must key the revision — keying on either alone leaves rows on a stale context when
+	 * the other changes. Memoized on identity so the stringify runs only when the scope actually
+	 * changes rather than on every parent render. */
+	private _contextRevision?: { scope: ScopeSelection | undefined; repoPath: string | undefined; value: string };
+	private get contextRevision(): string {
+		const cached = this._contextRevision;
+		if (cached != null && cached.scope === this.scope && cached.repoPath === this.repoPath) {
+			return cached.value;
+		}
+
+		const value = `${this.repoPath ?? ''}|${this.scope ? JSON.stringify(this.scope) : ''}`;
+		this._contextRevision = { scope: this.scope, repoPath: this.repoPath, value: value };
+		return value;
+	}
+
+	private renderFileCuration(files?: readonly ScopeFile[]) {
 		// Always render the section — when there are no files, gl-file-tree-pane shows the
 		// `empty-text` message inside its body so the section header / scope context stays
 		// visible (consistent with the compare empty-state pattern).
@@ -611,13 +715,18 @@ export class GlDetailsReviewModePanel extends LitElement {
 				<gl-file-tree-pane
 					.files=${renderFiles}
 					?checkable=${true}
+					?multi-selectable=${true}
 					?show-file-icons=${true}
 					.collapsable=${false}
-					.filesLayout=${{ layout: this.fileLayout }}
+					.filesLayout=${this.paneFilesLayout}
 					.checkableStates=${checkableStates}
 					.fileActions=${this.fileActionsForFile}
 					.fileContext=${this.getFileContext}
+					.contextRevision=${this.contextRevision}
 					.folderContext=${(folder: { relativePath: string }) => buildFolderContext(this.repoPath, folder)}
+					selection-action="file-compare-range"
+					@file-compare-range=${(e: CustomEvent<FileChangeListItemDetail>) =>
+						this.handleOpenFile(e.detail.path)}
 					.searchContext=${this.searchContext}
 					.showSearchBox=${this.showSearchBox}
 					.searchBoxFilter=${this.searchBoxFilter}
@@ -631,10 +740,26 @@ export class GlDetailsReviewModePanel extends LitElement {
 					@file-unstage=${this.redispatch}
 					@file-compare-working=${this.redispatch}
 					@file-open-on-remote=${this.redispatch}
+					@file-selection-changed=${(e: CustomEvent<{ files: readonly { path: string }[] }>) =>
+						(this._selectedFiles = e.detail?.files ?? [])}
 					@change-files-layout=${(e: CustomEvent<{ layout: ViewFilesLayout }>) => {
 						this.fileLayout = e.detail.layout;
 					}}
-				></gl-file-tree-pane>
+				>
+					${
+						renderFiles.length > 0
+							? renderOpenChangesAction({
+									selectedCount: this._selectedFiles.length,
+									slot: 'leading-actions',
+									onOpenAll: () => this.onOpenScopeMultiDiff(renderFiles),
+									onOpenSelected: () => {
+										const selectedPaths = new Set(this._selectedFiles.map(f => f.path));
+										this.onOpenScopeMultiDiff(renderFiles.filter(f => selectedPaths.has(f.path)));
+									},
+								})
+							: nothing
+					}
+				</gl-file-tree-pane>
 			</webview-pane-group>
 		</div>`;
 	}
@@ -643,13 +768,42 @@ export class GlDetailsReviewModePanel extends LitElement {
 		return [{ icon: 'go-to-file', label: 'Open File', action: 'file-open' }];
 	};
 
-	private getFileContext = (file: GitFileChangeShape): string | undefined => {
+	private getFileContext = (file: ScopeFile): string | undefined => {
 		const scope = this.scope;
 		if (!scope || !this.repoPath) return undefined;
 
 		let context: DetailsItemTypedContext | undefined;
 		switch (scope.type) {
 			case 'wip':
+				if (file.anchor === 'committed' && file.anchorSha != null) {
+					// Committed-range file reviewed under a wip scope: anchor to the range, not working tree
+					context =
+						file.anchorBaseSha != null
+							? {
+									webviewItem: 'gitlens:file:comparison',
+									webviewItemValue: {
+										type: 'file',
+										path: file.path,
+										repoPath: this.repoPath,
+										sha: file.anchorSha,
+										comparisonSha: file.anchorBaseSha,
+										status: file.status,
+										originalPath: file.originalPath,
+									},
+								}
+							: {
+									webviewItem: 'gitlens:file+committed',
+									webviewItemValue: {
+										type: 'file',
+										path: file.path,
+										repoPath: this.repoPath,
+										sha: file.anchorSha,
+										status: file.status,
+									},
+								};
+					break;
+				}
+
 				context = {
 					webviewItem: file.staged ? 'gitlens:file+staged' : 'gitlens:file+unstaged',
 					webviewItemValue: {
@@ -686,6 +840,7 @@ export class GlDetailsReviewModePanel extends LitElement {
 						sha: scope.toSha,
 						comparisonSha: scope.fromSha,
 						status: file.status,
+						originalPath: file.originalPath,
 					},
 				};
 				break;
@@ -697,32 +852,17 @@ export class GlDetailsReviewModePanel extends LitElement {
 	private redispatch = redispatch.bind(this);
 
 	private onFileChecked(e: CustomEvent<TreeItemCheckedDetail>): void {
-		if (!e.detail.context) return;
+		const next = fileCheckedExclusion(e, this._excludedFiles);
+		if (next == null) return;
 
-		const [file] = e.detail.context as unknown as GitFileChangeShape[];
-		if (!file) return;
-
-		const next = new Set(this._excludedFiles);
-		if (e.detail.checked) {
-			next.delete(file.path);
-		} else {
-			next.add(file.path);
-		}
 		this._excludedFiles = next;
 		this.invalidateForward();
 	}
 
 	private onToggleCheckAll(e: CustomEvent<{ checked: boolean; paths: readonly string[] }>): void {
-		const next = new Set(this._excludedFiles);
-		if (e.detail.checked) {
-			for (const path of e.detail.paths) {
-				next.delete(path);
-			}
-		} else {
-			for (const path of e.detail.paths) {
-				next.add(path);
-			}
-		}
+		const next = checkAllExclusion(e, this._excludedFiles);
+		if (next == null) return;
+
 		this._excludedFiles = next;
 		this.invalidateForward();
 	}
@@ -733,25 +873,25 @@ export class GlDetailsReviewModePanel extends LitElement {
 		}
 	}
 
-	private _scopeSplitSnap = ({ pos, size }: { pos: number; size: number }): number => {
-		const scopeEl = this.renderRoot.querySelector<GlCommitsScopePane>('gl-commits-scope-pane');
-		if (!scopeEl || size <= 0) return Math.max(15, Math.min(pos, 70));
+	/** Opens the idle curation scope's change set as a multi-diff (via `scope-open-multi-diff`). */
+	private onOpenScopeMultiDiff = (files: readonly GitFileChangeShape[]): void => {
+		if (!files.length) return;
 
-		// Cap at the scope picker's intrinsic height so it can't expand beyond its content.
-		// `contentHeight` is only the inner scroll pane; add the .scope-split__picker wrapper's
-		// padding + border-bottom or the fit-content track clamps short and clips / desyncs.
-		const maxPercent = Math.min(70, ((scopeEl.contentHeight + getScopeSplitPickerChrome(scopeEl)) / size) * 100);
-		return Math.max(15, Math.min(pos, maxPercent));
+		this.dispatchEvent(
+			new CustomEvent('scope-open-multi-diff', {
+				detail: { files: files },
+				bubbles: true,
+				composed: true,
+			}),
+		);
+	};
+
+	private _scopeSplitSnap = ({ pos, size }: { pos: number; size: number }): number => {
+		return scopeSplitSnap(this.renderRoot.querySelector<GlCommitsScopePane>('gl-commits-scope-pane'), pos, size);
 	};
 
 	private scopeSelectionIds(): readonly string[] | undefined {
-		const scope = this.scope;
-		if (scope?.type !== 'wip') return undefined;
-		return [
-			...(scope.includeUnstaged ? ['unstaged'] : []),
-			...(scope.includeStaged ? ['staged'] : []),
-			...scope.includeShas,
-		];
+		return wipScopeSelectionIds(this.scope);
 	}
 
 	private renderOverview() {
@@ -759,9 +899,13 @@ export class GlDetailsReviewModePanel extends LitElement {
 
 		return html`<div class="review-overview">
 			<div class="review-overview__text">${this.result.overview}</div>
-			${this.result.mode === 'two-pass'
-				? html`<span class="review-overview__hint">Select a focus area below to get detailed findings.</span>`
-				: nothing}
+			${
+				this.result.mode === 'two-pass'
+					? html`<span class="review-overview__hint"
+							>Select a focus area below to get detailed findings.</span
+						>`
+					: nothing
+			}
 		</div>`;
 	}
 
@@ -839,20 +983,24 @@ export class GlDetailsReviewModePanel extends LitElement {
 						class="review-area__chevron"
 					></code-icon>
 					<gl-tooltip
-						content=${area.severity === 'critical'
-							? 'Critical Issue'
-							: area.severity === 'warning'
-								? 'Warning (Non-Critical)'
-								: 'Suggestion'}
+						content=${
+							area.severity === 'critical'
+								? 'Critical Issue'
+								: area.severity === 'warning'
+									? 'Warning (Non-Critical)'
+									: 'Suggestion'
+						}
 						placement="bottom-start"
 					>
 						<span class="review-area__severity review-area__severity--${area.severity}">
 							<code-icon
-								icon=${area.severity === 'critical'
-									? 'error'
-									: area.severity === 'warning'
-										? 'warning'
-										: 'info'}
+								icon=${
+									area.severity === 'critical'
+										? 'error'
+										: area.severity === 'warning'
+											? 'warning'
+											: 'info'
+								}
 							></code-icon>
 						</span>
 					</gl-tooltip>
@@ -861,62 +1009,77 @@ export class GlDetailsReviewModePanel extends LitElement {
 				</button>
 				${this.renderFocusAreaActions(area, { isAnalyzed: isAnalyzed })}
 			</div>
-			${isExpanded
-				? html`<div class="review-area__body">
-						<div class="review-area__rationale">${area.rationale}</div>
-						<div class="review-area__files">
-							${area.files.map(f => {
-								// Split off a trailing `:line` or `:start-end` so the line range gets a
-								// muted color (it's a locator, not part of the path).
-								const match = f.match(/^(.+?)(:\d+(?:-\d+)?)?$/);
-								const path = match?.[1] ?? f;
-								const lineRange = match?.[2] ?? '';
-								return html`<button
-									class="review-area__file-link"
-									@click=${() => this.handleOpenFile(f)}
-								>
-									<code-icon class="review-area__file-link-icon" icon="go-to-file"></code-icon>
-									<span class="review-area__file-link-text">${path}</span>
-									${lineRange
-										? html`<span class="review-area__file-link-lines">${lineRange}</span>`
-										: nothing}
-								</button>`;
-							})}
-						</div>
-						${needsAnalyze
-							? html`<button
-									class="review-area__analyze-btn"
-									@click=${() => this.handleAnalyzeArea(area)}
-								>
-									<code-icon icon="search"></code-icon>
-									Review Files
-								</button>`
-							: nothing}
-						${isLoading
-							? html`<div class="review-area__loading" aria-live="polite">
-									<code-icon icon="loading" modifier="spin"></code-icon>
-									Reviewing files...
-								</div>`
-							: nothing}
-						${hasError
-							? html`<div class="review-area__error" role="alert">
-									<code-icon icon="error"></code-icon>
-									Failed to review files.
-									<button class="review-area__retry-btn" @click=${() => this.handleAnalyzeArea(area)}>
-										Retry
-									</button>
-								</div>`
-							: nothing}
-						${hasFindings
-							? this.renderFindings(area.findings, area)
-							: isAnalyzed && !isLoading && !hasError
-								? html`<div class="review-area__clean" aria-live="polite">
-										<code-icon icon="pass"></code-icon>
-										No issues found in these files.
-									</div>`
-								: nothing}
-					</div>`
-				: nothing}
+			${
+				isExpanded
+					? html`<div class="review-area__body">
+							<div class="review-area__rationale">${area.rationale}</div>
+							<div class="review-area__files">
+								${area.files.map(f => {
+									// Split off a trailing `:line` or `:start-end` so the line range gets a
+									// muted color (it's a locator, not part of the path).
+									const match = f.match(/^(.+?)(:\d+(?:-\d+)?)?$/);
+									const path = match?.[1] ?? f;
+									const lineRange = match?.[2] ?? '';
+									return html`<button
+										class="review-area__file-link"
+										@click=${() => this.handleOpenFile(f)}
+									>
+										<code-icon class="review-area__file-link-icon" icon="go-to-file"></code-icon>
+										<span class="review-area__file-link-text">${path}</span>
+										${
+											lineRange
+												? html`<span class="review-area__file-link-lines">${lineRange}</span>`
+												: nothing
+										}
+									</button>`;
+								})}
+							</div>
+							${
+								needsAnalyze
+									? html`<button
+											class="review-area__analyze-btn"
+											@click=${() => this.handleAnalyzeArea(area)}
+										>
+											<code-icon icon="search"></code-icon>
+											Review Files
+										</button>`
+									: nothing
+							}
+							${
+								isLoading
+									? html`<div class="review-area__loading" aria-live="polite">
+											<code-icon icon="loading" modifier="spin"></code-icon>
+											Reviewing files...
+										</div>`
+									: nothing
+							}
+							${
+								hasError
+									? html`<div class="review-area__error" role="alert">
+											<code-icon icon="error"></code-icon>
+											Failed to review files.
+											<button
+												class="review-area__retry-btn"
+												@click=${() => this.handleAnalyzeArea(area)}
+											>
+												Retry
+											</button>
+										</div>`
+									: nothing
+							}
+							${
+								hasFindings
+									? this.renderFindings(area.findings, area)
+									: isAnalyzed && !isLoading && !hasError
+										? html`<div class="review-area__clean" aria-live="polite">
+												<code-icon icon="pass"></code-icon>
+												No issues found in these files.
+											</div>`
+										: nothing
+							}
+						</div>`
+					: nothing
+			}
 		</div>`;
 	}
 
@@ -961,11 +1124,13 @@ export class GlDetailsReviewModePanel extends LitElement {
 
 		return html`<div class="review-findings">
 			${visible.map(f => this.renderFinding(f, area))}
-			${dismissedCount > 0
-				? html`<button class="review-findings__dismissed" @click=${this.handleShowDismissed}>
-						${dismissedCount} dismissed finding${dismissedCount > 1 ? 's' : ''}
-					</button>`
-				: nothing}
+			${
+				dismissedCount > 0
+					? html`<button class="review-findings__dismissed" @click=${this.handleShowDismissed}>
+							${dismissedCount} dismissed finding${dismissedCount > 1 ? 's' : ''}
+						</button>`
+					: nothing
+			}
 		</div>`;
 	}
 
@@ -1012,22 +1177,28 @@ export class GlDetailsReviewModePanel extends LitElement {
 				</span>
 			</div>
 			<div class="review-finding__description">${finding.description}</div>
-			${finding.filePath
-				? html`<button
-						class="review-finding__location"
-						@click=${() => this.handleOpenFile(finding.filePath!, finding.lineRange?.start)}
-					>
-						<code-icon class="review-finding__location-icon" icon="go-to-file"></code-icon>
-						<span class="review-finding__location-text">${finding.filePath}</span>
-						${finding.lineRange
-							? html`<span class="review-finding__location-lines"
-									>:${finding.lineRange.start}${finding.lineRange.end !== finding.lineRange.start
-										? `-${finding.lineRange.end}`
-										: ''}</span
-								>`
-							: nothing}
-					</button>`
-				: nothing}
+			${
+				finding.filePath
+					? html`<button
+							class="review-finding__location"
+							@click=${() => this.handleOpenFile(finding.filePath!, finding.lineRange?.start)}
+						>
+							<code-icon class="review-finding__location-icon" icon="go-to-file"></code-icon>
+							<span class="review-finding__location-text">${finding.filePath}</span>
+							${
+								finding.lineRange
+									? html`<span class="review-finding__location-lines"
+											>:${finding.lineRange.start}${
+												finding.lineRange.end !== finding.lineRange.start
+													? `-${finding.lineRange.end}`
+													: ''
+											}</span
+										>`
+									: nothing
+							}
+						</button>`
+					: nothing
+			}
 		</div>`;
 	}
 

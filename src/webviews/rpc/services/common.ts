@@ -7,9 +7,13 @@
  *
  */
 
-import { proxy } from '@eamodio/supertalk';
 import type { Container } from '../../../container.js';
 import type { EventVisibilityBuffer, SubscriptionTracker } from '../eventVisibilityBuffer.js';
+import { PromosService } from '../promosService.js';
+import type { ApplicablePromoService } from '../promosService.js';
+import type { WebviewViewServiceHost } from '../webviewViewService.js';
+import { WebviewViewService } from '../webviewViewService.js';
+import { AgentsService } from './agents.js';
 import { AIService } from './ai.js';
 import { AutolinksService } from './autolinks.js';
 import { BranchesService } from './branches.js';
@@ -44,8 +48,10 @@ export interface SharedWebviewServices {
 	readonly config: ConfigService;
 	readonly storage: StorageService;
 	readonly subscription: SubscriptionService;
+	readonly promos: ApplicablePromoService;
 	readonly integrations: IntegrationsService;
 	readonly onboarding: OnboardingRpcService;
+	readonly agents: AgentsService;
 	readonly ai: AIService;
 	readonly autolinks: AutolinksService;
 	readonly branches: BranchesService;
@@ -54,6 +60,7 @@ export interface SharedWebviewServices {
 	readonly files: FilesService;
 	readonly pullRequests: PullRequestsService;
 	readonly drafts: DraftsService;
+	readonly webview: WebviewViewService;
 }
 
 // ============================================================
@@ -68,16 +75,17 @@ export interface SharedWebviewServices {
  *
  * @param container - The GitLens Container
  * @param host - The webview host
- * @param updateTelemetryContext - Callback to update the provider's telemetry context
  * @param buffer - Optional event visibility buffer
+ * @param updateTelemetryContext - Callback to update the provider's telemetry context; defaults to a
+ * no-op for providers that don't track one
  * @returns SharedWebviewServices ready to be exposed via RPC
  */
 export function createSharedServices(
 	container: Container,
-	host: RpcServiceHost,
-	updateTelemetryContext: (context: Record<string, string | number | boolean | undefined>) => void,
+	host: RpcServiceHost & WebviewViewServiceHost,
 	buffer?: EventVisibilityBuffer,
 	tracker?: SubscriptionTracker,
+	updateTelemetryContext: (context: Record<string, string | number | boolean | undefined>) => void = () => {},
 ): SharedWebviewServices {
 	return {
 		repositories: new RepositoriesService(container, buffer, tracker),
@@ -85,30 +93,18 @@ export function createSharedServices(
 		config: new ConfigService(buffer, tracker),
 		storage: new StorageService(container),
 		subscription: new SubscriptionService(container, buffer, tracker),
+		promos: new PromosService(container),
 		integrations: new IntegrationsService(container, buffer, tracker),
 		onboarding: new OnboardingRpcService(container, buffer, tracker),
+		agents: new AgentsService(container, buffer, tracker),
 		ai: new AIService(container, buffer, tracker),
 		autolinks: new AutolinksService(container),
 		branches: new BranchesService(container),
 		commands: new CommandsService(container, host),
-		telemetry: new TelemetryService(host, updateTelemetryContext),
+		telemetry: new TelemetryService(host, updateTelemetryContext, container.usage, buffer, tracker),
 		files: new FilesService(container),
 		pullRequests: new PullRequestsService(container),
 		drafts: new DraftsService(container, host),
+		webview: new WebviewViewService(host, buffer, tracker),
 	};
-}
-
-/**
- * Wraps all object-valued properties with Supertalk's `proxy()` marker.
- *
- * Call this on the final services object returned from `getRpcServices()`.
- * Sub-service objects and class instances become remote proxies;
- * functions and primitives pass through unchanged.
- */
-export function proxyServices<T extends Record<string, unknown>>(services: T): T {
-	const result: Record<string, unknown> = {};
-	for (const [key, value] of Object.entries(services)) {
-		result[key] = value != null && typeof value === 'object' ? proxy(value) : value;
-	}
-	return result as T;
 }

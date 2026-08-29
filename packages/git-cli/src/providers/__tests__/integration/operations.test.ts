@@ -1,11 +1,12 @@
 import * as assert from 'assert';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SigningErrorReason } from '@gitlens/git/errors.js';
 import { CommitError, MergeError, SigningError } from '@gitlens/git/errors.js';
 import type { SigningFormat } from '@gitlens/git/models/signature.js';
-import { addCommit, createBranch, createTestRepo } from './helpers.js';
+import { addCommit, createBranch, createTestRepo, getHeadSha } from './helpers.js';
 
 suite('OperationsGitSubProvider.merge', () => {
 	test('returns { conflicted: false } on clean fast-forward merge', async () => {
@@ -251,6 +252,168 @@ suite('OperationsGitSubProvider signing', () => {
 			assert.strictEqual(calls.length, 0, 'onSigningFailed must not fire for non-signing failures');
 		} finally {
 			r.cleanup();
+		}
+	});
+
+	test('host signing override adds -S even when commit.gpgsign is false', async () => {
+		const failedCalls: Array<{ reason: SigningErrorReason; format: SigningFormat }> = [];
+		const signedCalls: unknown[] = [];
+		const r = createTestRepo({
+			config: { commits: {}, signing: { enabled: true } },
+			hooks: {
+				commits: {
+					onSigned: (...args) => signedCalls.push(args),
+					onSigningFailed: (reason, format) => failedCalls.push({ reason: reason, format: format }),
+				},
+			},
+		});
+		try {
+			// The helper leaves `commit.gpgsign=false` — without an explicit `-S` from the host
+			// override, git would never invoke the (broken) gpg program and the commit would
+			// succeed. A SigningError here is the proof that `-S` was passed.
+			execFileSync('git', ['config', 'gpg.format', 'openpgp'], { cwd: r.path, stdio: 'pipe' });
+			execFileSync('git', ['config', 'gpg.program', 'node --eval process.exit(1)'], {
+				cwd: r.path,
+				stdio: 'pipe',
+			});
+
+			writeFileSync(join(r.path, 'override.txt'), 'content\n');
+			execFileSync('git', ['add', 'override.txt'], { cwd: r.path, stdio: 'pipe' });
+
+			await assert.rejects(
+				() => r.provider.ops.commit(r.path, 'should attempt to sign via override'),
+				ex => SigningError.is(ex),
+				'Expected a SigningError — the override should force `-S` despite commit.gpgsign=false',
+			);
+
+			assert.strictEqual(failedCalls.length, 1, 'Expected onSigningFailed hook to fire exactly once');
+			assert.strictEqual(failedCalls[0].format, 'openpgp');
+			assert.strictEqual(signedCalls.length, 0, 'onSigned must not fire when signing fails');
+		} finally {
+			r.cleanup();
+		}
+	});
+
+	test('without the host override, broken signer config does not affect commits', async () => {
+		const calls: unknown[] = [];
+		const r = createTestRepo({
+			config: { commits: {}, signing: { enabled: false } },
+			hooks: {
+				commits: {
+					onSigned: (...args) => calls.push(args),
+					onSigningFailed: (...args) => calls.push(args),
+				},
+			},
+		});
+		try {
+			// Same broken gpg program as above, but no override and `commit.gpgsign=false` —
+			// the commit must go through without ever invoking the signer.
+			execFileSync('git', ['config', 'gpg.program', 'node --eval process.exit(1)'], {
+				cwd: r.path,
+				stdio: 'pipe',
+			});
+
+			writeFileSync(join(r.path, 'plain.txt'), 'content\n');
+			execFileSync('git', ['add', 'plain.txt'], { cwd: r.path, stdio: 'pipe' });
+
+			await r.provider.ops.commit(r.path, 'unsigned commit');
+
+			const log = execFileSync('git', ['log', '-1', '--format=%s'], {
+				cwd: r.path,
+				encoding: 'utf-8',
+			}).trim();
+			assert.strictEqual(log, 'unsigned commit');
+			assert.strictEqual(calls.length, 0, 'No signing hooks should fire for an unsigned commit');
+		} finally {
+			r.cleanup();
+		}
+	});
+});
+
+suite('OperationsGitSubProvider.push', () => {
+	function createRepoWithRemote() {
+		const r = createTestRepo();
+		const bareDir = mkdtempSync(join(tmpdir(), 'gitlens-test-bare-'));
+		execFileSync('git', ['clone', '--bare', r.path, bareDir], { stdio: 'pipe' });
+		execFileSync('git', ['remote', 'add', 'origin', bareDir], { cwd: r.path, stdio: 'pipe' });
+		execFileSync('git', ['fetch', 'origin'], { cwd: r.path, stdio: 'pipe' });
+		execFileSync('git', ['branch', '--set-upstream-to', 'origin/main', 'main'], { cwd: r.path, stdio: 'pipe' });
+		const origCleanup = r.cleanup;
+		return {
+			...r,
+			cleanup: () => {
+				origCleanup();
+				rmSync(bareDir, { recursive: true, force: true });
+			},
+		};
+	}
+
+	function getRemoteRef(repoPath: string, ref: string): string {
+		const output = execFileSync('git', ['ls-remote', 'origin', ref], {
+			cwd: repoPath,
+			encoding: 'utf-8',
+		}).trim();
+		return output.split('\t')[0] ?? '';
+	}
+
+	test('pushes to matching upstream branch', async () => {
+		const r = createRepoWithRemote();
+		try {
+			addCommit(r.path, 'file.txt', 'content\n', 'Add file');
+			const localSha = getHeadSha(r.path);
+
+			await r.provider.ops?.push(r.path);
+
+			const remoteSha = getRemoteRef(r.path, 'refs/heads/main');
+			assert.strictEqual(remoteSha, localSha, 'Remote main should match local HEAD after push');
+		} finally {
+			r.cleanup();
+		}
+	});
+
+	test('pushes to differently-named upstream branch using refspec', async () => {
+		const r = createRepoWithRemote();
+		try {
+			execFileSync('git', ['checkout', '-b', 'feature/foo'], { cwd: r.path, stdio: 'pipe' });
+			execFileSync('git', ['branch', '--set-upstream-to', 'origin/main', 'feature/foo'], {
+				cwd: r.path,
+				stdio: 'pipe',
+			});
+			addCommit(r.path, 'feature.txt', 'feature\n', 'Add feature');
+			const localSha = getHeadSha(r.path);
+
+			await r.provider.ops?.push(r.path);
+
+			// Should have pushed to origin/main, not created origin/feature/foo
+			const remoteSha = getRemoteRef(r.path, 'refs/heads/main');
+			assert.strictEqual(remoteSha, localSha, 'Remote main should have the feature commit');
+
+			// Verify no remote branch was created for feature/foo
+			const featureRef = getRemoteRef(r.path, 'refs/heads/feature/foo');
+			assert.strictEqual(featureRef, '', 'Remote should not have feature/foo branch');
+		} finally {
+			r.cleanup();
+		}
+	});
+});
+
+suite('OperationsSubProvider — branch-creating checkout', () => {
+	test('checkout -b leaves a predecessor’s metadata alone', async () => {
+		const repo = createTestRepo();
+		try {
+			// Simulates a branch deleted outside GitLens: its persisted base is still on disk under that
+			// name. Like `createBranch`, creation never removes persisted metadata — see the note there.
+			await repo.provider.config.setGkConfig(repo.path, 'branch.via-checkout.gk-merge-base', 'origin/DEAD');
+
+			await repo.provider.ops.checkout(repo.path, 'main', { createBranch: 'via-checkout' });
+
+			assert.strictEqual(
+				await repo.provider.config.getGkConfig(repo.path, 'branch.via-checkout.gk-merge-base'),
+				'origin/DEAD',
+				'creation must not touch persisted metadata',
+			);
+		} finally {
+			repo.cleanup();
 		}
 	});
 });

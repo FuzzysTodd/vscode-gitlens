@@ -4,13 +4,9 @@ import type { CurrentUserNameStyle } from '@gitlens/git/utils/commit.utils.js';
 import type { FeatureAccess } from '../../../features.js';
 import type { RepositoryShape } from '../../../git/models/repositoryShape.js';
 import type { Serialized } from '../../../system/serialize.js';
-import type { IpcScope } from '../../ipc/models/ipc.js';
-import { IpcNotification } from '../../ipc/models/ipc.js';
 import type { WebviewState } from '../../protocol.js';
 import type { SharedWebviewServices } from '../../rpc/services/common.js';
 import type { Unsubscribe } from '../../rpc/services/types.js';
-
-export const scope: IpcScope = 'timeline';
 
 export interface State extends WebviewState<'gitlens.timeline' | 'gitlens.views.timeline'> {
 	dataset?: Promise<TimelineDatum[]>;
@@ -92,11 +88,6 @@ export interface SelectDataPointParams {
 	shift: boolean;
 }
 
-export interface DidChangeParams {
-	state: State;
-}
-export const DidChangeNotification = new IpcNotification<DidChangeParams>(scope, 'didChange');
-
 /** Config the webview sends to the host when fetching data. */
 export interface TimelineConfig {
 	period: TimelinePeriod;
@@ -150,6 +141,9 @@ export interface TimelineDatasetResult {
 	repository: (RepositoryShape & { ref: GitReference | undefined }) | undefined;
 	/** Feature access for the scope's repo. */
 	access: FeatureAccess;
+	/** True when the workspace has both public and private repos, so a gated (private) scope can offer
+	 *  switching to a public repo. Independent of `access.allowed` — the gate only surfaces it when shown. */
+	allowRepoSwitch?: boolean;
 }
 
 /** View-specific service for Timeline operations. */

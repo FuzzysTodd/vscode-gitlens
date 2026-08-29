@@ -8,44 +8,69 @@
  * - Per-repo change events (working tree FS changes, filtered repository changes)
  */
 
-import { Disposable, Uri, window, workspace } from 'vscode';
+import { Disposable, FileSystemError, Uri, window, workspace } from 'vscode';
+import type { MessageItem } from 'vscode';
+import { getSquashSequenceEditor } from '@env/git/squashEditor.js';
 import type { GitBranch } from '@gitlens/git/models/branch.js';
 import { GitCommit } from '@gitlens/git/models/commit.js';
 import type { GitFileChange, GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
 import type { GitFileConflictStatus } from '@gitlens/git/models/fileStatus.js';
+import type { GitReference } from '@gitlens/git/models/reference.js';
 import type { RepositoryChange } from '@gitlens/git/models/repository.js';
 import { repositoryChanges } from '@gitlens/git/models/repository.js';
 import type { CommitSignature } from '@gitlens/git/models/signature.js';
 import type { GitStatusFile } from '@gitlens/git/models/statusFile.js';
 import type { GitCommitReachability } from '@gitlens/git/providers/commits.js';
+import { canStageCurrent, canStageIncoming } from '@gitlens/git/utils/conflictResolution.utils.js';
 import { isConflictStatus } from '@gitlens/git/utils/fileStatus.utils.js';
-import { getConflictIncomingRef, resolveConflictFilePaths } from '@gitlens/git/utils/pausedOperationStatus.utils.js';
+import {
+	getConflictCurrentRef,
+	getConflictIncomingRef,
+	resolveConflictFilePaths,
+} from '@gitlens/git/utils/pausedOperationStatus.utils.js';
+import { createRevisionRange, isSha } from '@gitlens/git/utils/revision.utils.js';
 import { Logger } from '@gitlens/utils/logger.js';
+import { LruMap } from '@gitlens/utils/lruMap.js';
 import { normalizePath } from '@gitlens/utils/path.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
 import { pluralize } from '@gitlens/utils/string.js';
+import { getAvatarUri } from '../../../avatars.js';
 import type { DiffWithCommandArgs } from '../../../commands/diffWith.js';
+import type { Source } from '../../../constants.telemetry.js';
 import type { Container } from '../../../container.js';
 import { ProviderNotSupportedError } from '../../../errors.js';
 import type { FeatureAccess, PlusFeatures } from '../../../features.js';
 import * as BranchActions from '../../../git/actions/branch.js';
 import * as RepoActions from '../../../git/actions/repository.js';
+import * as StashActions from '../../../git/actions/stash.js';
 import { GitUri } from '../../../git/gitUri.js';
-import { getCommitSignature } from '../../../git/utils/-webview/commit.utils.js';
+import {
+	getCommitAuthorAvatarUri,
+	getCommitCommitterAvatarUri,
+	getCommitSignature,
+	isCommitPushed,
+} from '../../../git/utils/-webview/commit.utils.js';
 import {
 	resolveAllConflicts as resolveAllConflictsHelper,
 	stageConflictResolution as stageConflictResolutionHelper,
 } from '../../../git/utils/-webview/conflictResolution.utils.js';
 import { countConflictMarkers } from '../../../git/utils/-webview/mergeConflicts.utils.js';
 import { getReferenceFromBranch } from '../../../git/utils/-webview/reference.utils.js';
+import { getReachableWorktrees } from '../../../git/utils/-webview/worktree.utils.js';
 import { executeCommand, executeCoreCommand } from '../../../system/-webview/command.js';
 import { serialize } from '../../../system/serialize.js';
-import type { EventVisibilityBuffer, SubscriptionTracker } from '../eventVisibilityBuffer.js';
-import { bufferEventHandler } from '../eventVisibilityBuffer.js';
+import type { EventRegistration, EventVisibilityBuffer, SubscriptionTracker } from '../eventVisibilityBuffer.js';
+import { bufferEventHandler, toEventNotifier, trackRpcRegistration } from '../eventVisibilityBuffer.js';
 import type { ClassifiedCommitFailure, CommitResult } from './commitFailure.js';
 import { buildCommitOutputPreview, classifyCommitFailure } from './commitFailure.js';
+import { classifyFilesForDiscard, discardOneWith } from './discard.utils.js';
+import { createRepositoryChangeAggregator } from './repositoryChangeAggregator.js';
 import type {
+	CommitAvatarsShape,
 	CommitSignatureShape,
+	ConflictDetails,
+	ConflictDetailsCommit,
+	ConflictDetailsSide,
 	RepositoryChangeEventData,
 	SerializedGitBranch,
 	SerializedGitCommit,
@@ -56,6 +81,10 @@ import type {
 } from './types.js';
 
 export class RepositoryService {
+	readonly #workingChangedRegistrations = new Set<EventRegistration>();
+	readonly #repositoryChangedRegistrations = new Set<EventRegistration>();
+	readonly #orWorktreeChangedRegistrations = new Set<EventRegistration>();
+
 	constructor(
 		private readonly container: Container,
 		private readonly buffer: EventVisibilityBuffer | undefined,
@@ -80,15 +109,16 @@ export class RepositoryService {
 
 		const pendingKey = Symbol(`repositoryWorking:${repoPath}`);
 		const buffered = bufferEventHandler<undefined>(this.buffer, pendingKey, callback, 'signal', undefined);
-		const disposable = Disposable.from(
-			repo.watchWorkingTree(1000),
-			repo.onDidChangeWorkingTree(() => buffered(undefined)),
-		);
-		const unsubscribe = () => {
-			this.buffer?.removePending(pendingKey);
-			disposable.dispose();
-		};
-		return this.tracker != null ? this.tracker.track(unsubscribe) : unsubscribe;
+		return trackRpcRegistration(this.#workingChangedRegistrations, this.tracker, () => {
+			const disposable = Disposable.from(
+				repo.watchWorkingTree(1000),
+				repo.onDidChangeWorkingTree(() => buffered(undefined)),
+			);
+			return () => {
+				this.buffer?.removePending(pendingKey);
+				disposable.dispose();
+			};
+		});
 	}
 
 	/**
@@ -102,37 +132,89 @@ export class RepositoryService {
 	 */
 	onRepositoryChanged(repoPath: string, callback: (data: RepositoryChangeEventData) => void): Unsubscribe {
 		const pendingKey = Symbol(`repositoryChanged:${repoPath}`);
-		const pendingChanges = new Set<RepositoryChange>();
-		let pendingUri: string | undefined;
+		const notifier = toEventNotifier(callback);
+		const aggregator = createRepositoryChangeAggregator(this.buffer, pendingKey, notifier);
 
-		const disposable = this.container.git.onDidChangeRepository(e => {
-			if (e.repository.path !== repoPath) return;
+		return trackRpcRegistration(this.#repositoryChangedRegistrations, this.tracker, () => {
+			const disposable = this.container.git.onDidChangeRepository(e => {
+				if (e.repository.path !== repoPath) return;
 
-			const data: RepositoryChangeEventData = {
-				repoPath: e.repository.path,
-				repoUri: e.repository.uri.toString(),
-				changes: extractRepositoryChanges(e),
-			};
-			if (!this.buffer || this.buffer.visible) {
-				callback(data);
-			} else {
-				pendingUri = data.repoUri;
-				for (const c of data.changes) {
-					pendingChanges.add(c);
-				}
-				this.buffer.addPending(pendingKey, () => {
-					callback({ repoPath: repoPath, repoUri: pendingUri!, changes: [...pendingChanges] });
-					pendingChanges.clear();
-					pendingUri = undefined;
+				aggregator.record({
+					repoPath: e.repository.path,
+					repoUri: e.repository.uri.toString(),
+					changes: extractRepositoryChanges(e),
 				});
-			}
+			});
+			return () => {
+				aggregator.dispose();
+				disposable.dispose();
+			};
 		});
-		const unsubscribe = () => {
-			this.buffer?.removePending(pendingKey);
-			pendingChanges.clear();
-			disposable.dispose();
-		};
-		return this.tracker != null ? this.tracker.track(unsubscribe) : unsubscribe;
+	}
+
+	/**
+	 * Like {@link onRepositoryChanged} + {@link onRepositoryWorkingChanged} combined into a
+	 * single signal, but works for a path that ISN'T a registered/opened `Repository` — e.g. a
+	 * secondary worktree GitLens hasn't surfaced, where no `GlRepository` instance exists so
+	 * `getRepository` returns `undefined` and both of the above silently no-op. Routes through
+	 * `GitRepositoryService.watch()`, which watches by path + git dir directly rather than
+	 * depending on a `GlRepository` model's watch lease (see that method's doc comment).
+	 * @param repoPath - Repository or worktree path to watch
+	 * @param callback - Called on index/head/heads structural changes or working-tree file edits
+	 * @returns Unsubscribe function that stops watching
+	 */
+	async onRepositoryOrWorktreeChanged(repoPath: string, callback: () => void): Promise<Unsubscribe> {
+		const epoch = this.tracker?.epoch;
+		// Read synchronously, before the await below — only reliable at the top of the dispatch.
+		// Carried through to `trackRpcRegistration` below, which re-checks it immediately before
+		// attaching (see that helper's doc comment) — this method must NOT re-read `callerSession`
+		// itself after the await, since by then it no longer reliably names this caller.
+		const session = this.tracker?.callerSession;
+		// Makes this acquisition visible to a validation landing before `trackRpcRegistration` below —
+		// without it, a validation superseding `session` while nothing is tracked yet for it would
+		// have no way to tombstone it. The one-shot handle is released in the `finally` so EVERY
+		// exit path — attach, abandon, or a `watch()` rejection — clears it, and only after
+		// `trackRpcRegistration` has run its released-session check.
+		const unreserve = this.tracker?.reserveSession(session);
+		try {
+			const watcher = await this.container.git.getRepositoryService(repoPath).watch();
+			if (watcher == null) return () => {};
+
+			// The tracker was reset (RPC reconnect) while the watch acquisition was in flight — an
+			// epoch change. Tracking the watcher now would leak it until the NEXT reset and
+			// double-deliver alongside the current generation's re-subscription; dispose instead.
+			// Session invalidation (superseded at validation, or rejected as a straggler) while the
+			// watch was in flight is handled centrally by `trackRpcRegistration`, via `session` below.
+			if (this.tracker != null && this.tracker.epoch !== epoch) {
+				watcher.dispose();
+				return () => {};
+			}
+
+			const pendingKey = Symbol(`repositoryOrWorktreeChanged:${repoPath}`);
+			const buffered = bufferEventHandler<undefined>(this.buffer, pendingKey, callback, 'signal', undefined);
+			return await trackRpcRegistration(
+				this.#orWorktreeChangedRegistrations,
+				this.tracker,
+				() => {
+					const disposable = Disposable.from(
+						watcher,
+						watcher.onDidChange(e => {
+							if (e.changed('index', 'head', 'heads')) {
+								buffered(undefined);
+							}
+						}),
+						watcher.onDidChangeWorkingTree(() => buffered(undefined)),
+					);
+					return () => {
+						this.buffer?.removePending(pendingKey);
+						disposable.dispose();
+					};
+				},
+				session,
+			);
+		} finally {
+			unreserve?.();
+		}
 	}
 
 	// ============================================================
@@ -183,6 +265,70 @@ export class RepositoryService {
 		return signature != null ? serializeSignature(signature) : undefined;
 	}
 
+	/**
+	 * Resolves a commit's provider avatars. Deliberately off the critical path: on a cold cache in a repo
+	 * with remotes this hits the remote provider (a network fetch), so the core commit payload ships a
+	 * synchronous cached-or-gravatar avatar and the details panels upgrade to this when it lands.
+	 *
+	 * Resolves from the commit rather than from bare emails so the integration-supplied `avatarUrl` still
+	 * wins (`getCommitAuthorAvatarUri` short-circuits on it) — resolving by email alone would downgrade a
+	 * GitHub-provider avatar to a gravatar, since `getAvatarUri` always falls back rather than returning
+	 * nothing.
+	 */
+	async getCommitAvatars(
+		repoPath: string,
+		sha: string,
+		signal?: AbortSignal,
+	): Promise<CommitAvatarsShape | undefined> {
+		signal?.throwIfAborted();
+
+		const commit = await this.container.git.getRepositoryService(repoPath).commits.getCommit(sha, signal);
+		signal?.throwIfAborted();
+		if (commit == null) return undefined;
+
+		const hasDistinctCommitter = commit.committer.email != null && commit.committer.email !== commit.author.email;
+		const [authorResult, committerResult] = await Promise.allSettled([
+			getCommitAuthorAvatarUri(commit, { size: 32 }),
+			hasDistinctCommitter ? getCommitCommitterAvatarUri(commit, { size: 32 }) : Promise.resolve(undefined),
+		]);
+		signal?.throwIfAborted();
+
+		return {
+			author: getSettledValue(authorResult)?.toString(true),
+			committer: hasDistinctCommitter ? getSettledValue(committerResult)?.toString(true) : undefined,
+		};
+	}
+
+	/**
+	 * Whether the commit is reachable from a sibling worktree (i.e. its files have a working copy
+	 * elsewhere). Gates the "(Worktree)" file actions in the details panels.
+	 */
+	async getReachableFromOtherWorktrees(repoPath: string, sha: string, signal?: AbortSignal): Promise<boolean> {
+		signal?.throwIfAborted();
+
+		const worktrees = await this.container.git.getRepository(repoPath)?.git.worktrees?.getWorktrees(signal);
+		signal?.throwIfAborted();
+		if (worktrees == null || worktrees.length <= 1) return false;
+
+		// `repoPath` MUST be part of the key: `getWorktrees` is family-wide, so every worktree in a family
+		// sees the same list, but the answer excludes the worktree AT `repoPath` — two repos in one family
+		// would otherwise collide on one key and be served each other's answer. Beyond that the answer can
+		// only change when a worktree's HEAD moves, so key on those too.
+		const key = `${repoPath}:${sha}:${worktrees.map(w => w.sha ?? '').join(',')}`;
+		const cached = this._reachableFromOtherWorktreesCache.get(key);
+		if (cached != null) return cached;
+
+		const reachable = (await getReachableWorktrees(this.container, repoPath, sha, signal)).length > 0;
+		// Check for abort BEFORE caching: an aborted run resolves to an empty list (the per-worktree checks
+		// are `allSettled`, so a cancelled check is indistinguishable from "not an ancestor"), and caching
+		// that would persist a phantom `false` for the rest of the session.
+		signal?.throwIfAborted();
+		this._reachableFromOtherWorktreesCache.set(key, reachable);
+		return reachable;
+	}
+
+	private readonly _reachableFromOtherWorktreesCache = new LruMap<string, boolean>(100);
+
 	async getFeatureAccess(feature: PlusFeatures, repoUri?: string): Promise<FeatureAccess> {
 		const access =
 			repoUri != null
@@ -221,6 +367,40 @@ export class RepositoryService {
 	 */
 	async unstageFile(file: GitFileChangeShape): Promise<void> {
 		await this.container.git.getRepositoryService(file.repoPath).staging?.unstageFile(file.path);
+	}
+
+	/**
+	 * Stage a set of files in ONE atomic `git add` (multi-select). Using the batch rather than N
+	 * concurrent {@link stageFile} calls avoids `.git/index.lock` contention that would silently leave
+	 * some files unstaged. All files are assumed to share a repo (the file tree is per-repo).
+	 */
+	async stageFiles(files: GitFileChangeShape[]): Promise<void> {
+		if (!files.length) return;
+
+		await this.container.git.getRepositoryService(files[0].repoPath).staging?.stageFiles(files.map(f => f.path));
+	}
+
+	/**
+	 * Unstage a set of files in ONE atomic `git reset` (multi-select) — see {@link stageFiles} for why
+	 * the batch is used instead of N concurrent {@link unstageFile} calls.
+	 */
+	async unstageFiles(files: GitFileChangeShape[]): Promise<void> {
+		if (!files.length) return;
+
+		await this.container.git.getRepositoryService(files[0].repoPath).staging?.unstageFiles(files.map(f => f.path));
+	}
+
+	// Stash the working-tree changes of a single file (or set). Routes through the shared stash-push
+	// action (its confirm/message wizard), `includeUntracked` so a new file can be stashed too.
+	async stashFile(file: GitFileChangeShape): Promise<void> {
+		await StashActions.push(file.repoPath, [Uri.joinPath(Uri.file(file.repoPath), file.path)], undefined, true);
+	}
+
+	async stashFiles(files: GitFileChangeShape[]): Promise<void> {
+		if (!files.length) return;
+
+		const uris = files.map(f => Uri.joinPath(Uri.file(f.repoPath), f.path));
+		await StashActions.push(files[0].repoPath, uris, undefined, true);
 	}
 
 	/**
@@ -274,6 +454,99 @@ export class RepositoryService {
 			repoPath: file.repoPath,
 			showOptions: { preserveFocus: false, preview: true },
 		});
+	}
+
+	/**
+	 * Per-side details for the graph WIP Conflict Details sheet: for each side (current/incoming) the
+	 * ref, a display label, and the commits that changed the file from the merge-base to that side's
+	 * ref. Mirrors the tree-view `MergeConflictChangesNode` log logic. `status` is the file's two-char
+	 * conflict status, used to gate the stage-current/incoming affordances.
+	 */
+	async getConflictDetails(repoPath: string, filePath: string, status: string): Promise<ConflictDetails | undefined> {
+		const normalizedPath = normalizePath(filePath);
+		const svc = this.container.git.getRepositoryService(repoPath);
+		const pausedStatus = await svc.pausedOps?.getPausedOperationStatus?.();
+		if (pausedStatus == null) {
+			Logger.warn('getConflictDetails: paused-operation status unavailable');
+			return undefined;
+		}
+
+		const mergeBase = pausedStatus.mergeBase;
+		const incomingRef = getConflictIncomingRef(pausedStatus) ?? pausedStatus.HEAD.ref;
+
+		// Rename-aware path per side (mirrors openConflictChanges / mergeConflictFileNode).
+		let currentPath = normalizedPath;
+		let incomingPath = normalizedPath;
+		if (mergeBase != null) {
+			const [currentFilesResult, incomingFilesResult] = await Promise.allSettled([
+				svc.diff.getDiffStatus(mergeBase, 'HEAD', { renameLimit: 0 }),
+				svc.diff.getDiffStatus(mergeBase, incomingRef, { renameLimit: 0 }),
+			]);
+			const currentFiles = getSettledValue(currentFilesResult);
+			const incomingFiles = getSettledValue(incomingFilesResult);
+			currentPath = resolveConflictFilePaths(currentFiles, incomingFiles, normalizedPath).rhsPath;
+			incomingPath = resolveConflictFilePaths(incomingFiles, currentFiles, normalizedPath).rhsPath;
+		}
+
+		const buildSide = async (
+			path: string,
+			ref: string,
+			display: GitReference | undefined,
+		): Promise<ConflictDetailsSide> => {
+			let commits: ConflictDetailsCommit[] = [];
+			if (mergeBase != null) {
+				const log = await svc.commits.getLogForPath(path, createRevisionRange(mergeBase, ref, '..'), {
+					isFolder: false,
+					renames: true,
+				});
+				if (log?.commits != null) {
+					commits = Array.from(log.commits.values(), c => {
+						const committerEmail = c.committer?.email;
+						// Distinct committer = different name OR email (mirrors gl-commit-author.hasDistinctCommitter).
+						const hasDistinctCommitter =
+							(c.committer?.name != null && c.committer.name !== c.author.name) ||
+							(committerEmail != null && committerEmail.toLowerCase() !== c.author.email?.toLowerCase());
+						return {
+							sha: c.sha,
+							shortSha: c.shortSha,
+							message: c.message ?? c.summary,
+							author: c.author.name,
+							authorEmail: c.author.email,
+							avatarUrl: getAvatarUri(c.author.email, undefined, { size: 32 }).toString(),
+							committerAvatarUrl: hasDistinctCommitter
+								? getAvatarUri(committerEmail, undefined, { size: 32 }).toString()
+								: undefined,
+							committerName: hasDistinctCommitter ? c.committer?.name : undefined,
+							committerEmail: hasDistinctCommitter ? committerEmail : undefined,
+							committerDate: hasDistinctCommitter ? c.committer?.date?.getTime() : undefined,
+							date: c.author.date.getTime(),
+						};
+					});
+				}
+			}
+			const refKind: 'branch' | 'commit' = display?.refType === 'branch' ? 'branch' : 'commit';
+			const refName = display == null ? ref : refKind === 'branch' ? display.name : display.ref;
+			return { ref: ref, refKind: refKind, refName: refName, commits: commits };
+		};
+
+		const [current, incoming] = await Promise.all([
+			buildSide(currentPath, 'HEAD', getConflictCurrentRef(pausedStatus)),
+			buildSide(incomingPath, incomingRef, pausedStatus.incoming),
+		]);
+
+		// The generic single-char 'U' carries no side semantics, so it can't be staged per-side.
+		const conflictStatus =
+			status !== 'U' && isConflictStatus(status) ? (status as GitFileConflictStatus) : undefined;
+
+		return {
+			path: normalizedPath,
+			status: status,
+			hasMergeBase: mergeBase != null,
+			canStageCurrent: conflictStatus != null ? canStageCurrent(conflictStatus) : false,
+			canStageIncoming: conflictStatus != null ? canStageIncoming(conflictStatus) : false,
+			current: current,
+			incoming: incoming,
+		};
 	}
 
 	/**
@@ -353,31 +626,36 @@ export class RepositoryService {
 	}
 
 	async discardFile(file: GitFileChangeShape): Promise<void> {
-		const svc = this.container.git.getRepositoryService(file.repoPath);
-
-		// Authoritative re-read — the wire snapshot can be stale by the time the user confirms,
-		// and mis-detecting `mixed` is the difference between preserving and nuking staged content.
-		// Scoped to this one path (git pathspec) so a per-file discard doesn't pay for a full
-		// working-tree status scan.
-		const fresh = await svc.status.getStatusForFile?.(file.path);
-
-		// File vanished from status between snapshot and click (committed/unstaged elsewhere) —
-		// bail rather than apply the destructive op against stale wire data: the user's intent
-		// no longer maps onto a current state we can reason about.
-		if (fresh == null) {
-			Logger.warn(`Discard skipped for "${file.path}": file is no longer in working-tree status.`);
-			return;
-		}
-
-		const confirmed = await this.confirmDiscardChanges(file.path, fresh.mixed);
-		if (!confirmed) return;
-
 		try {
+			const svc = this.container.git.getRepositoryService(file.repoPath);
+
+			// Authoritative re-read — the wire snapshot can be stale by the time the user confirms,
+			// and mis-detecting `mixed` is the difference between preserving and nuking staged content.
+			// Scoped to this one path (git pathspec) so a per-file discard doesn't pay for a full
+			// working-tree status scan. A provider without the op can't be classified at all (mixed
+			// vs not decides whether staged content survives), so fail as unsupported rather than
+			// reporting the file as having no changes.
+			if (svc.status.getStatusForFile == null) throw new ProviderNotSupportedError(svc.provider.name);
+
+			const fresh = await svc.status.getStatusForFile(file.path);
+
+			// File vanished from status between snapshot and click (committed/unstaged elsewhere) —
+			// bail rather than apply the destructive op against stale wire data: the user's intent
+			// no longer maps onto a current state we can reason about.
+			if (fresh == null) {
+				Logger.warn(`Discard skipped for "${file.path}": file is no longer in working-tree status.`);
+				void window.showWarningMessage(`"${file.path}" no longer has changes to discard.`);
+				return;
+			}
+
+			const confirmed = await this.confirmDiscardChanges(file.path, fresh.mixed);
+			if (!confirmed) return;
+
 			await this.discardOne(svc, fresh);
 		} catch (ex) {
 			Logger.error(ex, 'Failed to discard changes');
 			void window.showErrorMessage(
-				`Failed to discard changes in "${fresh.path}": ${ex instanceof Error ? ex.message : String(ex)}`,
+				`Failed to discard changes in "${file.path}": ${ex instanceof Error ? ex.message : String(ex)}`,
 			);
 			throw ex;
 		}
@@ -400,90 +678,63 @@ export class RepositoryService {
 	 * - **Everything else** (modified, deleted, renamed/copied): trash + unstage, then restore from
 	 *   HEAD (resets index and working tree). R/C target the original path.
 	 */
-	private async discardOne(
-		svc: ReturnType<Container['git']['getRepositoryService']>,
-		file: GitStatusFile,
-	): Promise<void> {
-		const uri = Uri.joinPath(Uri.file(file.repoPath), file.path);
-
-		if (file.mixed) {
-			// Require `ops.restore` BEFORE the trash step so we don't move the file off-disk and
-			// then have nothing to restore from the index on a provider that lacks operations support.
-			if (svc.ops?.restore == null) {
-				throw new ProviderNotSupportedError(svc.provider.name);
-			}
-
-			if (file.workingTreeStatus !== 'D') {
-				await this.moveToTrash(uri);
-			}
-			// Let restore failures propagate — the working-tree file is already in Trash, so a silent
-			// warn would leave the user thinking discard succeeded while the file is missing.
-			await svc.ops.restore(file.path);
-			return;
-		}
-
-		// Untracked and newly-added files don't exist in HEAD — trashing is the whole operation,
-		// no HEAD restore (and no provider-ops requirement).
-		const isUntrackedOrAdded = file.status === '?' || file.status === 'A';
-
-		// Preflight the restore capability BEFORE trashing, mirroring the mixed branch.
-		if (!isUntrackedOrAdded && svc.ops?.restore == null) {
-			throw new ProviderNotSupportedError(svc.provider.name);
-		}
-
-		await this.trashAndUnstage(uri, svc, file);
-
-		if (isUntrackedOrAdded) return;
-
-		// Renames/copies: restore the original path from HEAD (not the new name).
-		if (file.status === 'R' || file.status === 'C') {
-			if (file.originalPath) {
-				await svc.ops!.restore(file.originalPath, { ref: 'HEAD' });
-			} else {
-				Logger.warn(`Renamed file ${file.path} missing originalPath — original not restored`);
-			}
-			return;
-		}
-
-		await svc.ops!.restore(file.path, { ref: 'HEAD' });
+	private discardOne(svc: ReturnType<Container['git']['getRepositoryService']>, file: GitStatusFile): Promise<void> {
+		// Orchestration lives in `discardOneWith` (testable against a real repo without the Container);
+		// here we just bind the git side-effects to the per-repo service.
+		return discardOneWith(
+			{
+				canRestore: svc.ops?.restore != null,
+				providerName: svc.provider.name,
+				moveToTrash: uri => this.moveToTrash(uri),
+				unstage: async path => {
+					await svc.staging?.unstageFile(path);
+				},
+				restore: (path, options) => svc.ops!.restore(path, options),
+			},
+			file,
+		);
 	}
 
 	async discardUnstagedFiles(repoPath: string): Promise<void> {
-		const svc = this.container.git.getRepositoryService(repoPath);
-		const status = await svc.status.getStatus();
-		if (status == null) return;
-
-		// Single-pass classification: every file with working-tree changes (purely-unstaged or
-		// mixed), excluding conflicts. Mixed files have their unstaged delta dropped while staged
-		// content is preserved — the user would need to discard the now-purely-staged file via the
-		// per-file action to fully revert (the bulk filter won't pick it up a second time).
-		const untracked: GitStatusFile[] = [];
-		const trackedPureUnstaged: GitStatusFile[] = [];
-		const mixed: GitStatusFile[] = [];
-		const toTrash: GitStatusFile[] = [];
-		for (const f of status.files) {
-			if (f.workingTreeStatus == null || f.conflictStatus != null) continue;
-
-			if (f.mixed) {
-				mixed.push(f);
-			} else if (f.status === '?') {
-				untracked.push(f);
-			} else {
-				trackedPureUnstaged.push(f);
-			}
-			// Move non-deleted working-tree files to trash so versions are recoverable.
-			// Gate on `workingTreeStatus` directly: for mixed files `f.status` reflects indexStatus
-			// (e.g. 'M' when the WT is actually deleted), so checking `f.status !== 'D'` is wrong.
-			if (f.workingTreeStatus !== 'D') {
-				toTrash.push(f);
-			}
-		}
-		if (untracked.length === 0 && trackedPureUnstaged.length === 0 && mixed.length === 0) return;
-
-		const confirmed = await this.confirmDiscardUnstaged(trackedPureUnstaged.length, untracked.length, mixed.length);
-		if (!confirmed) return;
-
 		try {
+			const svc = this.container.git.getRepositoryService(repoPath);
+			const status = await svc.status.getStatus();
+			if (status == null) return;
+
+			// Single-pass classification: every file with working-tree changes (purely-unstaged or
+			// mixed), excluding conflicts. Mixed files have their unstaged delta dropped while staged
+			// content is preserved — the user would need to discard the now-purely-staged file via the
+			// per-file action to fully revert (the bulk filter won't pick it up a second time).
+			const untracked: GitStatusFile[] = [];
+			const trackedPureUnstaged: GitStatusFile[] = [];
+			const mixed: GitStatusFile[] = [];
+			const toTrash: GitStatusFile[] = [];
+			for (const f of status.files) {
+				if (f.workingTreeStatus == null || f.conflictStatus != null) continue;
+
+				if (f.mixed) {
+					mixed.push(f);
+				} else if (f.status === '?') {
+					untracked.push(f);
+				} else {
+					trackedPureUnstaged.push(f);
+				}
+				// Move non-deleted working-tree files to trash so versions are recoverable.
+				// Gate on `workingTreeStatus` directly: for mixed files `f.status` reflects indexStatus
+				// (e.g. 'M' when the WT is actually deleted), so checking `f.status !== 'D'` is wrong.
+				if (f.workingTreeStatus !== 'D') {
+					toTrash.push(f);
+				}
+			}
+			if (untracked.length === 0 && trackedPureUnstaged.length === 0 && mixed.length === 0) return;
+
+			const confirmed = await this.confirmDiscardFiles({
+				tracked: trackedPureUnstaged.length,
+				untracked: untracked.length,
+				mixed: mixed.length,
+			});
+			if (!confirmed) return;
+
 			// Preflight: refuse to trash anything if any file will need a restore (from-index for
 			// mixed, from-HEAD for tracked) but the provider can't restore. Covers both restore
 			// batches below, not just mixed, and matches the per-file path's preflight so the two
@@ -542,6 +793,107 @@ export class RepositoryService {
 	}
 
 	/**
+	 * Discards a SELECTED subset of files (multi-select inline discard, or the file-tree "Discard
+	 * Changes" context menu) with ONE combined confirmation — mirrors {@link discardUnstagedFiles} but
+	 * scoped to the requested paths. Re-reads authoritative status, classifies
+	 * untracked/unstaged/mixed/staged/conflicted, confirms once, then reverts each via the shared
+	 * {@link discardOne} core, which decides per file what a discard means:
+	 *
+	 * - purely-staged files are reverted in full — there is no mode that spares them, so the callers'
+	 *   controls all say "Discard Changes";
+	 * - MIXED files still lose only their unstaged portion, keeping their staged content until a second
+	 *   discard (see {@link discardOneWith}) — the confirm says so;
+	 * - conflicts revert to our/HEAD side, or are removed where HEAD has no version.
+	 *
+	 * Selected paths no longer present in status (committed/reverted elsewhere between snapshot and
+	 * click) are reported to the confirm rather than silently dropped. Destructive: the discarded
+	 * changes are permanently lost.
+	 */
+	async discardFiles(files: GitFileChangeShape[]): Promise<void> {
+		if (files.length === 0) return;
+
+		try {
+			const svc = this.container.git.getRepositoryService(files[0].repoPath);
+			const status = await svc.status.getStatus();
+			if (status == null) {
+				Logger.warn(`discardFiles: status unavailable for "${files[0].repoPath}"`);
+				void window.showWarningMessage('Unable to discard changes — repository status unavailable.');
+				return;
+			}
+
+			// Authoritative re-read scoped to the requested paths. Conflicted files are discarded too
+			// (reverted to our/HEAD side or removed — see discardOne); pure-staged files (index dirty,
+			// working tree clean) go to `pureStaged` and are discarded in full — see the doc comment
+			// above and the classification doc comment in discard.utils.ts.
+			const requested = new Set(files.map(f => f.path));
+			const { untracked, trackedPureUnstaged, mixed, pureStaged, conflicted, skippedMissingCount } =
+				classifyFilesForDiscard(status.files, requested);
+
+			const toDiscard = [...untracked, ...trackedPureUnstaged, ...mixed, ...conflicted, ...pureStaged];
+			if (toDiscard.length === 0) {
+				if (skippedMissingCount > 0) {
+					Logger.warn(
+						`discardFiles: nothing to discard — ${skippedMissingCount} of ${requested.size} selected file(s) no longer have changes`,
+					);
+					void window.showWarningMessage(
+						`${pluralize('file', skippedMissingCount)} selected no longer ${skippedMissingCount === 1 ? 'has' : 'have'} changes — nothing to discard.`,
+					);
+				} else {
+					Logger.warn('discardFiles: none of the selected files have changes to discard');
+					void window.showWarningMessage('None of the selected files have changes to discard.');
+				}
+				return;
+			}
+
+			// One standard confirm for the whole selection. Conflicts are reported on their own rather
+			// than folded into the tracked total: their unmerged index entries get cleared, so the
+			// prompt has to say the operation reaches past the working tree. Missing selections are
+			// disclosed but never folded into the discarded total.
+			const confirmed = await this.confirmDiscardFiles({
+				tracked: trackedPureUnstaged.length,
+				untracked: untracked.length,
+				mixed: mixed.length,
+				staged: pureStaged.length,
+				stagedAdded: pureStaged.filter(f => f.indexStatus === 'A').length,
+				conflicted: conflicted.length,
+				skippedMissing: skippedMissingCount,
+			});
+			if (!confirmed) return;
+
+			// Preflight `ops.restore` before trashing anything (matches the per-file and bulk paths), so
+			// a provider without restore fails fast instead of leaving files in the Trash unrecoverable.
+			// Staged additions aren't in HEAD (trash+unstage only, matching discardStagedFiles's same
+			// carve-out) so they don't require restore on their own.
+			if (
+				(mixed.length > 0 ||
+					trackedPureUnstaged.length > 0 ||
+					conflicted.length > 0 ||
+					pureStaged.some(f => f.indexStatus !== 'A')) &&
+				svc.ops?.restore == null
+			) {
+				throw new ProviderNotSupportedError(svc.provider.name);
+			}
+
+			// Reuse the per-file core so each file is reverted exactly as the single discard would.
+			const failed: string[] = [];
+			for (const f of toDiscard) {
+				try {
+					await this.discardOne(svc, f);
+				} catch (ex) {
+					Logger.warn(`Failed to discard changes in ${f.path}: ${ex}`);
+					failed.push(f.path);
+				}
+			}
+
+			this.warnDiscardFailures(failed);
+		} catch (ex) {
+			Logger.error(ex, 'Failed to discard changes');
+			void window.showErrorMessage(`Failed to discard changes: ${ex instanceof Error ? ex.message : String(ex)}`);
+			throw ex;
+		}
+	}
+
+	/**
 	 * Bulk-discards staged changes — the counterpart the WIP toolbar button morphs to when the
 	 * working tree has only staged content (nothing unstaged left to discard). Reverts each
 	 * pure-staged file to HEAD via the shared {@link discardOne} core, so behavior matches the
@@ -549,21 +901,21 @@ export class RepositoryService {
 	 * working-tree changes and belong to the unstaged path); so are conflicts.
 	 */
 	async discardStagedFiles(repoPath: string): Promise<void> {
-		const svc = this.container.git.getRepositoryService(repoPath);
-		const status = await svc.status.getStatus();
-		if (status == null) return;
-
-		// Pure-staged, non-conflicted files: index dirty, working tree clean. (Mixed files have a
-		// working-tree status and are handled by discardUnstagedFiles.)
-		const staged = status.files.filter(
-			f => f.indexStatus != null && f.workingTreeStatus == null && f.conflictStatus == null,
-		);
-		if (staged.length === 0) return;
-
-		const confirmed = await this.confirmDiscardStaged(staged.length);
-		if (!confirmed) return;
-
 		try {
+			const svc = this.container.git.getRepositoryService(repoPath);
+			const status = await svc.status.getStatus();
+			if (status == null) return;
+
+			// Pure-staged, non-conflicted files: index dirty, working tree clean. (Mixed files have a
+			// working-tree status and are handled by discardUnstagedFiles.)
+			const staged = status.files.filter(
+				f => f.indexStatus != null && f.workingTreeStatus == null && f.conflictStatus == null,
+			);
+			if (staged.length === 0) return;
+
+			const confirmed = await this.confirmDiscardStaged(staged.length);
+			if (!confirmed) return;
+
 			// Staged additions aren't in HEAD (trash + unstage handles them); everything else needs
 			// a HEAD restore. Preflight `ops.restore` only when such a file exists, matching the
 			// unstaged path's conditional preflight.
@@ -584,7 +936,7 @@ export class RepositoryService {
 				}
 			}
 
-			this.warnDiscardRestoreFailures(failed);
+			this.warnDiscardFailures(failed);
 		} catch (ex) {
 			Logger.error(ex, 'Failed to discard staged changes');
 			void window.showErrorMessage(
@@ -592,6 +944,16 @@ export class RepositoryService {
 			);
 			throw ex;
 		}
+	}
+
+	/**
+	 * Build the "<preview>, and N more" tail shared by the two discard failure warnings below, so the
+	 * truncation style can't drift between them.
+	 */
+	private previewFailedFiles(failed: string[]): string {
+		const preview = failed.slice(0, 3).join(', ');
+		const more = failed.length > 3 ? `, and ${failed.length - 3} more` : '';
+		return `${preview}${more}`;
 	}
 
 	/**
@@ -606,12 +968,27 @@ export class RepositoryService {
 	private warnDiscardRestoreFailures(failed: string[]): void {
 		if (failed.length === 0) return;
 
-		const preview = failed.slice(0, 3).join(', ');
-		const more = failed.length > 3 ? `, and ${failed.length - 3} more` : '';
+		const preview = this.previewFailedFiles(failed);
 		const they = failed.length === 1 ? "it's" : "they're";
 		const their = failed.length === 1 ? 'its' : 'their';
 		void window.showWarningMessage(
-			`Couldn't restore ${pluralize('file', failed.length)} after discard: ${preview}${more} — ${they} missing from the working tree, but ${their} content is recoverable from Git.`,
+			`Couldn't restore ${pluralize('file', failed.length)} after discard: ${preview} — ${they} missing from the working tree, but ${their} content is recoverable from Git.`,
+		);
+	}
+
+	/**
+	 * Surface per-file discard failures from {@link discardFiles}/{@link discardStagedFiles}, whose
+	 * per-file `discardOne` catch can't tell which phase inside {@link discardOneWith} threw — trash,
+	 * unstage, and restore all run in one try, unlike {@link discardUnstagedFiles}'s batch-restore-only
+	 * failures. So we can't say the file is missing (trash may never have run) or promise it's
+	 * recoverable from Git (restore may never have run either) — just tell the user to go look.
+	 */
+	private warnDiscardFailures(failed: string[]): void {
+		if (failed.length === 0) return;
+
+		const preview = this.previewFailedFiles(failed);
+		void window.showWarningMessage(
+			`Failed to discard changes in ${pluralize('file', failed.length)}: ${preview} — check ${failed.length === 1 ? 'its' : 'their'} state before continuing.`,
 		);
 	}
 
@@ -649,19 +1026,6 @@ export class RepositoryService {
 		}
 	}
 
-	private async trashAndUnstage(
-		uri: Uri,
-		svc: ReturnType<Container['git']['getRepositoryService']>,
-		file: GitFileChangeShape,
-	): Promise<void> {
-		if (file.status !== 'D') {
-			await this.moveToTrash(uri);
-		}
-		if (file.staged) {
-			await svc.staging?.unstageFile(file.path);
-		}
-	}
-
 	private async confirmDiscardChanges(path: string, isMixed: boolean = false): Promise<boolean> {
 		// Mixed: only the working-tree delta is discarded; the staged portion survives. Make that
 		// expectation explicit so users aren't surprised when staged changes remain — and so they
@@ -695,29 +1059,90 @@ export class RepositoryService {
 		return choice === discard;
 	}
 
-	private async confirmDiscardUnstaged(
-		trackedCount: number,
-		untrackedCount: number,
-		mixedCount: number = 0,
-	): Promise<boolean> {
+	private async confirmDiscardFiles(counts: {
+		tracked: number;
+		untracked: number;
+		mixed?: number;
+		/** Purely-staged files, discarded in full as part of the batch. */
+		staged?: number;
+		/** Of `staged`, those added to the index and absent from HEAD — Git cannot restore them. */
+		stagedAdded?: number;
+		/** Conflicted files, whose unmerged index entries are cleared — counted separately from
+		 * `tracked` so the prompt can say the operation isn't unstaged-only. */
+		conflicted?: number;
+		skippedMissing?: number;
+	}): Promise<boolean> {
+		const {
+			tracked,
+			untracked,
+			mixed = 0,
+			staged = 0,
+			stagedAdded = 0,
+			conflicted = 0,
+			skippedMissing = 0,
+		} = counts;
+
 		// Lead with a unified question keyed off the total, then layer on caveats per category.
 		// Collecting non-empty sections and joining with blank lines avoids the per-section
-		// "remember to push '' first" blank-line bookkeeping the earlier shape needed.
-		const totalCount = trackedCount + untrackedCount + mixedCount;
+		// "remember to push '' first" blank-line bookkeeping the earlier shape needed. Skipped
+		// counts never inflate `total` — the number the user reads must equal the number of files
+		// about to be modified.
+		const total = tracked + untracked + mixed + staged + conflicted;
+		// Staged or conflicted files put the index in scope, so the unstaged-only phrasing would
+		// under-describe the operation.
+		const beyondUnstaged = staged > 0 || conflicted > 0;
 		const sections: string[] = [
-			`Are you sure you want to discard unstaged changes in ${pluralize('file', totalCount)}?`,
+			beyondUnstaged
+				? `Are you sure you want to discard changes in ${pluralize('file', total)}?`
+				: `Are you sure you want to discard unstaged changes in ${pluralize('file', total)}?`,
 		];
-		if (untrackedCount > 0) {
+		if (untracked > 0) {
 			// Don't promise the Trash — `moveToTrash` hard-deletes on trash-unavailable providers,
 			// and untracked files aren't in Git, so there's no other recovery path. The IRREVERSIBLE
 			// line below is the honest worst case.
-			sections.push(`This will DELETE ${pluralize('untracked file', untrackedCount)}.`);
+			sections.push(`This will DELETE ${pluralize('untracked file', untracked)}.`);
 		}
-		if (mixedCount > 0) {
-			// The bulk filter excludes purely-staged files, so a second click of the bulk button
-			// won't pick these up — point users at the per-file discard for the staged portion.
+		if (stagedAdded > 0) {
+			// Staged-added files aren't in HEAD, so discard is trash-then-unstage with no restore —
+			// on trash-unavailable providers (SSH remote, dev container) `moveToTrash` hard-deletes,
+			// so this is the one genuinely unrecoverable case in the feature. Don't promise the Trash
+			// here either, matching the untracked section above.
 			sections.push(
-				`${pluralize('file', mixedCount)} also ${mixedCount === 1 ? 'has' : 'have'} staged changes — only ${mixedCount === 1 ? 'its' : 'their'} unstaged portion will be discarded. To also discard the staged portion, run the per-file discard action.`,
+				`This will DELETE ${pluralize('staged file', stagedAdded)} added to the index — Git cannot restore ${stagedAdded === 1 ? 'it' : 'them'} because ${stagedAdded === 1 ? "it isn't" : "they aren't"} in HEAD.`,
+			);
+		}
+		if (mixed > 0) {
+			// States the outcome without prescribing a next step: whether discarding again would remove
+			// the staged portion depends on which caller this is — the selection path picks the file up
+			// once it's purely staged, the repo-wide path skips it — so any "do X next" is wrong for one
+			// of them. `confirmDiscardChanges` can still say "discard again" because it has one caller.
+			sections.push(
+				`${pluralize('file', mixed)} also ${mixed === 1 ? 'has' : 'have'} staged changes — only ${mixed === 1 ? 'its' : 'their'} unstaged portion will be discarded; the staged changes remain.`,
+			);
+		}
+		if (staged > 0) {
+			// Distinct from the mixed section above: purely-staged files, no unstaged portion at all,
+			// discarded outright as part of the full batch discard. Lead with ONLY so it reads
+			// unambiguously against mixed's "also has staged changes" when both sections appear —
+			// the two describe disjoint file sets, and a destructive confirm can't leave the reader
+			// guessing which one a sentence is about.
+			sections.push(
+				`${pluralize('file', staged)} ${staged === 1 ? 'has' : 'have'} ONLY staged changes — ${staged === 1 ? 'it' : 'these'} will be discarded in full, not preserved.`,
+			);
+		}
+		if (conflicted > 0) {
+			// Clearing the unmerged index entry is the part that isn't recoverable from the Trash, and
+			// marking the path resolved lets the paused operation continue with Current's content —
+			// silently producing a wrong result rather than merely losing edits. Say both. `Current`
+			// matches the conflict vocabulary used by "Open Current/Incoming Changes" and
+			// `canStageCurrent`; "paused operation" covers rebase, merge, cherry-pick and revert.
+			sections.push(
+				`${pluralize('conflicted file', conflicted)} will be reset to Current and marked resolved — any conflict resolution will be lost, and the paused operation will continue as if ${conflicted === 1 ? 'it was' : 'they were'} resolved.`,
+			);
+		}
+		if (skippedMissing > 0) {
+			sections.push(
+				`${pluralize('file', skippedMissing)} selected no longer ${skippedMissing === 1 ? 'has' : 'have'} changes and will be skipped.`,
 			);
 		}
 		sections.push('This is IRREVERSIBLE!\nYour current working set will be FOREVER LOST if you proceed.');
@@ -725,9 +1150,13 @@ export class RepositoryService {
 		// Label switches to the verb form (no count) whenever ANY mixed file is in the batch —
 		// the count form would mis-describe mixed entries as "Unstaged Files" since those get
 		// partial discards, not full ones. The verb form is honest for any batch size and
-		// composition that includes mixed files.
-		const discard =
-			mixedCount > 0 ? 'Discard Unstaged Changes' : `Discard ${pluralize('Unstaged File', totalCount)}`;
+		// composition that includes mixed files. Staged or conflicted files win over both: once the
+		// index is in scope, "Unstaged" no longer describes the operation at all.
+		const discard = beyondUnstaged
+			? 'Discard Changes'
+			: mixed > 0
+				? 'Discard Unstaged Changes'
+				: `Discard ${pluralize('Unstaged File', total)}`;
 		const choice = await window.showWarningMessage(sections.join('\n\n'), { modal: true }, discard);
 		return choice === discard;
 	}
@@ -736,6 +1165,10 @@ export class RepositoryService {
 		try {
 			await workspace.fs.delete(uri, { useTrash: true });
 		} catch (ex) {
+			// Nothing on disk (e.g. a both-deleted conflict, where neither side keeps a working copy) —
+			// discard has nothing to trash, so treat it as done.
+			if (ex instanceof FileSystemError && ex.code === 'FileNotFound') return;
+
 			// Some filesystem providers (SSH-remote, dev containers, virtual FS) don't implement
 			// trash. Fall back to a direct delete — the user already accepted the IRREVERSIBLE
 			// warning in confirmDiscardChanges, so losing the recovery path is in policy.
@@ -759,7 +1192,9 @@ export class RepositoryService {
 		options?: { all?: boolean; amend?: boolean },
 	): Promise<CommitResult> {
 		try {
-			await this.container.git.getRepositoryService(repoPath).ops?.commit(message, options);
+			await this.container.git
+				.getRepositoryService(repoPath)
+				.ops?.commit(message, { ...options, source: { source: 'graph' } satisfies Source });
 			return { status: 'committed' };
 		} catch (ex) {
 			const failure = classifyCommitFailure(ex);
@@ -775,6 +1210,117 @@ export class RepositoryService {
 				hasOutput: failure.output != null && failure.output.length > 0,
 			};
 		}
+	}
+
+	/**
+	 * Commits staged changes as a `fixup!`-prefixed message, then immediately relocates that fixup
+	 * commit directly under its target via a headless interactive rebase — folding it in right away
+	 * rather than waiting for a later `--autosquash` pass. Never throws; the rebase step degrades to
+	 * a toast on conflict or failure while still reporting the commit itself as succeeded.
+	 */
+	async commitAndSquashFixup(
+		repoPath: string,
+		message: string,
+		options: { targetSha: string; all?: boolean },
+	): Promise<CommitResult> {
+		const svc = this.container.git.getRepositoryService(repoPath);
+		if (svc.ops?.rebase == null) {
+			return {
+				status: 'failed',
+				reason: 'unknown',
+				summary: "Squashing fixups isn't supported in this environment",
+				hasOutput: false,
+			};
+		}
+
+		let published = false;
+		try {
+			published = await isCommitPushed(repoPath, options.targetSha);
+		} catch {
+			// Ignore — fall back to committing without the published warning.
+		}
+		if (published) {
+			const confirm: MessageItem = { title: 'Commit & Squash' };
+			const cancel: MessageItem = { title: 'Cancel', isCloseAffordance: true };
+			let choice: MessageItem | undefined;
+			try {
+				choice = await window.showWarningMessage(
+					'Commit and squash this fixup?',
+					{
+						modal: true,
+						detail: 'The target commit has already been pushed. Squashing the fixup rewrites history and will require a force push.',
+					},
+					confirm,
+					cancel,
+				);
+			} catch {
+				// An unpresentable confirmation counts as a decline — never rewrite unconfirmed.
+			}
+			if (choice !== confirm) return { status: 'cancelled' };
+		}
+
+		try {
+			await svc.ops.commit(message, { all: options.all, source: { source: 'graph' } satisfies Source });
+		} catch (ex) {
+			const failure = classifyCommitFailure(ex);
+			void presentCommitFailure(failure);
+
+			return {
+				status: 'failed',
+				reason: failure.reason,
+				summary: failure.summary,
+				hasOutput: failure.output != null && failure.output.length > 0,
+			};
+		}
+
+		let resolved;
+		try {
+			resolved = await svc.revision.resolveRevision('HEAD');
+		} catch {
+			// Fall through to the committed-without-squash path below.
+		}
+		if (resolved == null || !isSha(resolved.sha)) {
+			void window.showWarningMessage(
+				'The fixup was committed, but GitLens could not locate it to squash automatically.',
+			);
+
+			return { status: 'committed' };
+		}
+
+		try {
+			const sequenceEditor = getSquashSequenceEditor(this.container);
+			const result = await svc.ops.rebase(
+				`${options.targetSha}^`,
+				{
+					interactive: true,
+					// The editor is a script that rewrites the todo by SHA, so force git to emit a plain,
+					// natural-order todo (no autosquash reordering, no abbreviated `p` commands).
+					programmaticEditor: true,
+					editor: sequenceEditor.editor,
+					autoStash: true,
+					updateRefs: true,
+					source: { source: 'graph' } satisfies Source,
+				},
+				{
+					env: {
+						...sequenceEditor.env,
+						GL_FIXUP_SHA: resolved.sha,
+						GL_FIXUP_TARGET: options.targetSha,
+					},
+				},
+			);
+			if (result?.conflicted) {
+				void window.showWarningMessage(
+					'Fixup stopped because of conflicts. Resolve them to continue, or abort the rebase to cancel.',
+				);
+			}
+		} catch (ex) {
+			void window.showErrorMessage(
+				`Committed the fixup, but squashing it failed: ${ex instanceof Error ? ex.message : String(ex)}`,
+			);
+		}
+
+		return { status: 'committed' };
 	}
 
 	/**

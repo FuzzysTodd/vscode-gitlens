@@ -8,8 +8,16 @@ import type { GitFileChangeShape, GitFileChangeStats } from '@gitlens/git/models
 import type { GitFileConflictStatus } from '@gitlens/git/models/fileStatus.js';
 import type { GitCommitSearchContext } from '@gitlens/git/models/search.js';
 import { isConflictStatus } from '@gitlens/git/utils/fileStatus.utils.js';
+import { areEqual } from '@gitlens/utils/object.js';
+import { trimTrailingSlash } from '@gitlens/utils/path.js';
 import { pluralize } from '@gitlens/utils/string.js';
 import type { ViewFilesLayout, ViewsFilesConfig } from '../../../../../config.js';
+import type { WebviewItemContext } from '../../../../../system/webview.js';
+import {
+	mergeWebviewItems,
+	mergeWebviewItemsUnion,
+	serializeWebviewItemContext,
+} from '../../../../../system/webview.js';
 import type { FileShowOptions, WorkingFileSorting } from '../../../../commitDetails/protocol.js';
 import { ModifierKeysController } from '../../controllers/modifier-keys.js';
 import { elementBase } from '../styles/lit/base.css.js';
@@ -21,6 +29,7 @@ import type {
 	TreeItemDecoration,
 	TreeItemSelectionDetail,
 	TreeModel,
+	TreeSelectionChangedDetail,
 } from './base.js';
 import { getConflictDecorations, getConflictTooltip } from './conflictRendering.js';
 import type { FileGroup } from './file-tree-utils.js';
@@ -33,8 +42,10 @@ import {
 	nextContextMatchVisibility,
 	renderContextMatchVisibilityAction,
 	renderLayoutAction,
+	selectFilesByPath,
 } from './file-tree-utils.js';
 import { fileTreeStyles } from './gl-file-tree-pane.css.js';
+import type { GlTreeView } from './tree-view.js';
 import '../badges/badge.js';
 import '../webview-pane.js';
 import '../chips/action-chip.js';
@@ -46,6 +57,8 @@ import './tree-view.js';
 
 export type FileItem = GitFileChangeShape & { stats?: GitFileChangeStats; conflictMarkers?: number };
 type Files = Mutable<FileItem[]>;
+type FilesLayoutConfig = Pick<ViewsFilesConfig, 'layout' | 'threshold' | 'compact'>;
+type CheckableState = { state?: 'checked' | 'mixed'; disabled?: boolean; disabledReason?: string };
 
 // Can only import types from 'vscode'
 const BesideViewColumn = -2; /*ViewColumn.Beside*/
@@ -55,6 +68,9 @@ export interface FileChangeListItemDetail extends FileItem {
 	/** Set when the originating click held Alt. Surfaced so consumers like gl-wip-tree-pane
 	 * can fork dispatch on modifier state without reverse-engineering `showOptions.viewColumn`. */
 	altKey?: boolean;
+	/** Present when a `batch` inline action fires on a multi-selection — the full selected set so the
+	 * consumer can act once (e.g. one combined discard confirm) instead of per-file. */
+	files?: readonly FileItem[];
 }
 
 @customElement('gl-file-tree-pane')
@@ -92,7 +108,7 @@ export class GlFileTreePane extends LitElement {
 	 * When set, each file's tree model will include the returned contextData string.
 	 */
 	@property({ attribute: false })
-	fileContext?: (file: FileItem) => string | undefined;
+	fileContext?: (file: FileItem, options?: Partial<TreeItemBase>) => string | undefined;
 
 	/**
 	 * Optional callback to generate context data for folder tree items. When set, each folder's
@@ -102,6 +118,16 @@ export class GlFileTreePane extends LitElement {
 	@property({ attribute: false })
 	folderContext?: (folder: { name: string; relativePath: string; repoPath?: string }) => string | undefined;
 
+	/**
+	 * Opaque token for the *inputs* of {@link fileContext} / {@link folderContext}. The callbacks
+	 * themselves can't trigger a rebuild (they're stable-bound and re-created per render — see the note
+	 * in `willUpdate`), but their results are baked into the cached tree model as `contextData`. Change
+	 * this whenever something the callbacks read changes, so the baked contexts are recomputed —
+	 * otherwise a late-arriving input (e.g. worktree reachability) never reaches the rows' menus.
+	 */
+	@property({ attribute: false })
+	contextRevision?: unknown;
+
 	// --- Generic grouping (replaces isUncommitted / staged-unstaged logic) ---
 
 	@property({ attribute: false })
@@ -109,8 +135,13 @@ export class GlFileTreePane extends LitElement {
 
 	// --- File layout (replaces preferences.files) ---
 
-	@property({ attribute: false })
-	filesLayout?: Pick<ViewsFilesConfig, 'layout' | 'threshold' | 'compact'>;
+	@property({
+		attribute: false,
+		// Callers pass a fresh literal per parent render; only rebuild when a value we read changes.
+		hasChanged: (next: FilesLayoutConfig | undefined, prev: FilesLayoutConfig | undefined) =>
+			next?.layout !== prev?.layout || next?.threshold !== prev?.threshold || next?.compact !== prev?.compact,
+	})
+	filesLayout?: FilesLayoutConfig;
 
 	/**
 	 * Working-files sort order (VS Code's `scm.defaultViewSortKey`). Honored only in list layout,
@@ -118,6 +149,17 @@ export class GlFileTreePane extends LitElement {
 	 */
 	@property({ attribute: false })
 	orderBy?: WorkingFileSorting;
+
+	/**
+	 * When set (the WIP `gitlens.sortWorkingChangesBy: stage` mode), the list-layout sort floats files
+	 * staged → mixed → unstaged ahead of `orderBy`. List layout only, like `orderBy`.
+	 */
+	@property({ type: Boolean, attribute: 'sort-by-stage' })
+	sortByStage = false;
+
+	/** Paths with both staged + unstaged hunks; lets the stage sort rank a file as "mixed". */
+	@property({ attribute: false })
+	mixedPaths?: ReadonlySet<string>;
 
 	@property()
 	showIndentGuides?: 'none' | 'onHover' | 'always';
@@ -128,18 +170,30 @@ export class GlFileTreePane extends LitElement {
 	badge?: string | number;
 
 	@property({ attribute: false })
-	buttons?: ('layout' | 'search' | 'multi-diff')[];
+	buttons?: ('layout' | 'search')[];
 
-	/** Override the default `"Open All Changes"` label for the multi-diff button. Set by the WIP
-	 *  pane to surface smart `"Open Staged Changes"` wording when both staged + unstaged exist. */
-	@property({ attribute: 'multi-diff-label' })
-	multiDiffLabel?: string;
+	// --- Multi-select ---
 
-	/** Companion alt-label for the multi-diff button. When set, the button uses gl-action-chip's
-	 *  built-in `alt-label` machinery so the tooltip composes a `Primary\n[Alt] Alt-action` hint,
-	 *  swaps live when Alt is held, and the aria-label stays clean (single action at a time). */
-	@property({ attribute: 'multi-diff-alt-label' })
-	multiDiffAltLabel?: string;
+	/**
+	 * Opt-in native row multi-select (Ctrl/Cmd+click toggle, Shift+click range). Forwarded to
+	 * `gl-tree-view`. When on, the pane emits `file-selection-changed` with the selected file set;
+	 * a plain click still fires the per-row `selectionAction` event so click-to-open is preserved.
+	 * Orthogonal to `checkable`.
+	 */
+	@property({ type: Boolean, attribute: 'multi-selectable' })
+	multiSelectable = false;
+
+	/** Opt-in: makes file rows draggable (native drag carrying the file `path`). Off by default;
+	 *  set by consumers that support dropping files elsewhere (e.g. compose file→commit move). */
+	@property({ type: Boolean, attribute: 'draggable-files' })
+	draggableFiles = false;
+
+	@state() private _selectedFiles: readonly FileItem[] = [];
+
+	/** The currently multi-selected files (empty when `multiSelectable` is off or nothing selected). */
+	get selectedFiles(): readonly FileItem[] {
+		return this._selectedFiles;
+	}
 
 	// --- Checkbox ---
 
@@ -152,8 +206,25 @@ export class GlFileTreePane extends LitElement {
 	 * `disabledReason` overrides the default include/exclude tooltip when the row is disabled
 	 * (e.g. "Excluded by AI ignore rules") so users understand WHY they can't toggle it.
 	 */
-	@property({ attribute: false })
-	checkableStates?: Map<string, { state?: 'checked' | 'mixed'; disabled?: boolean; disabledReason?: string }>;
+	@property({
+		attribute: false,
+		// Freshly built per parent render with conditionally-inserted entries — compare entry-wise;
+		// reference equality or equal sizes alone can't prove equal contents.
+		hasChanged: (next: Map<string, CheckableState> | undefined, prev: Map<string, CheckableState> | undefined) => {
+			if (next === prev) return false;
+			if (next == null || prev == null) return true;
+
+			let matched = 0;
+			for (const [path, state] of next) {
+				const prevState = prev.get(path);
+				if (prevState == null || !areEqual(state, prevState)) return true;
+
+				matched++;
+			}
+			return matched !== prev.size;
+		},
+	})
+	checkableStates?: Map<string, CheckableState>;
 
 	@property({ attribute: false })
 	checkableStateDefault?: { state?: 'checked' | 'mixed'; disabled?: boolean; disabledReason?: string };
@@ -232,22 +303,111 @@ export class GlFileTreePane extends LitElement {
 	searchBoxFilter?: boolean;
 
 	private _cachedTreeModel?: TreeModel[];
+	/**
+	 * Row identities (`key ?? path`) of folders the user has collapsed. The tree model is rebuilt
+	 * from scratch (default-expanded) on every `files`/preference change, so we re-apply this set
+	 * after each rebuild to keep collapse state across refreshes. Storing only collapsed *deviations*
+	 * (not expanded ids) means folders that first appear after a refresh default to expanded.
+	 * In-memory only — persists while this element lives (data refreshes, commit switches), resets on
+	 * a full webview reload.
+	 */
+	private readonly _collapsedIds = new Set<string>();
 	private _pendingScrollRestore?: number;
 	// Drives a re-render when alt is pressed/released so the header tooltip can swap between
 	// the primary and alt-action labels. Per-file checkbox tooltips swap inside `gl-tree-item`,
 	// which has its own subscription.
 	private readonly _modifiers = new ModifierKeysController(this);
 
+	override connectedCallback(): void {
+		super.connectedCallback?.();
+		// Bubble-phase listener fires before the ancestor ContextMenuProxyController (inner→outer), so
+		// it can enrich the right-clicked row's data-vscode-context with the active multi-selection
+		// just-in-time — before the proxy copies it to the light-DOM host for VS Code's menu.
+		this.addEventListener('contextmenu', this.onContextMenuEnrichSelection);
+	}
+
+	override disconnectedCallback(): void {
+		this.removeEventListener('contextmenu', this.onContextMenuEnrichSelection);
+		super.disconnectedCallback?.();
+	}
+
+	/**
+	 * When a row that's part of a multi-selection is right-clicked, enrich its data-vscode-context with
+	 * `listMultiSelection` + merged `webviewItems` + `webviewItemsValues` so VS Code's `.multi` file
+	 * commands gate and resolve over the whole selection. The single-row context is restored shortly
+	 * after the menu reads it (mirrors ContextMenuProxyController's 100ms window).
+	 */
+	private onContextMenuEnrichSelection = (e: MouseEvent): void => {
+		if (!this.multiSelectable || this._selectedFiles.length <= 1 || this.fileContext == null) return;
+
+		const treeItem = e
+			.composedPath()
+			.find(
+				(el): el is HTMLElement =>
+					el instanceof HTMLElement &&
+					el.tagName === 'GL-TREE-ITEM' &&
+					el.hasAttribute('data-vscode-context'),
+			);
+		if (treeItem == null) return;
+
+		const raw = treeItem.getAttribute('data-vscode-context');
+		if (raw == null) return;
+
+		let single: WebviewItemContext;
+		try {
+			single = JSON.parse(raw) as WebviewItemContext;
+		} catch {
+			return;
+		}
+
+		// Only enrich when the right-clicked row is itself part of the selection.
+		const path = (single.webviewItemValue as { path?: string } | undefined)?.path;
+		if (path == null || !this._selectedFiles.some(f => f.path === path)) return;
+
+		const values: { webviewItem: string; webviewItemValue: unknown }[] = [];
+		for (const file of this._selectedFiles) {
+			const ctx = this.fileContext(file);
+			if (ctx == null) continue;
+
+			try {
+				const parsed = JSON.parse(ctx) as WebviewItemContext;
+				values.push({ webviewItem: parsed.webviewItem, webviewItemValue: parsed.webviewItemValue });
+			} catch {
+				continue;
+			}
+		}
+		if (values.length <= 1) return;
+
+		// Omit `webviewItem` (the singular row key) so single-file menus auto-hide on a multi-selection
+		// and only the `.multi` menus (gated on `webviewItems` + `listMultiSelection`) show — matching
+		// the graph's multi-selection context. `webviewItemValue` is kept as the right-clicked anchor.
+		const enriched = {
+			webview: single.webview,
+			webviewInstance: single.webviewInstance,
+			webviewItemValue: single.webviewItemValue,
+			listMultiSelection: true,
+			webviewItems: mergeWebviewItems(values.map(v => v.webviewItem)),
+			webviewItemsUnion: mergeWebviewItemsUnion(values.map(v => v.webviewItem)),
+			webviewItemsValues: values,
+		};
+		treeItem.setAttribute('data-vscode-context', serializeWebviewItemContext(enriched));
+		setTimeout(() => treeItem.setAttribute('data-vscode-context', raw), 100);
+	};
+
 	override willUpdate(changedProperties: Map<PropertyKey, unknown>): void {
 		// Rebuild cached tree model when tree-structure-relevant properties change.
 		// Note: fileActions, fileContext, and folderContext are excluded — they're
 		// callbacks/arrays consumed during model creation but don't affect tree structure.
 		// Including them causes unnecessary rebuilds (losing expansion state) because
-		// callers often pass new references on every render.
+		// callers often pass new references on every render. When what those callbacks
+		// *read* changes, bump `contextRevision` instead.
 		if (
 			changedProperties.has('files') ||
+			changedProperties.has('contextRevision') ||
 			changedProperties.has('filesLayout') ||
 			changedProperties.has('orderBy') ||
+			changedProperties.has('sortByStage') ||
+			changedProperties.has('mixedPaths') ||
 			changedProperties.has('showFileIcons') ||
 			changedProperties.has('grouping') ||
 			changedProperties.has('checkable') ||
@@ -282,6 +442,23 @@ export class GlFileTreePane extends LitElement {
 						}
 					}
 				}
+
+				// Reconcile the multi-selection against the new files: drop paths that are gone and
+				// re-point survivors to the new FileItem objects. The tree's own prune only re-emits
+				// when its id-set actually changes, so a model swap whose paths overlap would otherwise
+				// leave `_selectedFiles` holding the previous commit's file shapes (wrong diff refs).
+				if (this._selectedFiles.length) {
+					const byPath = new Map(files.map(f => [f.path, f]));
+					const reconciled = this._selectedFiles
+						.map(f => byPath.get(f.path))
+						.filter((f): f is FileItem => f != null);
+					if (
+						reconciled.length !== this._selectedFiles.length ||
+						reconciled.some((f, i) => f !== this._selectedFiles[i])
+					) {
+						this._selectedFiles = reconciled;
+					}
+				}
 			}
 
 			this._cachedTreeModel = buildGroupedTree({
@@ -295,9 +472,34 @@ export class GlFileTreePane extends LitElement {
 				fileToModel: (file, opts, flat) => this.fileToTreeModel(file, opts, flat),
 				folderToContextData: this.folderContext,
 				orderBy: this.orderBy,
+				sortByStage: this.sortByStage,
+				mixedPaths: this.mixedPaths,
 			});
+			this.applyCollapsedState(this._cachedTreeModel);
 		}
 	}
+
+	/** Re-applies remembered folder collapse state onto a freshly-built (default-expanded) model. */
+	private applyCollapsedState(nodes: TreeModel[]): void {
+		if (this._collapsedIds.size === 0) return;
+
+		for (const node of nodes) {
+			if (node.branch && this._collapsedIds.has(node.key ?? node.path)) {
+				node.expanded = false;
+			}
+			if (node.children != null) {
+				this.applyCollapsedState(node.children);
+			}
+		}
+	}
+
+	private onTreeExpansionChanged = (e: CustomEvent<{ path: string; key: string; expanded: boolean }>): void => {
+		if (e.detail.expanded) {
+			this._collapsedIds.delete(e.detail.key);
+		} else {
+			this._collapsedIds.add(e.detail.key);
+		}
+	};
 
 	override updated(): void {
 		if (this._pendingScrollRestore != null) {
@@ -347,47 +549,43 @@ export class GlFileTreePane extends LitElement {
 		const effectiveBadge = this.badge ?? (fileCount > 0 ? fileCount : undefined);
 		const showLayout = this.buttons?.includes('layout') ?? true;
 		const showSearch = this.buttons?.includes('search') ?? true;
-		const showMultiDiff = (this.buttons?.includes('multi-diff') ?? false) && fileCount > 0;
 		const showSearchBox = this.effectiveShowSearchBox;
 
 		return html`
 			<webview-pane exportparts="header, content" .collapsable=${this.collapsable} expanded flexible>
 				<span slot="title"
-					>${this.checkable
-						? this.renderCheckboxTitle(fileCount, effectiveBadge)
-						: this.renderTitle(effectiveBadge)}</span
+					>${
+						this.checkable
+							? this.renderCheckboxTitle(fileCount, effectiveBadge)
+							: this.renderTitle(effectiveBadge)
+					}</span
 				>
 				<slot name="subtitle" slot="subtitle"></slot>
 				<div class="header-actions" slot="actions">
 					<slot name="leading-actions" class="leading-actions"></slot>
 					<action-nav>
-						${showMultiDiff
-							? html`<gl-action-chip
-									data-action="multi-diff"
-									label=${this.multiDiffLabel ?? 'Open All Changes'}
-									alt-label=${this.multiDiffAltLabel ?? nothing}
-									icon="diff-multiple"
-									@click=${this.onOpenMultiDiff}
-								></gl-action-chip>`
-							: nothing}
-						${this.searchContext != null
-							? renderContextMatchVisibilityAction(
-									this._contextMatchVisibility,
-									this.searchContext.matchedFiles?.length ?? 0,
-									fileCount,
-									e => this.onCycleContextMatchVisibility(e),
-								)
-							: nothing}
+						${
+							this.searchContext != null
+								? renderContextMatchVisibilityAction(
+										this._contextMatchVisibility,
+										this.searchContext.matchedFiles?.length ?? 0,
+										fileCount,
+										e => this.onCycleContextMatchVisibility(e),
+									)
+								: nothing
+						}
 						${showLayout ? renderLayoutAction(this.fileLayout, e => this.onToggleFilesLayout(e)) : nothing}
-						${showSearch
-							? html`<gl-action-chip
-									data-action="search"
-									label="${showSearchBox ? 'Hide Search' : 'Show Search'}"
-									icon="search"
-									class="${showSearchBox ? 'active-toggle' : ''}"
-									@click=${this.onToggleSearch}
-								></gl-action-chip>`
-							: nothing}
+						${
+							showSearch
+								? html`<gl-action-chip
+										data-action="search"
+										label="${showSearchBox ? 'Hide Search' : 'Show Search'}"
+										icon="search"
+										class="${showSearchBox ? 'active-toggle' : ''}"
+										@click=${this.onToggleSearch}
+									></gl-action-chip>`
+								: nothing
+						}
 						<slot name="actions"></slot>
 					</action-nav>
 				</div>
@@ -399,11 +597,13 @@ export class GlFileTreePane extends LitElement {
 
 	private renderTitle(badge?: string | number): TemplateResult {
 		return html`<slot name="title-content"><span class="file-tree-pane__title">${this.header}</span></slot
-			>${badge != null
-				? html`<gl-badge appearance="filled"
-						><span class="checkbox-header__badge-text">${badge}</span></gl-badge
-					>`
-				: nothing}<slot name="header-badge"></slot>`;
+			>${
+				badge != null
+					? html`<gl-badge appearance="filled"
+							><span class="checkbox-header__badge-text">${badge}</span></gl-badge
+						>`
+					: nothing
+			}<slot name="header-badge"></slot>`;
 	}
 
 	private renderCheckboxTitle(_fileCount: number, badge?: string | number): TemplateResult {
@@ -525,9 +725,11 @@ export class GlFileTreePane extends LitElement {
 						>`;
 
 		return html`<span class="checkbox-header" @click=${(e: Event) => e.stopPropagation()}>
-			${tooltipText
-				? html`<gl-tooltip placement="bottom" content=${tooltipText}>${checkbox}</gl-tooltip>`
-				: checkbox}
+			${
+				tooltipText
+					? html`<gl-tooltip placement="bottom" content=${tooltipText}>${checkbox}</gl-tooltip>`
+					: checkbox
+			}
 			<span class="checkbox-header__label">${label}<slot name="header-badge"></slot></span>
 		</span>`;
 	}
@@ -535,7 +737,10 @@ export class GlFileTreePane extends LitElement {
 	private onToggleSearch(e: Event) {
 		e.preventDefault();
 		e.stopPropagation();
-		const next = !this.effectiveShowSearchBox;
+		this.setShowSearchBox(!this.effectiveShowSearchBox);
+	}
+
+	private setShowSearchBox(next: boolean): void {
 		// Mutate the fallback so uncontrolled consumers keep working; controlled consumers ignore
 		// this and update via the property on the next render.
 		this._showSearchBox = next;
@@ -548,29 +753,42 @@ export class GlFileTreePane extends LitElement {
 		);
 	}
 
-	private onTreeSearchBoxFilterChanged(e: CustomEvent<boolean>) {
-		// Suppress while context-match visibility is forcing highlight for the visual story —
-		// otherwise the user-controlled inner click would persist a value that gets immediately
-		// overridden on the next render. The visible mode is being dictated by the cycle, not the
-		// user. (Lit dispatched the event because the bound `?search-box-filter` flipped.)
-		if (this._contextMatchVisibility === 'mixed') return;
+	/** Opens the filter box (if collapsed) and moves focus into the tree/filter — the `mod+F`
+	 *  keymap binding's entry point. Awaits the render triggered by opening the box before
+	 *  focusing, since the filter input doesn't exist in the DOM until then. */
+	showAndFocusFilter(): void {
+		if (!this.effectiveShowSearchBox) {
+			this.setShowSearchBox(true);
+			// No render promise can be awaited here: a CONTROLLED consumer round-trips the change
+			// through its own state before `showSearchBox` comes back down, so `effectiveShowSearchBox`
+			// stays false past any local updateComplete. Retry across frames (bounded) until the
+			// tree-view has actually rendered the filter input, then focus lands in it.
+			let attempts = 0;
+			const tryFocus = (): void => {
+				const tree = this.renderRoot?.querySelector<GlTreeView>('gl-tree-view');
+				if (tree?.renderRoot?.querySelector('.filter-input') != null) {
+					tree.focus();
+					return;
+				}
 
+				if (++attempts < 10) {
+					requestAnimationFrame(tryFocus);
+				}
+			};
+			requestAnimationFrame(tryFocus);
+			return;
+		}
+
+		this.renderRoot?.querySelector<GlTreeView>('gl-tree-view')?.focus();
+	}
+
+	private onTreeSearchBoxFilterChanged(e: CustomEvent<boolean>) {
+		// The user owns the search-box filter/highlight mode independently of context-match
+		// visibility now (mixed dims via `dimUnmatched`, not by forcing this off), so always honor it.
 		this._searchBoxFilter = e.detail;
 		this.dispatchEvent(
 			new CustomEvent<boolean>('gl-search-box-filter-change', {
 				detail: e.detail,
-				bubbles: true,
-				composed: true,
-			}),
-		);
-	}
-
-	private onOpenMultiDiff(e: Event) {
-		e.preventDefault();
-		e.stopPropagation();
-		this.dispatchEvent(
-			new CustomEvent('gl-file-tree-pane-open-multi-diff', {
-				detail: { altKey: (e as MouseEvent).altKey === true },
 				bubbles: true,
 				composed: true,
 			}),
@@ -656,7 +874,10 @@ export class GlFileTreePane extends LitElement {
 			decorations.push({
 				type: 'agent' as const,
 				label: 'Editing',
-				tooltip: 'Claude Code is editing this file',
+				// Agent-agnostic on purpose: `agentTouchedFiles` carries the phase only, no provider
+				// identity, and a file can be touched by more than one agent at once — so there is no
+				// single agent to name here.
+				tooltip: 'An agent is editing this file',
 				phase: agentPhase,
 				position: 'before' as const,
 			});
@@ -665,15 +886,11 @@ export class GlFileTreePane extends LitElement {
 		return decorations;
 	}
 
-	private fileToTreeModel(
-		file: FileItem,
-		options?: Partial<TreeItemBase>,
-		flat = false,
-		glue = '/',
-	): TreeModel<FileItem[]> {
-		const pathIndex = file.path.lastIndexOf(glue);
-		const fileName = pathIndex !== -1 ? file.path.substring(pathIndex + 1) : file.path;
-		const filePath = flat && pathIndex !== -1 ? file.path.substring(0, pathIndex) : '';
+	private fileToTreeModel(file: FileItem, options?: Partial<TreeItemBase>, flat = false): TreeModel<FileItem[]> {
+		const path = trimTrailingSlash(file.path);
+		const pathIndex = path.lastIndexOf('/');
+		const fileName = pathIndex !== -1 ? path.substring(pathIndex + 1) : path;
+		const filePath = flat && pathIndex !== -1 ? path.substring(0, pathIndex) : '';
 
 		// Check if this file matches the search criteria (always set based on data, regardless of
 		// the current context-match-visibility cycle)
@@ -736,15 +953,22 @@ export class GlFileTreePane extends LitElement {
 			level: 1,
 			checkable: this.checkable,
 			checked: false,
+			// Conflicted files stage behind a confirm prompt the user can cancel — keep their checkbox
+			// model-controlled so a click doesn't optimistically check it before the stage lands.
+			controlledCheck: conflicted,
 			icon: icon,
 			label: fileName,
+			// `label` is only the basename, so make the full repo-relative path searchable (exact-substring)
+			// — otherwise a query with a folder separator (e.g. `src/webviews/foo.ts`) matches nothing.
+			filterText: file.path,
 			description: `${flat === true ? filePath : ''}${file.status === 'R' ? ` ← ${file.originalPath}` : ''}`,
 			tooltip: tooltip,
+			tooltipWrap: conflicted ? undefined : 'break-all',
 			priority: conflicted ? -1 : undefined,
 			context: [file],
 			actions: actions,
 			decorations: decorations.length > 0 ? decorations : undefined,
-			contextData: this.fileContext?.(file),
+			contextData: this.fileContext?.(file, options),
 			matched: isMatchedFile,
 			...options,
 			...checkableOverrides,
@@ -757,16 +981,19 @@ export class GlFileTreePane extends LitElement {
 		// empty-text.
 		const matchedEmpty = this._contextMatchVisibility === 'matched' && this.searchContext != null;
 		const emptyText = matchedEmpty ? 'No matching files' : this.emptyText;
-		// `mixed` context-match visibility shows all files with matches highlighted, so the
-		// search-box filter has to be `false` (highlight) for the visual story to hold even if the
-		// user preference is otherwise. Outside of `mixed`, use the user preference.
-		const treeSearchBoxFilter = this._contextMatchVisibility === 'mixed' ? false : this.effectiveSearchBoxFilter;
+		// `mixed` context-match visibility shows all files with matches highlighted (dim non-matches).
+		// Route that through `dimUnmatched` rather than forcing `searchBoxFilter` off — otherwise the
+		// funnel would hijack the user's search-box filter mode and flip its placeholder.
+		const dimUnmatched = this.searchContext != null && this._contextMatchVisibility === 'mixed';
 		return html`<gl-tree-view
 			.model=${treeModel}
 			.guides=${this.indentGuides}
 			.filtered=${this.searchContext != null && this._contextMatchVisibility !== 'off'}
-			.searchBoxFilter=${treeSearchBoxFilter}
+			.searchBoxFilter=${this.effectiveSearchBoxFilter}
+			.dimUnmatched=${dimUnmatched}
 			?filterable=${this.effectiveShowSearchBox}
+			?multi-selectable=${this.multiSelectable}
+			?draggable-files=${this.draggableFiles}
 			filter-placeholder="Filter files..."
 			search-placeholder="Search files..."
 			empty-text=${emptyText}
@@ -774,6 +1001,8 @@ export class GlFileTreePane extends LitElement {
 			@gl-tree-generated-item-action-clicked=${this.onTreeItemActionClicked}
 			@gl-tree-generated-item-checked=${this.onTreeItemChecked}
 			@gl-tree-generated-item-selected=${this.onTreeItemSelected}
+			@gl-tree-generated-selection-changed=${this.onSelectionChanged}
+			@gl-tree-expansion-changed=${this.onTreeExpansionChanged}
 		></gl-tree-view>`;
 	}
 
@@ -784,7 +1013,33 @@ export class GlFileTreePane extends LitElement {
 		// If context contains a file object, dispatch as a file event
 		if (context?.[0] && typeof context[0] === 'object' && 'path' in context[0]) {
 			const file = context[0] as FileItem;
-			this.dispatchFileEvent(e.detail.action.action, file, e.detail);
+			const action = e.detail.action;
+
+			// Inline-action fan-out (VS Code SCM): when the clicked row is part of a multi-selection,
+			// apply the action across the selection. `batch` actions (e.g. discard) get one event carrying
+			// the whole set so the consumer can act once; `fanOut` repeats the action per selected file;
+			// `single` opts out entirely (row-specific actions like conflict Open Current/Incoming that
+			// would open wrong/empty content for non-applicable rows) and acts only on the clicked row.
+			if (
+				this.multiSelectable &&
+				this._selectedFiles.length > 1 &&
+				action.multiBehavior !== 'single' &&
+				this._selectedFiles.some(f => f.path === file.path)
+			) {
+				if (action.multiBehavior === 'batch') {
+					this.dispatchFileEvent(action.action, file, e.detail, this._selectedFiles);
+				} else {
+					// Force non-preview (`dblClick: true`) so a multi-open lands every file in its own tab —
+					// a single preview tab would otherwise be replaced by each successive open, leaving only
+					// the last file. Non-open fan-out actions ignore showOptions, so this is harmless to them.
+					for (const selected of this._selectedFiles) {
+						this.dispatchFileEvent(action.action, selected, { dblClick: true, altKey: e.detail.altKey });
+					}
+				}
+				return;
+			}
+
+			this.dispatchFileEvent(action.action, file, e.detail);
 		} else {
 			// For non-file actions (e.g., group header actions), dispatch generically
 			this.dispatchEvent(
@@ -798,6 +1053,38 @@ export class GlFileTreePane extends LitElement {
 	}
 
 	private onTreeItemChecked(e: CustomEvent<TreeItemCheckedDetail>): void {
+		// Selection-aware checkboxes (VS Code SCM behavior): when the toggled row is part of a
+		// multi-selection, apply the SAME ACTION (check → on, uncheck → off) to every selected file
+		// by emitting a `file-checked` per selected file — but skip files already in the target state
+		// so the consumer doesn't fire redundant ops (e.g. re-`git add`-ing an already-staged file,
+		// which would silently capture new working-tree changes). A `mixed` (partially staged) file
+		// is NOT in either terminal state, so it always receives the action. A checkbox toggle on a
+		// row NOT in the selection (or with <2 selected) acts on that row alone. Consumers read only
+		// detail.context[0] (the file) + detail.checked, so a per-file detail with context:[file] is
+		// sufficient and keeps the wrappers/panels unchanged.
+		const toggledPath = (e.detail.context?.[0] as FileItem | undefined)?.path;
+		if (this.multiSelectable && this._selectedFiles.length > 1 && toggledPath != null) {
+			const inSelection = this._selectedFiles.some(f => f.path === toggledPath);
+			if (inSelection) {
+				const checked = e.detail.checked;
+				for (const file of this._selectedFiles) {
+					const state = this.checkableStates?.get(file.path)?.state ?? this.checkableStateDefault?.state;
+					// Skip files already fully in the requested terminal state (`checked` → already
+					// 'checked'; unchecked → already off/undefined). `mixed` falls through both ways.
+					if (checked ? state === 'checked' : state == null) continue;
+
+					this.dispatchEvent(
+						new CustomEvent('file-checked', {
+							detail: { node: e.detail.node, context: [file], checked: checked },
+							bubbles: true,
+							composed: true,
+						}),
+					);
+				}
+				return;
+			}
+		}
+
 		this.dispatchEvent(new CustomEvent('file-checked', { detail: e.detail, bubbles: true, composed: true }));
 	}
 
@@ -807,7 +1094,27 @@ export class GlFileTreePane extends LitElement {
 		this.dispatchFileEvent(this.selectionAction, e.detail.context[0], e.detail);
 	}
 
-	private dispatchFileEvent(name: string, file: FileItem, e?: { dblClick?: boolean; altKey?: boolean }): void {
+	private onSelectionChanged(e: CustomEvent<TreeSelectionChangedDetail>): void {
+		// Dedupe by path: a mixed (staged + unstaged) file can appear as two rows sharing one path, and
+		// the selected set must carry each file once — otherwise multi actions double-act (open a file
+		// twice, copy/stage its path twice, list it twice in webviewItemsValues).
+		const files = selectFilesByPath(this.files, new Set(e.detail.paths));
+		this._selectedFiles = files;
+		this.dispatchEvent(
+			new CustomEvent('file-selection-changed', {
+				detail: { files: files, paths: e.detail.paths },
+				bubbles: true,
+				composed: true,
+			}),
+		);
+	}
+
+	private dispatchFileEvent(
+		name: string,
+		file: FileItem,
+		e?: { dblClick?: boolean; altKey?: boolean },
+		files?: readonly FileItem[],
+	): void {
 		this.dispatchEvent(
 			new CustomEvent(name, {
 				detail: {
@@ -817,6 +1124,7 @@ export class GlFileTreePane extends LitElement {
 					originalPath: file.originalPath,
 					staged: file.staged,
 					altKey: e?.altKey,
+					files: files,
 					showOptions: e
 						? {
 								preview: !e.dblClick,

@@ -7,7 +7,17 @@ import type { Ref } from 'lit/directives/ref.js';
 import { createRef, ref } from 'lit/directives/ref.js';
 import { when } from 'lit/directives/when.js';
 import type { AgentSessionPhase } from '@gitlens/agents/types.js';
+import { agentPhaseToCategory, agentProviderIcon } from '../../agentUtils.js';
+import type { CollectionIndexController } from '../../controllers/collection-index.js';
+import { FilterController } from '../../controllers/filter.js';
+import type { FocusController } from '../../controllers/focus.js';
+import type { SelectionController } from '../../controllers/selection.js';
+import { VirtualCollectionController } from '../../controllers/virtual-collection.js';
+import type { VirtualScrollController } from '../../controllers/virtual-scroll.js';
+import { parseFilterTerms } from '../../utils/filter-match.js';
 import { GlElement } from '../element.js';
+import type { AutolinkIconStatus } from '../rich/utils.js';
+import { getAutolinkIcon } from '../rich/utils.js';
 import type { GlGitStatus } from '../status/git-status.js';
 import { scrollableBase } from '../styles/lit/base.css.js';
 import type {
@@ -17,9 +27,11 @@ import type {
 	TreeItemSelectionDetail,
 	TreeModel,
 	TreeModelFlat,
+	TreeSelectionChangedDetail,
 } from './base.js';
 import type { GlTreeItem } from './tree-item.js';
 import '@lit-labs/virtualizer';
+import '../agents/gl-agent-mark.js';
 import '../chips/action-chip.js';
 import '../branch-icon.js';
 import '../commit/wip-stats.js';
@@ -43,17 +55,23 @@ export class GlTreeView extends GlElement {
 			:host {
 				display: flex;
 				flex-direction: column;
-				height: 100%;
 				width: 100%;
+				height: 100%;
 				overflow: hidden;
+			}
+
+			/* Signals "the tree has focus" to descendant gl-tree-item rows (inherits across the shadow
+	   boundary). Drives the active-vs-inactive selection background on every selected row —
+	   reliable for click-focus, which doesn't surface as a focusin on this host. */
+			:host(:focus-within) {
+				--gl-tree-focus-within: 1;
 			}
 
 			.scrollable {
 				flex: 1;
 				width: 100%;
 				min-height: 0;
-				overflow-y: auto;
-				overflow-x: visible; /* Allow horizontal overflow for tooltips */
+				overflow: visible auto; /* Allow horizontal overflow for tooltips */
 				outline: none;
 			}
 
@@ -65,32 +83,37 @@ export class GlTreeView extends GlElement {
 				display: block;
 				width: 100%;
 				height: 100%;
+
+				/* lit-virtualizer sets an inline min-height based on its initial item-size
+		   estimate, which can exceed the scrollable container in small viewports and
+		   push scrolling onto the outer .scrollable div instead of the virtualizer's
+		   own scroller. Since height: 100% already provides correct sizing from the
+		   flex layout, the min-height is always redundant. */
+				min-height: 0 !important;
+
 				/* Use layout containment instead of strict to avoid rendering issues */
+
 				/* Removed paint containment to allow tooltips to escape */
 				contain: layout;
-				/* lit-virtualizer sets an inline min-height based on its initial item-size
-				   estimate, which can exceed the scrollable container in small viewports and
-				   push scrolling onto the outer .scrollable div instead of the virtualizer's
-				   own scroller. Since height: 100% already provides correct sizing from the
-				   flex layout, the min-height is always redundant. */
-				min-height: 0 !important;
 			}
 
 			gl-tree-item {
 				width: 100%;
 			}
 
-			/* Dim non-matched items when highlighting (search-box-filter absent = highlight mode) */
-			:host([filtered]:not([search-box-filter])) gl-tree-item:not([matched]) {
+			/* Dim non-matched items when highlighting: either the search box is in highlight mode
+	   (search-box-filter absent) or an external source forces dim (dim-unmatched). */
+			:host([filtered]:not([search-box-filter])) gl-tree-item:not([matched]),
+			:host([filtered][dim-unmatched]) gl-tree-item:not([matched]) {
 				opacity: 0.6;
 			}
 
 			.filter {
 				display: flex;
-				align-items: center;
-				gap: 0.4rem;
-				padding: 0.4rem 0.6rem;
 				flex: none;
+				gap: var(--gl-space-4);
+				align-items: center;
+				padding: var(--gl-space-4) var(--gl-space-6);
 			}
 
 			.filter-field {
@@ -100,21 +123,21 @@ export class GlTreeView extends GlElement {
 			}
 
 			.filter-input {
+				box-sizing: border-box;
 				width: 100%;
 				height: 2.4rem;
-				box-sizing: border-box;
-				padding: 0 2rem 0 0.6rem;
+				padding: 0 var(--gl-space-20) 0 var(--gl-space-6);
 				font-family: var(--vscode-font-family);
 				font-size: var(--vscode-font-size);
 				color: var(--vscode-input-foreground);
-				background-color: var(--vscode-input-background);
-				border: 1px solid var(--vscode-input-border, transparent);
-				border-radius: var(--gl-input-border-radius);
 				outline: none;
+				background-color: var(--vscode-input-background);
+				border: var(--gl-border-width) solid var(--vscode-input-border, transparent);
+				border-radius: var(--gl-input-border-radius);
 			}
 
 			.filter-input:focus {
-				outline: 1px solid var(--vscode-focusBorder);
+				outline: var(--gl-border-width) solid var(--vscode-focusBorder);
 				outline-offset: -1px;
 			}
 
@@ -123,10 +146,10 @@ export class GlTreeView extends GlElement {
 			}
 
 			.filter-input::-webkit-search-cancel-button {
-				-webkit-appearance: none;
-				cursor: pointer;
 				width: 16px;
 				height: 16px;
+				-webkit-appearance: none;
+				cursor: pointer;
 				background-color: var(--vscode-foreground);
 				-webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 8.707l3.646 3.647.708-.707L8.707 8l3.647-3.646-.707-.708L8 7.293 4.354 3.646l-.707.708L7.293 8l-3.646 3.646.707.708L8 8.707z'/%3E%3C/svg%3E");
 				-webkit-mask-size: contain;
@@ -138,9 +161,9 @@ export class GlTreeView extends GlElement {
 				right: 0;
 				bottom: 1px;
 				display: inline-flex;
-				align-items: center;
 				gap: 0.1rem;
-				padding-right: 0.2rem;
+				align-items: center;
+				padding-right: var(--gl-space-2);
 			}
 
 			.filter-controls gl-button {
@@ -149,17 +172,17 @@ export class GlTreeView extends GlElement {
 			}
 
 			mark {
-				background-color: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 92, 0, 0.33));
 				color: inherit;
+				background-color: var(--vscode-editor-findMatchHighlightBackground, rgb(234 92 0 / 33%));
 				border-radius: 1px;
 			}
 
 			/* Shared by both the no-data case (emptyText) and the filter-yields-no-matches
-			   case ("No results found"); class name dates from the latter. */
+	   case ("No results found"); class name dates from the latter. */
 			.no-results {
-				padding: 1rem;
-				color: var(--vscode-descriptionForeground);
+				padding: var(--gl-space-10);
 				font-style: italic;
+				color: var(--vscode-descriptionForeground);
 				text-align: center;
 			}
 
@@ -167,51 +190,143 @@ export class GlTreeView extends GlElement {
 				pointer-events: none;
 				--max-width: min(40rem, 90vw);
 			}
+
 			.hover-popover::part(body) {
 				box-sizing: border-box;
 			}
 
 			.hover-content {
-				font-size: 1.2rem;
+				font-size: var(--gl-font-md);
 				line-height: 1.5;
-				/* anywhere wraps at any character when forced — avoids the default behavior of
-				   breaking paths at hyphens (the worst possible split point). */
 				overflow-wrap: anywhere;
+			}
+
+			.hover-content--break-all {
+				word-break: break-all;
+			}
+
+			/* Sizes codicons to the text for markdown tooltips only, where an icon appears mid-sentence
+			   and 16px towers over the words. Scoped to gl-markdown rather than the wrapper on purpose:
+			   component tooltips render in the same wrapper and own their icon sizing (gl-agent-tooltip
+			   builds a layout around full-size icons), and a custom property on the wrapper would
+			   silently shrink theirs too. */
+			.hover-content gl-markdown {
+				--code-icon-size: 1.3rem;
 			}
 
 			.conflict-count {
 				display: inline-flex;
-				align-items: center;
 				gap: 0.3rem;
-				padding: 0 0.6rem;
+				align-items: center;
 				height: 1.8rem;
-				border-radius: 0.9rem;
-				font-size: 1.1rem;
+				padding: 0 var(--gl-space-6);
+				font-size: var(--gl-font-sm);
 				font-weight: 500;
-				border: 1px solid;
+				border: var(--gl-border-width) solid;
+				border-radius: 0.9rem;
+			}
+
+			/* Set in a wash of the row's own foreground rather than a fixed tint: the badge marks
+	   membership, not urgency, so it should read as a shape without competing with the state
+	   glyph or the attention indicator. Tabular figures so 2/3 and 2/10 align down a column. */
+			.stack-count {
+				display: inline-flex;
+				gap: 0.3rem;
+				align-items: center;
+				height: 1.5rem;
+				padding: 0 var(--gl-space-4);
+				font-size: var(--gl-font-sm);
+				font-variant-numeric: tabular-nums;
+				border-radius: 0.8rem;
+				background: color-mix(in srgb, transparent 88%, var(--color-foreground));
+			}
+
+			/* Pull-request state, in GitLens's contributed theme colors so a retheme carries. Draft has
+	   no color of its own — it borrows the description foreground, which is what marks it as the
+	   not-yet-real one of the four. */
+			code-icon.tree-icon--pr-opened {
+				color: var(--vscode-gitlens-openPullRequestIconColor);
+			}
+
+			code-icon.tree-icon--pr-merged {
+				color: var(--vscode-gitlens-mergedPullRequestIconColor);
+			}
+
+			code-icon.tree-icon--pr-closed {
+				color: var(--vscode-gitlens-closedPullRequestIconColor);
+			}
+
+			code-icon.tree-icon--pr-draft {
+				color: var(--vscode-descriptionForeground);
 			}
 
 			/* Phase-tinted agent icon — pulls from the shared --gl-agent-* palette defined in
-			   theme.scss so leaf, tooltip, pill, and details panel all dereference the same set
-			   of variables. code-icon's :host inherits color from its parent, so styling the
-			   element here flows through to its rendered glyph. */
-			code-icon.tree-icon-agent {
+	   theme.scss so leaf, tooltip, pill, and details panel all dereference the same set
+	   of variables. Unqualified (not scoped to code-icon) so the same rules also tint the
+	   gl-agent-mark corner badge below — both the identity glyph and its phase mark carry
+	   these classes and must always agree on color. code-icon's :host inherits color from its
+	   parent, so styling the element here flows through to its rendered glyph; gl-agent-mark
+	   draws entirely in currentColor, so it picks the color up the same way. */
+			.tree-icon-agent {
 				color: var(--gl-agent-idle-color);
 			}
-			code-icon.tree-icon-agent--working {
+
+			.tree-icon-agent--working {
 				color: var(--gl-agent-working-color);
 			}
-			code-icon.tree-icon-agent--waiting {
+
+			.tree-icon-agent--waiting {
 				color: var(--gl-agent-waiting-color);
 			}
 
-			/* Pair wrapper for the robot + spinner glyphs so they sit flush as one identity
-			   marker. The decoration slot's gap applies between the wrapper and any sibling
-			   decoration but not between the icons inside. */
-			.tree-icon-agent-pair {
+			.tree-icon-agent--ended {
+				color: var(--gl-agent-ended-color);
+			}
+
+			/* Positioning context for the robot + its overlaid phase mark, which together read as
+	   one identity marker. The decoration slot's gap applies between this wrapper and any
+	   sibling decoration, never inside it. */
+			/* The leaf's logomark gets the graph's icon size, not the tree's 1.3rem default: at 1.3rem
+	   the badge covers more than half of a thin radial mark. Scoped to this anchor so file-tree
+	   decorations keep the tree's own sizing. */
+			.tree-icon-agent-anchor {
+				position: relative;
 				display: inline-flex;
 				align-items: center;
-				gap: 0;
+			}
+
+			/* Opaque chip behind the mark, in the row's own colour, so the identity glyph is
+	   OCCLUDED rather than cut. A cutout has to survive whatever glyph it lands on, and a thin
+	   radiating mark like Claude's comes apart when you punch a hole through it. The chip needs
+	   the row's background, which tree-item publishes as --gl-tree-row-bg for each of its states
+	   (rest / hover / selected); custom properties inherit through the flattened tree, so slotted
+	   content picks up the right one without tracking state itself.
+
+	   Sized to circumscribe the mark's RING, in em so it tracks the glyph — the triangle runs
+	   wider than the circle and the square's corners reach furthest, so both take the larger disc.
+	   Painted between the glyph and the mark, hence the z-index ladder. */
+			/* The leaf mirrors the graph's WIP-row indicator exactly — same glyph size, same badge
+	   basis, same offsets — so one composition is learned once. The mark draws its own opaque
+	   backing in its own silhouette; all this supplies is the colour to cut with, which
+	   tree-item publishes per row state as --gl-tree-row-bg. */
+			.tree-icon-agent-anchor--leaf {
+				--code-icon-size: 1.6rem;
+			}
+
+			.tree-icon-agent-anchor gl-agent-mark.tree-icon-agent {
+				/* Composited, not a bare var: the hover and selection colours tree-item publishes are
+		   semi-transparent, so painting one directly leaves a see-through chip that occludes
+		   nothing — the cut vanishes exactly when a row is hovered or selected. Layering the row
+		   colour over the panel's opaque background reproduces the row's effective surface. */
+				--gl-agent-mark-chip:
+					linear-gradient(var(--gl-tree-row-bg, transparent), var(--gl-tree-row-bg, transparent)),
+					var(--color-view-background, var(--vscode-sideBar-background));
+
+				position: absolute;
+				font-size: 1.2rem;
+				right: 0.05em;
+				bottom: 0.05em;
+				z-index: 2;
 			}
 		`,
 	];
@@ -247,30 +362,70 @@ export class GlTreeView extends GlElement {
 	@property({ type: Boolean, attribute: 'search-box-filter', reflect: true })
 	searchBoxFilter = true;
 
+	/**
+	 * Dim (rather than hide) non-matched rows while `filtered`, independent of {@link searchBoxFilter}.
+	 * Lets an external match source (e.g. the file pane's search-context "highlight matches" mode) force
+	 * the dim presentation WITHOUT hijacking the user's search-box filter/highlight mode — so toggling it
+	 * never changes the search box placeholder or its filter toggle.
+	 */
+	@property({ type: Boolean, attribute: 'dim-unmatched', reflect: true })
+	dimUnmatched = false;
+
 	@property({ type: String, attribute: 'empty-text' })
 	emptyText = 'No items';
+
+	/**
+	 * Set by consumers that slot their own `empty` content — a loading skeleton, an error with a retry.
+	 * Keeps the tree's chrome (filter bar, aria wiring, filter text) on screen around that content even
+	 * when {@link emptyText} is blank, so a panel's filter box doesn't come and go with its data.
+	 */
+	@property({ type: Boolean, attribute: 'has-empty-content' })
+	hasEmptyContent = false;
 
 	@property({ type: Boolean, attribute: 'tooltip-anchor-right' })
 	tooltipAnchorRight = false;
 
-	private _filterText = '';
 	@property({ type: String, attribute: 'filter-text' })
 	get filterText(): string {
-		return this._filterText;
+		return this._filter.query;
 	}
 	set filterText(value: string) {
-		const old = this._filterText;
+		const old = this._filter.query;
 		if (old === value) return;
 
-		this._filterText = value;
-		clearTimeout(this._filterDebounceTimer);
-		this.applyFilterToModel();
+		// Programmatic set applies synchronously (matches the prior setter); requestUpdate keeps the
+		// reflected `filter-text` property in sync for consumers binding it.
+		this._filter.setQuery(value);
 		this.requestUpdate('filterText', old);
 	}
 
-	private _filterLower = '';
-	private _filterTerms: string[] = [];
-	private _filterDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+	/**
+	 * Optional query → terms mapping, for hosts whose rows carry an identity the visible text doesn't
+	 * spell out (e.g. a pull request addressed by a pasted URL). The query itself is untouched, so the
+	 * input keeps showing what was typed.
+	 */
+	@property({ attribute: false })
+	filterTermsParser?: (query: string) => string[];
+
+	/** Owns the filter query/terms/debounce. The recursive tree match stays host-side via applyMatch. */
+	private readonly _filter = new FilterController(this, {
+		debounceMs: 150,
+		parseTerms: (query: string) => (this.filterTermsParser ?? parseFilterTerms)(query),
+		applyMatch: (terms: readonly string[]) => {
+			if (terms.length === 0) {
+				this.filtered = false;
+				if (this._model != null) {
+					clearMatched(this._model);
+				}
+			} else {
+				this.filtered = true;
+				if (this._model != null) {
+					applyFilter(this._model, [...terms]);
+				}
+			}
+		},
+		onApplied: () => this.rebuildFlattenedTree(),
+	});
 
 	@property({ type: String, attribute: 'aria-label' })
 	override ariaLabel = 'Tree';
@@ -279,29 +434,102 @@ export class GlTreeView extends GlElement {
 	@property({ type: String, attribute: 'focused-path' })
 	focusedPath?: string;
 
-	private _lastSelectedPath?: string;
-	private _focusedItemPath?: string;
-	private _focusedItemIndex: number = -1;
-	private virtualizerRef: Ref<any> = createRef();
+	// Single-select highlight is owned by `_selection` (via its anchor). The setter only mutates in
+	// single mode, so multi-mode focus moves never collapse the set (multi reads `_selection.has`,
+	// not this accessor) — keeping multi-mode behavior identical to before this delegation.
+	private get _lastSelectedPath(): string | undefined {
+		return this._selection.anchorId;
+	}
+	private set _lastSelectedPath(value: string | undefined) {
+		if (this.multiSelectable) return;
+
+		if (value == null) {
+			this._selection.clear();
+		} else {
+			this._selection.setSingle(value);
+		}
+	}
+
+	// The focused-row cursor is owned by `_focus` (FocusController). These accessors delegate to it
+	// so the cursor has a single source of truth; the movement methods still drive scroll/notify
+	// explicitly (incremental migration — see `_focus` field).
+	private get _focusedItemPath(): string | undefined {
+		return this._focus.focusedId;
+	}
+	private set _focusedItemPath(value: string | undefined) {
+		this._focus.setFocusedId(value);
+	}
+	private get _focusedItemIndex(): number {
+		return this._focus.focusedIndex;
+	}
+	private set _focusedItemIndex(value: number) {
+		this._focus.setFocusedIndex(value);
+	}
+
+	// Structurally typed (lit-virtualizer ships no element type): just the members this component +
+	// VirtualScrollController touch. Avoids `Ref<any>` (no-unsafe-return on the controller wiring).
+	private virtualizerRef: Ref<
+		HTMLElement & { scrollToIndex?: (index: number, position?: string) => unknown; layoutComplete?: Promise<void> }
+	> = createRef();
 	private scrollableRef: Ref<HTMLElement> = createRef();
-
-	@state()
-	private _containerHasFocus = false;
-
-	@state()
-	private _filterHasFocus = false;
 
 	@state()
 	private _actionButtonHasFocus = false;
 
-	private _scrolling = false;
+	// The L1 virtualized-collection facade: instantiates + sequences index/scroll/selection/focus
+	// (and keyboard). The sub-controllers stay reachable via the delegating getters below so the
+	// host can drive them for tree-specific concerns (Left/Right expand, type-ahead) via the seam.
+	private readonly _collection = new VirtualCollectionController<TreeModelFlat>(this, {
+		getItems: () => this.treeItems,
+		getItemId: item => nodeId(item),
+		isSelectable: item => item.branch === false,
+		mode: () => (this.multiSelectable ? 'multi' : 'single'),
+		focusStrategy: 'activedescendant',
+		getVirtualizer: () => this.virtualizerRef.value,
+		getContainer: () => this.scrollableRef.value,
+		onSelectionChange: () => {
+			this.requestUpdate();
+			// The selection-changed event is multi-select-specific; single mode keeps its prior
+			// (event-free) selection-follows-focus semantics.
+			if (this.multiSelectable) {
+				this.emitSelectionChanged();
+			}
+		},
+		// Enter / single-mode Space activate the focused row (open / expand).
+		onActivate: id => {
+			const item = this._index.itemFor(id);
+			if (item != null) {
+				this.handleItemActivation(item);
+			}
+		},
+		// The seam: keys the shared controller doesn't consume (ArrowLeft/Right expand-collapse,
+		// printable type-ahead) are handled here, in tree terms.
+		onUnhandledKey: e => this.handleTreeKey(e),
+	});
+
+	private get _index(): CollectionIndexController<TreeModelFlat> {
+		return this._collection.index;
+	}
+	private get _scroll(): VirtualScrollController {
+		return this._collection.scroll;
+	}
+	private get _selection(): SelectionController {
+		return this._collection.selection;
+	}
+	private get _focus(): FocusController {
+		return this._collection.focus;
+	}
 
 	// Hover tooltip state
 	private _hoverTimer?: ReturnType<typeof setTimeout>;
 	private _unhoverTimer?: ReturnType<typeof setTimeout>;
+	private _dismissedHoverBounds?: DOMRect;
 
 	@state()
 	private _hoveredTooltip?: string | TemplateResult;
+
+	@state()
+	private _hoveredTooltipWrap?: 'break-all';
 
 	@state()
 	private _hoveredAnchor?: HTMLElement | { getBoundingClientRect: () => Omit<DOMRect, 'toJSON'> };
@@ -316,7 +544,18 @@ export class GlTreeView extends GlElement {
 
 	// Performance optimization: Maps for O(1) lookups
 	private _nodeMap = new Map<string, TreeModel>(); // path -> TreeModel
-	private _pathToIndexMap = new Map<string, number>(); // path -> index in treeItems
+	/**
+	 * Opt-in native multi-select. Default OFF — when off, the single-select path drives selection
+	 * through `_selection` via the `_lastSelectedPath` getter/setter (a single selected id at a time),
+	 * preserving the prior single-select behavior. When on, Ctrl/Cmd+click toggles, Shift+click selects
+	 * a range, and plain click selects one (and still fires the open event). Folders are never members.
+	 */
+	@property({ type: Boolean, attribute: 'multi-selectable' })
+	multiSelectable = false;
+
+	/** Opt-in: makes file (non-branch) rows draggable, forwarded to each `gl-tree-item`. */
+	@property({ type: Boolean, attribute: 'draggable-files' })
+	draggableFiles = false;
 
 	override connectedCallback(): void {
 		super.connectedCallback?.();
@@ -326,10 +565,6 @@ export class GlTreeView extends GlElement {
 		this.addEventListener('focusin', this.handleFocusIn, { capture: true });
 		this.addEventListener('focusout', this.handleFocusOut, { capture: true });
 		this.addEventListener('mousedown', this.dismissRowTooltip, { capture: true });
-
-		// Listen for contextmenu events from tree items and re-dispatch them
-		// so they can cross the shadow DOM boundary with the context data
-		this.addEventListener('contextmenu', this.handleContextMenu);
 	}
 
 	override focus(options?: FocusOptions): void {
@@ -353,14 +588,12 @@ export class GlTreeView extends GlElement {
 		this.removeEventListener('focusin', this.handleFocusIn, { capture: true });
 		this.removeEventListener('focusout', this.handleFocusOut, { capture: true });
 		this.removeEventListener('mousedown', this.dismissRowTooltip, { capture: true });
-		this.removeEventListener('contextmenu', this.handleContextMenu);
 
 		// Clean up timers and reset state
 		if (this._typeAheadTimer) {
 			clearTimeout(this._typeAheadTimer);
 			this._typeAheadTimer = undefined;
 		}
-		clearTimeout(this._filterDebounceTimer);
 		this._typeAheadBuffer = '';
 	}
 
@@ -372,8 +605,8 @@ export class GlTreeView extends GlElement {
 		this._model = value;
 
 		// Apply active filter to the new model so matched flags are set before flattening
-		if (this._filterTerms.length > 0 && this._model != null) {
-			applyFilter(this._model, this._filterTerms);
+		if (this._filter.terms.length > 0 && this._model != null) {
+			applyFilter(this._model, [...this._filter.terms]);
 		}
 
 		// Clear stale node map before processing new model
@@ -384,7 +617,7 @@ export class GlTreeView extends GlElement {
 		let treeItems: TreeModelFlat[] | undefined;
 		if (this._model != null) {
 			const size = this._model.length;
-			const hideNonMatched = this.filtered && this.searchBoxFilter;
+			const hideNonMatched = this.filtered && this.searchBoxFilter && !this.dimUnmatched;
 			treeItems = [];
 			for (let i = 0; i < size; i++) {
 				flattenTree(this._model[i], size, i + 1, undefined, this._nodeMap, hideNonMatched, treeItems);
@@ -404,27 +637,27 @@ export class GlTreeView extends GlElement {
 
 		// Reconcile focus with new model
 		if (this._focusedItemPath) {
-			const newIndex = this._pathToIndexMap.get(this._focusedItemPath);
-			if (newIndex != null) {
+			const newIndex = this._index.indexOf(this._focusedItemPath);
+			if (newIndex !== -1) {
 				// Path still exists — update cached index
 				this._focusedItemIndex = newIndex;
 			} else {
 				// Path gone — fall back to nearest positional neighbor
 				if (this.treeItems?.length) {
 					const clamped = Math.min(this._focusedItemIndex, this.treeItems.length - 1);
-					this._focusedItemPath = this.treeItems[Math.max(0, clamped)].path;
+					this._focusedItemPath = nodeId(this.treeItems[Math.max(0, clamped)]);
 					this._focusedItemIndex = Math.max(0, clamped);
 				} else {
 					this._focusedItemPath = undefined;
 					this._focusedItemIndex = -1;
 				}
 				// Sync selection if it also pointed to the removed item
-				if (this._lastSelectedPath && !this._pathToIndexMap.has(this._lastSelectedPath)) {
+				if (this._lastSelectedPath && !this._index.has(this._lastSelectedPath)) {
 					this._lastSelectedPath = this._focusedItemPath;
 				}
 			}
 		} else if (this.treeItems?.length) {
-			this._focusedItemPath = this.treeItems[0].path;
+			this._focusedItemPath = nodeId(this.treeItems[0]);
 			this._focusedItemIndex = 0;
 		}
 	}
@@ -441,7 +674,12 @@ export class GlTreeView extends GlElement {
 		// `filtered` was still true, so non-matched items stayed hidden in the flattened list. By
 		// the time willUpdate runs all bindings are committed, so re-flatten here whenever either
 		// changed — cheap and correct regardless of how the consumer ordered its bindings.
-		if ((changedProperties.has('filtered') || changedProperties.has('searchBoxFilter')) && this._model != null) {
+		if (
+			(changedProperties.has('filtered') ||
+				changedProperties.has('searchBoxFilter') ||
+				changedProperties.has('dimUnmatched')) &&
+			this._model != null
+		) {
 			this.rebuildFlattenedTree();
 		}
 
@@ -449,8 +687,8 @@ export class GlTreeView extends GlElement {
 		// setter, because Lit sets bindings in template order — the model setter may run before
 		// the focused-path attribute is updated, leaving focusedPath stale.
 		if (this.focusedPath && (changedProperties.has('focusedPath') || changedProperties.has('model'))) {
-			const index = this._pathToIndexMap.get(this.focusedPath);
-			if (index != null) {
+			const index = this._index.indexOf(this.focusedPath);
+			if (index !== -1) {
 				this._focusedItemPath = this.focusedPath;
 				this._focusedItemIndex = index;
 				this._lastSelectedPath = this.focusedPath;
@@ -464,6 +702,8 @@ export class GlTreeView extends GlElement {
 		// empty. Do NOT wipe state or force scroll-to-top here — that breaks consumers like
 		// gl-file-tree-pane whose own scrollTop save/restore relies on the position staying
 		// stable across refreshes of the same data (e.g. a WIP working-tree change).
+		// The multi-select range anchor is seeded from the focused row by the VirtualCollectionController
+		// facade (`hostUpdated`), so a first Shift+click/Shift+Arrow has a pivot — see that controller.
 	}
 
 	override updated(changedProperties: Map<PropertyKey, unknown>): void {
@@ -507,7 +747,8 @@ export class GlTreeView extends GlElement {
 			| { type: 'status'; name: GlGitStatus['status'] }
 			| { type: 'branch'; status?: string; worktree?: boolean; hasChanges?: boolean }
 			| { type: 'file-icon'; filename: string }
-			| { type: 'agent'; phase: AgentSessionPhase },
+			| { type: 'agent'; phase: AgentSessionPhase; provider?: string }
+			| { type: 'pull-request'; state?: string; draft?: boolean },
 	) {
 		if (icon == null) return nothing;
 
@@ -533,19 +774,34 @@ export class GlTreeView extends GlElement {
 		}
 
 		if (icon.type === 'agent') {
-			// Phase-driven glyph AND color so the leaf telegraphs state at a glance — color alone
-			// is a single-axis signal and fails for color-blind scanning. Idle keeps the Claude
-			// brand asterisk (default state retains provider identity); working spins a `sync`
-			// glyph as an activity cue; waiting flips to `warning` as a call-to-action. Colors
-			// come from the shared --gl-agent-* palette via this component's static styles.
-			const phaseIcon = icon.phase === 'working' ? 'sync' : icon.phase === 'waiting' ? 'warning' : 'claude';
-			const modifier = icon.phase === 'working' ? 'spin' : undefined;
-			return html`<code-icon
-				slot="icon"
-				icon="${phaseIcon}"
-				modifier=${ifDefined(modifier)}
-				class="tree-icon-agent tree-icon-agent--${icon.phase}"
-			></code-icon>`;
+			// Provider glyph with the phase mark OVERLAID on its corner, same composition as the
+			// graph's WIP-row indicator and the file decoration below. The glyph is rendered at the
+			// larger icon size here so the badge reads as a badge rather than swallowing it — a
+			// logomark is thinner than the robot and needs the extra room to survive an overlay.
+			return html`<span class="tree-icon-agent-anchor tree-icon-agent-anchor--leaf" slot="icon">
+				<code-icon
+					icon=${agentProviderIcon(icon.provider)}
+					class="tree-icon-agent tree-icon-agent--${icon.phase}"
+				></code-icon>
+				<gl-agent-mark
+					class="tree-icon-agent tree-icon-agent--${icon.phase}"
+					category=${agentPhaseToCategory[icon.phase]}
+					variant="badge"
+					aria-hidden="true"
+				></gl-agent-mark>
+			</span>`;
+		}
+
+		if (icon.type === 'pull-request') {
+			// Glyph + tone from the shared resolver, so this row can't drift from the pull-request icons the
+			// rich components and the graph's ref pills draw. Rendered as a bare `code-icon` rather than
+			// through `pr-icon`, which wraps itself in a `gl-tooltip` that would nest inside the row's own.
+			const { icon: glyph, modifier } = getAutolinkIcon(
+				'pr',
+				(icon.state?.toLowerCase() as AutolinkIconStatus) ?? 'opened',
+				icon.draft,
+			);
+			return html`<code-icon slot="icon" icon=${glyph} class="tree-icon-pr tree-icon--${modifier}"></code-icon>`;
 		}
 
 		return nothing;
@@ -581,6 +837,13 @@ export class GlTreeView extends GlElement {
 				return html`<code-icon
 					slot=${slot}
 					part=${slot}
+					class=${
+						decoration.kind
+							? `decoration-icon--${decoration.kind}`
+							: decoration.muted
+								? 'decoration-icon--muted'
+								: nothing
+					}
 					aria-label="${decoration.label}"
 					.icon=${decoration.icon}
 				></code-icon>`;
@@ -610,8 +873,9 @@ export class GlTreeView extends GlElement {
 			}
 
 			if (decoration.type === 'wip') {
-				// `no-tooltip` so the indicator doesn't double-tooltip with the row tooltip — the
-				// row's own tooltip carries the breakdown pill (see sidebar-panel toWorktreeLeaf).
+				// `badge` renders a pencil/check from `dirty` alone, so no counts are passed. `no-tooltip` so
+				// the indicator doesn't double-tooltip with the row tooltip, which carries the breakdown
+				// (see sidebar-panel toWorktreeLeaf).
 				return html`<gl-wip-stats
 					slot=${slot}
 					part=${slot}
@@ -619,9 +883,6 @@ export class GlTreeView extends GlElement {
 					show-clean
 					no-tooltip
 					.dirty=${decoration.hasChanges}
-					added=${decoration.added ?? nothing}
-					modified=${decoration.changed ?? nothing}
-					removed=${decoration.deleted ?? nothing}
 				></gl-wip-stats>`;
 			}
 
@@ -637,32 +898,41 @@ export class GlTreeView extends GlElement {
 			}
 
 			if (decoration.type === 'agent') {
-				// Robot glyph is the agent's identity (never animates); the spinner is a separate
-				// adjacent glyph that only renders during `working`. Color comes from the shared
-				// --gl-agent-* palette via the `tree-icon-agent--${phase}` class on each
-				// `code-icon` so the CSS rules at the top of this file match the rendered markup.
-				// Both icons live inside a flex wrapper so the decoration slot's `gap: 0.4rem`
-				// only applies between the wrapper and any other decoration — not between the
-				// robot and the spinner, which should sit flush as one identity glyph.
+				// One identity glyph: the robot (never animates) carries identity + phase color, with
+				// the ONE agent-phase mark (`<gl-agent-mark>`) overlaid as a corner badge — the same
+				// mark the graph's WIP row indicator and the details panel's cards use, so every
+				// surface agrees on shape/tempo per phase, not just color. The mark must be its own
+				// element rather than a ::after on the robot: code-icon's `modifier="spin"` rotates
+				// the whole host, which would spin the robot along with it. Color comes from the
+				// shared --gl-agent-* palette via `tree-icon-agent--${phase}` on both elements.
 				const tooltip = decoration.tooltip ?? decoration.label;
+				const category = agentPhaseToCategory[decoration.phase];
 				return html`<gl-tooltip slot=${slot} part=${slot} placement="top">
-					<span class="tree-icon-agent-pair">
+					<span class="tree-icon-agent-anchor">
 						<code-icon
 							icon="robot"
 							class="tree-icon-agent tree-icon-agent--${decoration.phase}"
 							aria-label=${ifDefined(tooltip)}
 						></code-icon>
-						${decoration.phase === 'working'
-							? html`<code-icon
-									icon="sync"
-									modifier="spin"
-									class="tree-icon-agent tree-icon-agent--${decoration.phase}"
-									aria-hidden="true"
-								></code-icon>`
-							: nothing}
+						<gl-agent-mark
+							class="tree-icon-agent tree-icon-agent--${decoration.phase}"
+							category=${category}
+							variant="badge"
+							aria-hidden="true"
+						></gl-agent-mark>
 					</span>
 					<span slot="content">${tooltip}</span>
 				</gl-tooltip>`;
+			}
+
+			if (decoration.type === 'stack') {
+				return html`<span
+					slot=${slot}
+					part=${slot}
+					class="stack-count"
+					aria-label=${ifDefined(decoration.tooltip ?? decoration.label)}
+					><code-icon icon="layers" size="12"></code-icon>${decoration.layer}/${decoration.size}</span
+				>`;
 			}
 
 			// TODO: implement badge and indicator decorations
@@ -671,14 +941,13 @@ export class GlTreeView extends GlElement {
 		});
 	}
 
-	private highlightText(text: string): unknown {
-		if (!this.filtered || this._filterTerms.length === 0) return text;
-
+	/** Sorted, de-duplicated character indices in `text` matched by any active term (exact substring
+	 *  first, then fuzzy). Shared by {@link highlightText} and {@link highlightPathAware}. */
+	private matchIndices(text: string): number[] {
 		const lowerText = text.toLowerCase();
 
-		// Collect all matched character indices across all filter terms
 		const allIndices = new Set<number>();
-		for (const term of this._filterTerms) {
+		for (const term of this._filter.terms) {
 			// Try exact substring first
 			const idx = lowerText.indexOf(term);
 			if (idx !== -1) {
@@ -697,22 +966,55 @@ export class GlTreeView extends GlElement {
 			}
 		}
 
-		if (allIndices.size === 0) return text;
+		return [...allIndices].sort((a, b) => a - b);
+	}
 
-		const sorted = [...allIndices].sort((a, b) => a - b);
+	private highlightText(text: string): unknown {
+		if (!this.filtered || this._filter.terms.length === 0) return text;
+
+		const sorted = this.matchIndices(text);
+		if (sorted.length === 0) return text;
+
 		return renderFuzzyHighlight(text, sorted);
 	}
 
+	/** Highlight a node's visible `text` (its basename label or directory description) by matching
+	 *  against the node's full `path`, so a query that spans folder boundaries (e.g. `webviews/foo`)
+	 *  still highlights the characters that fall inside `text` — the per-`text` match can't, since the
+	 *  whole term isn't a substring of the basename or of any single folder segment. `offset` is where
+	 *  `text` begins within `path` (0 for the leading directory, `path.length - label.length` for the
+	 *  trailing basename). Falls back to matching `text` directly when it isn't a clean slice of `path`
+	 *  (e.g. a rename's `← original` description tail, or a non-path group header). */
+	private highlightPathAware(text: string, path: string, offset: number): unknown {
+		if (!this.filtered || this._filter.terms.length === 0) return text;
+
+		if (offset < 0 || path.slice(offset, offset + text.length).toLowerCase() !== text.toLowerCase()) {
+			return this.highlightText(text);
+		}
+
+		const end = offset + text.length;
+		const local: number[] = [];
+		for (const i of this.matchIndices(path)) {
+			if (i >= offset && i < end) {
+				local.push(i - offset);
+			}
+		}
+
+		// Nothing from the path landed in this slice — fall back so a plain basename/description match
+		// still highlights (e.g. `foo` typed against `foo.ts`, matched via the label, not a path span).
+		if (local.length === 0) return this.highlightText(text);
+
+		return renderFuzzyHighlight(text, local);
+	}
+
 	private renderTreeItem(model: TreeModelFlat) {
-		const isSelected = this._lastSelectedPath === model.path;
-		const isFocused = this._focusedItemPath === model.path;
-		// Either the list itself or the filter-as-combobox counts as "the tree is focused" for
-		// visual highlight purposes; the filter input drives the virtual active-descendant.
-		const hasTreeFocus = (this._containerHasFocus || this._filterHasFocus) && !this._actionButtonHasFocus;
+		const id = nodeId(model);
+		const isSelected = this.multiSelectable ? this._selection.has(id) : this._lastSelectedPath === id;
+		const isFocused = this._focusedItemPath === id;
 
 		// All items get tabindex="-1" (not focusable via Tab, only programmatically)
 		// Add ID for aria-activedescendant
-		const itemId = `tree-item-${model.path}`;
+		const itemId = `tree-item-${id}`;
 
 		return html`<gl-tree-item
 			id=${itemId}
@@ -724,30 +1026,37 @@ export class GlTreeView extends GlElement {
 			.level=${model.level}
 			.size=${model.size}
 			.position=${model.position}
+			.hasActions=${(model.actions?.length ?? 0) > 0}
 			.checkable=${model.checkable}
 			.checked=${model.checked ?? false}
+			.controlledCheck=${model.controlledCheck ?? false}
 			.disableCheck=${model.disableCheck ?? false}
 			.checkableTooltip=${model.checkableTooltip}
 			.checkableAltTooltip=${model.checkableAltTooltip}
 			.showIcon=${model.icon != null}
 			.matched=${model.matched ?? false}
+			.muted=${model.muted ?? false}
 			.selected=${isSelected}
-			.focused=${isFocused && hasTreeFocus}
-			.focusedInactive=${isFocused && !hasTreeFocus}
+			.controlledSelection=${true}
+			.focused=${isFocused}
 			.tabIndex=${-1}
 			.vscodeContext=${model.contextData}
+			.draggableItem=${this.draggableFiles && !model.branch}
 			@gl-tree-item-select=${() => this.onBeforeTreeItemSelected(model)}
 			@gl-tree-item-selected=${(e: CustomEvent<TreeItemSelectionDetail>) => this.onTreeItemSelected(e, model)}
+			@gl-tree-item-toggle=${() => this.onTreeItemToggle(model)}
 			@gl-tree-item-checked=${(e: CustomEvent<TreeItemCheckedDetail>) => this.onTreeItemChecked(e, model)}
 			@mouseenter=${(e: MouseEvent) => this.onTreeItemHover(e, model)}
+			@mousemove=${(e: MouseEvent) => this.onTreeItemMove(e, model)}
 			@mouseleave=${() => this.onTreeItemUnhover()}
 			@gl-tree-item-suspend-tooltip=${() => this.onSuspendRowTooltip()}
 			@gl-tree-item-resume-tooltip=${() => this.onResumeRowTooltip()}
 		>
 			${this.renderIcon(model.icon)}
-			${this.highlightText(model.label)}${when(
+			${this.highlightPathAware(model.label, model.path, model.path.length - model.label.length)}${when(
 				model.description != null,
-				() => html`<span slot="description">${this.highlightText(model.description!)}</span>`,
+				() =>
+					html`<span slot="description">${this.highlightPathAware(model.description!, model.path, 0)}</span>`,
 			)}
 			${this.renderActions(model)} ${this.renderDecorations(model)}
 		</gl-tree-item>`;
@@ -767,14 +1076,15 @@ export class GlTreeView extends GlElement {
 					aria-haspopup="tree"
 					aria-autocomplete="list"
 					aria-activedescendant=${activeDescendant || nothing}
-					placeholder="${this.searchBoxFilter
-						? this.filterPlaceholder
-						: (this.searchPlaceholder ?? this.filterPlaceholder)}"
-					.value=${this._filterText}
+					placeholder="${
+						this.searchBoxFilter
+							? this.filterPlaceholder
+							: (this.searchPlaceholder ?? this.filterPlaceholder)
+					}"
+					.value=${this._filter.query}
 					@input=${this.handleFilterInput}
 					@keydown=${this.handleFilterKeydown}
 					@focus=${this.handleFilterFocus}
-					@blur=${this.handleFilterBlur}
 				/>
 				<div class="filter-controls">
 					<gl-button
@@ -795,10 +1105,12 @@ export class GlTreeView extends GlElement {
 
 	override render(): unknown {
 		const hasItems = Boolean(this.treeItems?.length);
-		const showNoResults = !hasItems && this._filterText && this._model?.length;
+		const showNoResults = !hasItems && this._filter.query && this._model?.length;
 		const showEmptyText = !hasItems && !showNoResults && Boolean(this.emptyText);
 
-		if (!hasItems && !showNoResults && !showEmptyText) return nothing;
+		// Slotted empty content stands in for `emptyText`, so it also stands in for the blank-`emptyText`
+		// escape hatch that renders nothing at all.
+		if (!hasItems && !showNoResults && !showEmptyText && !this.hasEmptyContent) return nothing;
 
 		// Container-focused approach: the scrollable div is the focusable element
 		// Use aria-activedescendant to indicate which tree item is active for screen readers.
@@ -807,50 +1119,71 @@ export class GlTreeView extends GlElement {
 
 		return html`
 			${this.renderFilterBar(activeDescendant)}
-			${hasItems
-				? html`<div
-						${ref(this.scrollableRef)}
-						id="tree-list"
-						class="scrollable"
-						tabindex="0"
-						role="tree"
-						aria-label=${this.ariaLabel}
-						aria-multiselectable="false"
-						aria-activedescendant=${activeDescendant || nothing}
-						@keydown=${this.handleContainerKeydown}
-						@focus=${this.handleContainerFocus}
-						@blur=${this.handleContainerBlur}
-					>
-						<lit-virtualizer
+			${
+				hasItems
+					? html`<div
+							${ref(this.scrollableRef)}
+							id="tree-list"
 							class="scrollable"
-							${ref(this.virtualizerRef)}
-							.items=${this.treeItems}
-							.keyFunction=${(item: TreeModelFlat) => item.path}
-							.layout=${flow({ direction: 'vertical' })}
-							.renderItem=${(node: TreeModelFlat) => this.renderTreeItem(node)}
-							scroller
-						></lit-virtualizer>
-					</div>`
-				: showNoResults
-					? html`<div class="no-results">No results found</div>`
-					: html`<div class="no-results">${this.emptyText}</div>`}
-			${this._hoverOpen && this._hoveredTooltip
-				? html`<gl-popover
-						class="hover-popover"
-						?open=${this._hoverOpen}
-						.anchor=${this._hoveredAnchor}
-						placement="right-start"
-						trigger="manual"
-						hoist
-						.distance=${12}
-					>
-						<div slot="content" class="hover-content">
-							${typeof this._hoveredTooltip === 'string'
-								? html`<gl-markdown density="compact" .markdown=${this._hoveredTooltip}></gl-markdown>`
-								: this._hoveredTooltip}
-						</div>
-					</gl-popover>`
-				: nothing}
+							tabindex="0"
+							role="tree"
+							aria-label=${this.ariaLabel}
+							aria-multiselectable=${this.multiSelectable ? 'true' : 'false'}
+							aria-activedescendant=${activeDescendant || nothing}
+							@keydown=${this.handleContainerKeydown}
+							@focus=${this.handleContainerFocus}
+						>
+							<lit-virtualizer
+								class="scrollable"
+								${ref(this.virtualizerRef)}
+								.items=${this.treeItems}
+								.keyFunction=${(item: TreeModelFlat) => nodeId(item)}
+								.layout=${flow({ direction: 'vertical' })}
+								.renderItem=${(node: TreeModelFlat) => this.renderTreeItem(node)}
+								scroller
+							></lit-virtualizer>
+						</div>`
+					: showNoResults
+						? html`<div class="no-results">No results found</div>`
+						: // The no-data body only. A filter that matches nothing is the tree's own answer about
+							// the model it holds, so it stays out of the consumer's slot.
+							html`<slot name="empty"><div class="no-results">${this.emptyText}</div></slot>`
+			}
+			${
+				this._hoverOpen && this._hoveredTooltip
+					? html`<gl-popover
+							class="hover-popover"
+							?open=${this._hoverOpen}
+							.anchor=${this._hoveredAnchor}
+							placement=${this.tooltipAnchorRight ? 'right-start' : 'bottom-start'}
+							flip-fallback-placements=${this.tooltipAnchorRight ? 'bottom-start top-start' : 'top-start'}
+							trigger="manual"
+							.distance=${12}
+							@mouseenter=${
+								this.tooltipAnchorRight ? this.onHoverPopoverEnter : this.onDefaultHoverPopoverEnter
+							}
+							@mouseleave=${() => this.onTreeItemUnhover()}
+						>
+							<div
+								slot="content"
+								class=${
+									this._hoveredTooltipWrap === 'break-all' && !this.tooltipAnchorRight
+										? 'hover-content hover-content--break-all'
+										: 'hover-content'
+								}
+							>
+								${
+									typeof this._hoveredTooltip === 'string'
+										? html`<gl-markdown
+												density="compact"
+												.markdown=${this._hoveredTooltip}
+											></gl-markdown>`
+										: this._hoveredTooltip
+								}
+							</div>
+						</gl-popover>`
+					: nothing
+			}
 		`;
 	}
 
@@ -865,7 +1198,7 @@ export class GlTreeView extends GlElement {
 	 * Get the index of an item by path using O(1) map lookup
 	 */
 	private getItemIndex(path: string): number {
-		return this._pathToIndexMap.get(path) ?? -1;
+		return this._index.indexOf(path);
 	}
 
 	/**
@@ -879,7 +1212,7 @@ export class GlTreeView extends GlElement {
 		// This prevents stale node references when expanding/collapsing nodes
 		this._nodeMap.clear();
 
-		const hideNonMatched = this.filtered && this.searchBoxFilter;
+		const hideNonMatched = this.filtered && this.searchBoxFilter && !this.dimUnmatched;
 		const size = this._model.length;
 		const newTreeItems: TreeModelFlat[] = [];
 		for (let i = 0; i < size; i++) {
@@ -894,11 +1227,11 @@ export class GlTreeView extends GlElement {
 		// Sync focused index with rebuilt map. If the highlighted item has been filtered out,
 		// fall back to the first row so aria-activedescendant never references a removed node.
 		if (this._focusedItemPath) {
-			const newIndex = this._pathToIndexMap.get(this._focusedItemPath);
-			if (newIndex != null) {
+			const newIndex = this._index.indexOf(this._focusedItemPath);
+			if (newIndex !== -1) {
 				this._focusedItemIndex = newIndex;
 			} else if (this.treeItems?.length) {
-				this._focusedItemPath = this.treeItems[0].path;
+				this._focusedItemPath = nodeId(this.treeItems[0]);
 				this._focusedItemIndex = 0;
 			} else {
 				this._focusedItemPath = undefined;
@@ -908,34 +1241,119 @@ export class GlTreeView extends GlElement {
 	}
 
 	private onBeforeTreeItemSelected(model: TreeModelFlat) {
-		if (this._lastSelectedPath !== model.path) {
-			this._lastSelectedPath = model.path;
+		const id = nodeId(model);
+		if (this._lastSelectedPath !== id) {
+			this._lastSelectedPath = id;
 		}
 		// Update focused item when clicking
-		if (this._focusedItemPath !== model.path) {
-			this._focusedItemPath = model.path;
-			this._focusedItemIndex = this.getItemIndex(model.path);
+		if (this._focusedItemPath !== id) {
+			this._focusedItemPath = id;
+			this._focusedItemIndex = this.getItemIndex(id);
 		}
 		// Toggle expansion for branch nodes
-		if (model.branch) {
-			const treeNode = this.findTreeNode(model.path);
-			if (treeNode) {
-				treeNode.expanded = !treeNode.expanded;
-				this.rebuildFlattenedTree();
-				this.emit('gl-tree-expansion-changed', { path: model.path, expanded: treeNode.expanded });
-			}
-		}
+		this.toggleNodeExpansion(model);
 		// Trigger a re-render to update selection and tabindex state across all items
+		this.requestUpdate();
+	}
+
+	/** Toggle a branch node's expansion in the hierarchical model and re-flatten. Returns false for
+	 *  non-branch nodes or when the node can't be found. Used by the row-select path AND the
+	 *  chevron's toggle-only path. */
+	private toggleNodeExpansion(model: TreeModelFlat): boolean {
+		if (!model.branch) return false;
+
+		const id = nodeId(model);
+		const treeNode = this.findTreeNode(id);
+		if (treeNode == null) return false;
+
+		treeNode.expanded = !treeNode.expanded;
+		this.rebuildFlattenedTree();
+		this.emit('gl-tree-expansion-changed', { path: model.path, key: id, expanded: treeNode.expanded });
+		return true;
+	}
+
+	/** Chevron click: expand/collapse only. Moves keyboard focus to the row for arrow-key continuity,
+	 *  but never selects or fires the open event (so it won't, e.g., focus the graph to a worktree). */
+	private onTreeItemToggle(model: TreeModelFlat) {
+		const id = nodeId(model);
+		if (this._focusedItemPath !== id) {
+			this._focusedItemPath = id;
+			this._focusedItemIndex = this.getItemIndex(id);
+		}
+		this.toggleNodeExpansion(model);
 		this.requestUpdate();
 	}
 
 	private onTreeItemSelected(e: CustomEvent<TreeItemSelectionDetail>, model: TreeModelFlat) {
 		e.stopPropagation();
+
+		// Multi-select: modifier-clicks mutate the selection set WITHOUT firing the open event, so
+		// the familiar plain-click-to-open behavior is preserved and only Ctrl/Cmd/Shift accumulate.
+		// Folders are never selection members.
+		if (this.multiSelectable) {
+			if (model.branch) {
+				// A plain click on a folder resets the selection so a prior multi-selection doesn't
+				// "stick" behind the folder's focus/expand. Modifier-clicks on a folder leave the
+				// selection untouched (folders can't be members) and just fall through to open/expand.
+				if (!e.detail.shiftKey && !e.detail.ctrlKey && !e.detail.metaKey) {
+					this._selection.clear();
+				}
+			} else {
+				const id = nodeId(model);
+				const d = e.detail;
+				if (d.shiftKey) {
+					this._selection.selectRange(id, { additive: d.ctrlKey || d.metaKey });
+					return;
+				}
+				if (d.ctrlKey || d.metaKey) {
+					this._selection.toggle(id);
+					return;
+				}
+
+				// Plain click: collapse the selection to this row, then fall through to open it.
+				this._selection.setSingle(id);
+			}
+		}
+
 		this.emit('gl-tree-generated-item-selected', {
 			...e.detail,
 			node: model,
 			context: model.context,
 		});
+	}
+
+	private emitSelectionChanged() {
+		// Emit in collection (visual) order, not Set-insertion (click) order — toggle/Ctrl+click
+		// insert in interaction order, so iterate the flattened rows and keep the selected ones.
+		const selected = this._selection.selectedIds;
+		const paths: string[] = [];
+		const nodes: TreeModelFlat[] = [];
+		const contexts: unknown[] = [];
+		for (const item of this.treeItems ?? []) {
+			// Match by row identity (grouped trees key by `key`), but emit the real `path` so consumers
+			// resolve/dedupe files by their actual path.
+			if (selected.has(nodeId(item))) {
+				paths.push(item.path);
+				nodes.push(item);
+				contexts.push(item.context);
+			}
+		}
+		// Emit the anchor's real `path`, not its internal identity (which is group-prefixed in grouped
+		// trees) — keeps `lastPath` consistent with `paths`, which are real file paths.
+		const anchorId = this._selection.anchorId;
+		this.emit('gl-tree-generated-selection-changed', {
+			nodes: nodes,
+			paths: paths,
+			contexts: contexts,
+			lastPath: anchorId != null ? this.findTreeNode(anchorId)?.path : undefined,
+		} satisfies TreeSelectionChangedDetail);
+	}
+
+	/** Drop selected ids no longer present after a flatten/filter/model change (multi-select only). */
+	private pruneSelection() {
+		if (!this.multiSelectable) return;
+
+		this._selection.pruneTo((id: string) => this._index.has(id));
 	}
 
 	private onTreeItemChecked(e: CustomEvent<TreeItemCheckedDetail>, model: TreeModelFlat) {
@@ -959,6 +1377,20 @@ export class GlTreeView extends GlElement {
 	};
 
 	private onTreeItemHover(event: MouseEvent, model: TreeModelFlat) {
+		const dismissedBounds = this._dismissedHoverBounds;
+		if (!this.tooltipAnchorRight && dismissedBounds != null) {
+			if (
+				event.clientX >= dismissedBounds.left &&
+				event.clientX <= dismissedBounds.right &&
+				event.clientY >= dismissedBounds.top &&
+				event.clientY <= dismissedBounds.bottom
+			) {
+				return;
+			}
+
+			this._dismissedHoverBounds = undefined;
+		}
+
 		if (!model.tooltip) {
 			this.onTreeItemUnhover();
 			return;
@@ -969,10 +1401,10 @@ export class GlTreeView extends GlElement {
 		clearTimeout(this._unhoverTimer);
 
 		const itemRect = element.getBoundingClientRect();
-		// Anchor at the cursor's X (or the host's right edge in `tooltipAnchorRight` mode), aligned
-		// vertically with the row so the tooltip floats just to the side and never sits in the
-		// vertical path the cursor takes when moving between rows.
-		const x = this.tooltipAnchorRight ? this.getBoundingClientRect().right : event.clientX;
+		// Default tooltips open below the row with their body roughly 8px right of the cursor; the
+		// 24px anchor offset accounts for wa-popup's start-aligned arrow inset. Externally anchored
+		// trees keep the host's right edge so their tooltip stays outside the tree.
+		const x = this.tooltipAnchorRight ? this.getBoundingClientRect().right : event.clientX + 24;
 		const rect = this._virtualAnchorRect;
 		rect.x = rect.left = rect.right = x;
 		rect.y = rect.top = itemRect.top;
@@ -981,6 +1413,7 @@ export class GlTreeView extends GlElement {
 		// width stays 0
 		this._hoveredAnchor = this._virtualAnchor;
 		this._hoveredTooltip = model.tooltip;
+		this._hoveredTooltipWrap = model.tooltipWrap;
 
 		if (this._hoverOpen) {
 			// Already showing — anchor identity is unchanged so Lit/wa-popup won't trigger a
@@ -993,6 +1426,23 @@ export class GlTreeView extends GlElement {
 		this._hoverTimer = setTimeout(() => {
 			this._hoverOpen = true;
 		}, 500);
+	}
+
+	private onTreeItemMove(event: MouseEvent, model: TreeModelFlat): void {
+		const dismissedBounds = this._dismissedHoverBounds;
+		if (
+			this.tooltipAnchorRight ||
+			dismissedBounds == null ||
+			(event.clientX >= dismissedBounds.left &&
+				event.clientX <= dismissedBounds.right &&
+				event.clientY >= dismissedBounds.top &&
+				event.clientY <= dismissedBounds.bottom)
+		) {
+			return;
+		}
+
+		this._dismissedHoverBounds = undefined;
+		this.onTreeItemHover(event, model);
 	}
 
 	private async _repositionHoverPopover(): Promise<void> {
@@ -1013,15 +1463,32 @@ export class GlTreeView extends GlElement {
 		this._unhoverTimer = setTimeout(() => {
 			this._hoverOpen = false;
 			this._hoveredTooltip = undefined;
+			this._hoveredTooltipWrap = undefined;
 			this._hoveredAnchor = undefined;
 		}, 100);
 	}
+
+	// The pointer entering the hover popover keeps it open (like VS Code's own tree hovers). In
+	// narrow viewports the popover has to overlap the list — without this, the row's mouseleave
+	// (fired the moment the popover lands under or the pointer crosses into it) closes the hover
+	// and the re-hover reopens it, looping open/close.
+	private readonly onHoverPopoverEnter = (): void => {
+		clearTimeout(this._unhoverTimer);
+	};
+
+	private readonly onDefaultHoverPopoverEnter = (event: MouseEvent): void => {
+		const popover = event.currentTarget as HTMLElement;
+		this._dismissedHoverBounds = popover?.shadowRoot
+			?.querySelector<HTMLElement>('.popover__body')
+			?.getBoundingClientRect();
+		this.dismissRowTooltip();
+	};
 
 	private onSuspendRowTooltip() {
 		clearTimeout(this._hoverTimer);
 		clearTimeout(this._unhoverTimer);
 		this._hoverOpen = false;
-		// Keep _hoveredTooltip and _hoveredAnchor so we can resume
+		// Keep the hovered tooltip state and anchor so we can resume
 	}
 
 	private readonly dismissRowTooltip = (): void => {
@@ -1029,6 +1496,7 @@ export class GlTreeView extends GlElement {
 		clearTimeout(this._unhoverTimer);
 		this._hoverOpen = false;
 		this._hoveredTooltip = undefined;
+		this._hoveredTooltipWrap = undefined;
 		this._hoveredAnchor = undefined;
 	};
 
@@ -1052,26 +1520,19 @@ export class GlTreeView extends GlElement {
 	}
 
 	private handleContainerFocus = () => {
-		// Mark that the container has focus
-		this._containerHasFocus = true;
-
-		// When the container receives focus, if we don't have a focused item, default to first or selected
+		// When the container receives focus, if we don't have a focused item, default to first or selected.
+		// (Active-vs-inactive highlighting is CSS-driven via --gl-tree-focus-within, so no focus flag is
+		// tracked here — see renderTreeItem / tree.css.ts.)
 		if (!this._focusedItemPath) {
 			if (this._lastSelectedPath) {
 				this._focusedItemPath = this._lastSelectedPath;
 				this._focusedItemIndex = this.getItemIndex(this._lastSelectedPath);
 			} else if (this.treeItems?.length) {
-				this._focusedItemPath = this.treeItems[0].path;
+				this._focusedItemPath = nodeId(this.treeItems[0]);
 				this._focusedItemIndex = 0;
 			}
 			this.requestUpdate();
 		}
-	};
-
-	private handleContainerBlur = () => {
-		// Mark that the container lost focus
-		// This will trigger a re-render to update the focused item's visual state
-		this._containerHasFocus = false;
 	};
 
 	private handleFocusIn = (e: FocusEvent) => {
@@ -1097,82 +1558,72 @@ export class GlTreeView extends GlElement {
 		}
 	};
 
-	private handleContextMenu = (e: MouseEvent) => {
-		// Find the tree-item element that triggered the context menu
-		const path = e.composedPath();
-		const treeItem = path.find(el => (el as HTMLElement).tagName === 'GL-TREE-ITEM') as GlTreeItem | undefined;
-		if (!treeItem) return;
-
-		// Get the context data from the tree-item
-		const contextData = treeItem.vscodeContext;
-		if (!contextData) return;
-
-		// Prevent the original event from bubbling
-		e.preventDefault();
-		e.stopPropagation();
-
-		// Copy the context data to this element (tree-generator host)
-		// so VS Code's injected library can read it
-		this.dataset.vscodeContext = contextData;
-
-		// Re-dispatch the event from this element so it can cross the shadow DOM boundary
-		const evt = new MouseEvent('contextmenu', {
-			bubbles: true,
-			composed: true,
-			cancelable: true,
-			clientX: e.clientX,
-			clientY: e.clientY,
-			button: e.button,
-			buttons: e.buttons,
-			ctrlKey: e.ctrlKey,
-			shiftKey: e.shiftKey,
-			altKey: e.altKey,
-			metaKey: e.metaKey,
-		});
-
-		// Dispatch the new event
-		this.dispatchEvent(evt);
-
-		// Clean up the context data after a short delay
-		// (VS Code should have read it by then)
-		setTimeout(() => {
-			delete this.dataset.vscodeContext;
-		}, 100);
-	};
-
+	// Capture-phase Tab handler that keeps the tree a single tab stop: once focus is on one of the
+	// cursor row's inner controls (checkbox / action chip), Tab cycles them and then leaves the tree —
+	// it must never walk natively from one row's control to the next. handleContainerKeydown handles
+	// Tab while focus is still on the container itself.
 	private handleKeydown = (e: KeyboardEvent) => {
 		if (e.key !== 'Tab') return;
 
-		// In capture phase, e.target is the element with the listener, not the focused element
-		// We need to use composedPath to find the action chip in the event path
+		// In capture phase, e.target is the element with the listener, not the focused element — use
+		// composedPath to find which of the row's controls (if any) currently has focus.
 		const composedPath = e.composedPath();
+		const onActionChip = composedPath.some((el: any) => el.tagName === 'GL-ACTION-CHIP');
+		const onCheckbox = composedPath.some(
+			(el: any) => el.tagName === 'INPUT' && el.classList?.contains('checkbox__input'),
+		);
+		// Not on a row control → let handleContainerKeydown (container-focused) drive the Tab.
+		if (!onActionChip && !onCheckbox) return;
 
-		// Find the action chip in the composed path
-		const actionItem = composedPath.find((el: any) => el.tagName === 'GL-ACTION-CHIP') as HTMLElement;
-		if (!actionItem) {
+		e.preventDefault();
+		e.stopPropagation();
+
+		const row = composedPath.find((el: any) => el.tagName === 'GL-TREE-ITEM') as GlTreeItem | undefined;
+
+		if (onCheckbox) {
+			if (e.shiftKey) {
+				this.scrollableRef.value?.focus();
+			} else {
+				// Forward: checkbox → the row's actions if any, else leave the tree.
+				const firstAction = row?.querySelector<HTMLElement>('gl-action-chip');
+				if (firstAction) {
+					firstAction.focus();
+				} else {
+					this.exitTreeForward();
+				}
+			}
 			return;
 		}
 
+		// On an action chip.
 		if (e.shiftKey) {
-			// Shift+Tab - always move back to container
-			e.preventDefault();
-			const container = this.scrollableRef.value;
-			if (container) {
-				container.focus();
+			// Back: actions → the row's checkbox if it has one, else the container.
+			if (!row?.focusCheckbox()) {
+				this.scrollableRef.value?.focus();
 			}
 		} else {
-			// Tab forward - blur the action button and let VS Code handle focus
-			e.preventDefault();
-
-			// Blur the currently focused element to let VS Code's focus management take over
-			const activeElement = document.activeElement as HTMLElement;
-			setTimeout(() => {
-				if (activeElement && typeof activeElement.blur === 'function') {
-					activeElement.blur();
-				}
-			}, 0);
+			this.exitTreeForward();
 		}
 	};
+
+	/** Resolve the currently-rendered gl-tree-item element for the cursor row (virtualized). */
+	private getFocusedTreeItemElement(): GlTreeItem | undefined {
+		if (!this._focusedItemPath) return undefined;
+
+		const virtualizer = this.virtualizerRef.value;
+		if (!virtualizer) return undefined;
+
+		// The virtualizer renders gl-tree-items as direct children; find the cursor row by id.
+		return [...virtualizer.querySelectorAll('gl-tree-item')].find(
+			item => item.id === `tree-item-${this._focusedItemPath}`,
+		);
+	}
+
+	/** Leave the tree forward: blur the focused control so VS Code's focus management advances past it. */
+	private exitTreeForward(): void {
+		const activeElement = document.activeElement as HTMLElement | null;
+		setTimeout(() => activeElement?.blur?.(), 0);
+	}
 
 	private getCurrentFocusedIndex(): number {
 		if (!this.treeItems?.length) return -1;
@@ -1205,136 +1656,141 @@ export class GlTreeView extends GlElement {
 		// This allows action-nav to handle left/right arrow navigation between action buttons
 		if (this._actionButtonHasFocus) return;
 
-		// Handle Tab key to move focus to action buttons
+		// Tab → step into the focused row's controls (tree-specific). The tree is a single tab stop, so
+		// Tab cycles the cursor row's controls — checkbox first, then actions (handleKeydown continues
+		// the cycle once focus is on the checkbox) — then leaves the tree; it never walks to the next row.
 		if (e.key === 'Tab' && !e.shiftKey) {
-			// Try to focus the first action button in the focused row
-			if (this._focusedItemPath) {
-				const virtualizer = this.virtualizerRef.value;
+			const focusedTreeItem = this.getFocusedTreeItemElement();
+			if (focusedTreeItem) {
+				// Checkbox first (it's tabindex="-1", so only this managed path reaches it).
+				if (focusedTreeItem.focusCheckbox()) {
+					e.preventDefault();
+					e.stopPropagation();
+					return;
+				}
 
-				if (virtualizer) {
-					// Query all gl-tree-items and find by ID
-					// (virtualizer renders items as direct children)
-					const allTreeItems = [...virtualizer.querySelectorAll('gl-tree-item')];
-					const focusedTreeItem = allTreeItems.find(
-						item => item.id === `tree-item-${this._focusedItemPath}`,
-					) as HTMLElement;
-
-					if (focusedTreeItem) {
-						// Action chips are light DOM children of the tree item
-						const firstAction = focusedTreeItem.querySelector('gl-action-chip') as HTMLElement;
-						if (firstAction) {
-							// Prevent default BEFORE focusing to stop Tab from moving focus out
-							e.preventDefault();
-							e.stopPropagation();
-
-							// Focus the action button
-							firstAction.focus();
-							return;
-						}
-					}
+				// Otherwise the first action chip (light DOM child of the tree item).
+				const firstAction = focusedTreeItem.querySelector<HTMLElement>('gl-action-chip');
+				if (firstAction) {
+					// Prevent default BEFORE focusing to stop Tab from moving focus out.
+					e.preventDefault();
+					e.stopPropagation();
+					firstAction.focus();
+					return;
 				}
 			}
-			// If no action buttons, let Tab move focus out naturally
+			// No controls in the row → let Tab move focus out naturally.
 			return;
 		}
 
-		// Get current focused index using helper method
-		const currentIndex = this.getCurrentFocusedIndex();
-
-		let targetIndex = currentIndex;
-		let handled = false;
-
-		switch (e.key) {
-			case 'Enter':
-			case ' ':
-				// Trigger selection on the focused item
+		// ArrowUp at the top → return focus to the filter input so the user can keep typing
+		// (tree-specific override of the shared controller's plain ArrowUp).
+		if (e.key === 'ArrowUp' && this.filterable && this.getCurrentFocusedIndex() <= 0) {
+			const filter = this.renderRoot.querySelector<HTMLInputElement>('.filter-input');
+			if (filter != null) {
 				e.preventDefault();
 				e.stopPropagation();
-				this.handleItemActivation(this.treeItems[currentIndex]);
+				filter.focus();
+				filter.select();
 				return;
-			case 'ArrowDown':
-				targetIndex = Math.min(currentIndex + 1, this.treeItems.length - 1);
-				handled = true;
-				break;
-			case 'ArrowUp':
-				// At the top of the list, return focus to the filter input (when present) so the
-				// user can keep typing without reaching for the mouse.
-				if (currentIndex <= 0 && this.filterable) {
-					const filter = this.renderRoot.querySelector<HTMLInputElement>('.filter-input');
-					if (filter != null) {
-						e.preventDefault();
-						e.stopPropagation();
-						filter.focus();
-						filter.select();
-						return;
-					}
-				}
-
-				targetIndex = Math.max(currentIndex - 1, 0);
-				handled = true;
-				break;
-			case 'Home':
-				targetIndex = 0;
-				handled = true;
-				break;
-			case 'End':
-				targetIndex = this.treeItems.length - 1;
-				handled = true;
-				break;
-			case 'ArrowLeft':
-			case 'ArrowRight': {
-				// Try to handle expand/collapse for branch nodes
-				const branchHandled = this.handleBranchToggle(e, this.treeItems[currentIndex]);
-				if (branchHandled) {
-					return;
-				}
-
-				// If not handled (already expanded/collapsed), navigate instead
-				if (e.key === 'ArrowRight') {
-					// Right arrow: move to next row
-					targetIndex = Math.min(currentIndex + 1, this.treeItems.length - 1);
-				} else {
-					// Left arrow: move to parent if possible, otherwise previous row
-					const currentItem = this.treeItems[currentIndex];
-					if (currentItem.parentPath) {
-						// Find the parent in the tree
-						const parentIndex = this.getItemIndex(currentItem.parentPath);
-						if (parentIndex !== -1) {
-							targetIndex = parentIndex;
-						} else {
-							// Parent not found (shouldn't happen), go to previous row
-							targetIndex = Math.max(currentIndex - 1, 0);
-						}
-					} else {
-						// No parent, go to previous row
-						targetIndex = Math.max(currentIndex - 1, 0);
-					}
-				}
-				handled = true;
-				break;
-			}
-			default: {
-				// Handle type-ahead search for printable characters
-				if (this.isPrintableCharacter(e.key)) {
-					e.preventDefault();
-					e.stopPropagation();
-					this.handleTypeAhead(e.key);
-					return;
-				}
-				break;
 			}
 		}
 
-		if (handled) {
-			// Always prevent default for navigation keys to avoid browser scroll behavior
+		// Space on a branch row → activate (expand/collapse) rather than multi-toggle.
+		if (e.key === ' ') {
+			// A focused checkbox toggles itself natively on Space — bail so we don't ALSO toggle the
+			// multi-selection (the event bubbles here from the checkbox). Let the native toggle run.
+			if (
+				e.composedPath().some((el: any) => el.tagName === 'INPUT' && el.classList?.contains('checkbox__input'))
+			) {
+				return;
+			}
+
+			const focused = this.treeItems[this.getCurrentFocusedIndex()];
+
+			// Checkable rows toggle their checkbox on Space (Alt+Space for the mixed-state shortcut),
+			// routed through the row's own toggleChecked so the mixed-state semantics aren't duplicated
+			// here. Takes priority over branch expand/collapse — a checkable folder still toggles.
+			if (focused?.checkable) {
+				e.preventDefault();
+				e.stopPropagation();
+				this.getFocusedTreeItemElement()?.toggleChecked(e.altKey);
+				return;
+			}
+
+			if (focused?.branch) {
+				e.preventDefault();
+				e.stopPropagation();
+				this.handleItemActivation(focused);
+				return;
+			}
+		}
+
+		// Delegate the common vocabulary (Up/Down/Home/End/Page/Enter/Space/Shift+Arrow/Ctrl+A) to the
+		// shared keyboard controller; tree-specific keys come back through the onUnhandledKey seam.
+		if (this._collection.handleKeydown(e)) {
 			e.preventDefault();
 			e.stopPropagation();
-
-			// Always call focusItemAtIndex, even if we're already at the target
-			// This ensures we scroll to the item if the user has scrolled away
-			this.focusItemAtIndex(targetIndex);
 		}
 	};
+
+	/** The keyboard seam (`onUnhandledKey`): tree-specific keys the shared controller forwards. */
+	private handleTreeKey(e: KeyboardEvent): boolean {
+		const items = this.treeItems;
+		if (items == null || items.length === 0) return false;
+
+		if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+			const currentIndex = this.getCurrentFocusedIndex();
+			const item = items[currentIndex];
+			if (item == null) return false;
+
+			// Expand/collapse a branch first; if already in the target state, navigate instead.
+			if (this.handleBranchToggle(e, item)) return true;
+
+			let targetIndex: number;
+			if (e.key === 'ArrowRight') {
+				targetIndex = Math.min(currentIndex + 1, items.length - 1);
+			} else if (item.parentPath) {
+				const parentIndex = this.getItemIndex(item.parentPath);
+				targetIndex = parentIndex !== -1 ? parentIndex : Math.max(currentIndex - 1, 0);
+			} else {
+				targetIndex = Math.max(currentIndex - 1, 0);
+			}
+
+			this.focusItemAtIndex(targetIndex);
+			if (this.multiSelectable) {
+				const focusedItem = items[targetIndex];
+				if (focusedItem != null && !focusedItem.branch) {
+					const id = nodeId(focusedItem);
+					if (e.shiftKey) {
+						this._selection.selectRange(id);
+					} else if (!e.ctrlKey && !e.metaKey) {
+						this._selection.setSingle(id);
+					}
+					// Ctrl/Cmd+Arrow moves focus without changing the selection.
+				}
+			}
+			return true;
+		}
+
+		// Type-ahead for printable characters — ignore Ctrl/Cmd/Alt combos so native shortcuts
+		// (copy/paste, select-all, etc.) aren't swallowed while the tree has focus. Shifted LETTERS
+		// are excluded too: matching is case-insensitive so a capital adds nothing, and eating them
+		// would swallow the graph's Shift-letter toggle chords (Shift+M/B/D/…) whenever a details
+		// tree has focus. Shifted punctuation (`_`) stays — it has no lowercase twin.
+		if (
+			!e.ctrlKey &&
+			!e.metaKey &&
+			!e.altKey &&
+			!(e.shiftKey && /[a-zA-Z]/.test(e.key)) &&
+			this.isPrintableCharacter(e.key)
+		) {
+			this.handleTypeAhead(e.key);
+			return true;
+		}
+
+		return false;
+	}
 
 	private handleItemActivation(item: TreeModelFlat) {
 		if (!item) return;
@@ -1371,44 +1827,26 @@ export class GlTreeView extends GlElement {
 		e.preventDefault();
 		e.stopPropagation();
 
-		// Find and update the node in the hierarchical model
-		const treeNode = this.findTreeNode(item.path);
-		if (treeNode) {
-			treeNode.expanded = !treeNode.expanded;
-			this.rebuildFlattenedTree();
-			this.emit('gl-tree-expansion-changed', { path: item.path, expanded: treeNode.expanded });
+		// Expand/collapse only — no open/select event, so arrow-key toggling won't fire the row's
+		// open action (e.g. focusing the graph to a worktree in the agents panel). The directional
+		// guard above already filtered out the already-in-target-state no-ops.
+		if (!this.toggleNodeExpansion(item)) return false;
 
-			// Trigger a re-render
-			this.requestUpdate();
-
-			// Emit selection event
-			this.onTreeItemSelected(
-				new CustomEvent('gl-tree-item-selected', {
-					detail: {
-						node: null as any,
-						dblClick: false,
-						altKey: false,
-						ctrlKey: false,
-						metaKey: false,
-					},
-				}),
-				item,
-			);
-			return true;
-		}
-		return false;
+		this.requestUpdate();
+		return true;
 	}
 
 	private focusItemAtIndex(index: number) {
 		const item = this.treeItems?.[index];
 		if (!item) return;
 
-		this._focusedItemPath = item.path;
+		const id = nodeId(item);
+		this._focusedItemPath = id;
 		this._focusedItemIndex = index;
 
 		// Selection follows focus - update selection to match focus
-		if (this._lastSelectedPath !== item.path) {
-			this._lastSelectedPath = item.path;
+		if (this._lastSelectedPath !== id) {
+			this._lastSelectedPath = id;
 		}
 
 		// Trigger re-render to update aria-activedescendant and focused state
@@ -1419,64 +1857,7 @@ export class GlTreeView extends GlElement {
 	}
 
 	private scrollToItem(index: number, shouldRestoreFocus: boolean = true) {
-		// Prevent multiple simultaneous scroll operations
-		if (this._scrolling) return;
-
-		this._scrolling = true;
-
-		// Wait for render to complete with updated focused state
-		void this.updateComplete.then(() => {
-			const virtualizer = this.virtualizerRef.value;
-			const container = this.scrollableRef.value;
-
-			if (!virtualizer || !container) {
-				this._scrolling = false;
-				return;
-			}
-
-			// Restore focus helper
-			const restoreFocus = () => {
-				if (shouldRestoreFocus && container && document.activeElement !== container) {
-					container.focus();
-				}
-				this._scrolling = false;
-			};
-
-			// For Home/End (large jumps to first/last item), use manual scrolling
-			// scrollToIndex has known issues with large jumps causing blank screens
-			const isHome = index === 0;
-			const isEnd = index === (this.treeItems?.length ?? 0) - 1;
-
-			if (isHome || isEnd) {
-				// Use requestAnimationFrame to ensure DOM is ready
-				requestAnimationFrame(() => {
-					// Scroll the virtualizer (the actual scroll container, via `scroller` attr)
-					// to top or bottom. Setting scrollTop on the outer wrapper is a no-op because
-					// it never overflows — the virtualizer fills it and owns the scrollbar.
-					if (isHome) {
-						virtualizer.scrollTop = 0;
-					} else {
-						virtualizer.scrollTop = virtualizer.scrollHeight;
-					}
-
-					// Restore focus after scroll
-					requestAnimationFrame(restoreFocus);
-				});
-			} else {
-				// For small jumps, use scrollToIndex
-				requestAnimationFrame(() => {
-					const scrollPromise = virtualizer.scrollToIndex(index, 'nearest');
-
-					// If scrollToIndex returns a promise, wait for it
-					if (scrollPromise && typeof scrollPromise.then === 'function') {
-						void scrollPromise.then(restoreFocus);
-					} else {
-						// Otherwise use RAF as fallback
-						requestAnimationFrame(restoreFocus);
-					}
-				});
-			}
-		});
+		this._scroll.scrollToIndex(index, { restoreFocus: shouldRestoreFocus });
 	}
 
 	/**
@@ -1525,15 +1906,8 @@ export class GlTreeView extends GlElement {
 	}
 
 	private buildPathToIndexMap() {
-		this._pathToIndexMap.clear();
-		if (!this.treeItems) {
-			return;
-		}
-
-		let i = 0;
-		for (const item of this.treeItems) {
-			this._pathToIndexMap.set(item.path, i++);
-		}
+		this._index.rebuild();
+		this.pruneSelection();
 	}
 
 	/**
@@ -1570,26 +1944,18 @@ export class GlTreeView extends GlElement {
 	}
 
 	private handleFilterInput = (e: InputEvent) => {
-		this._filterText = (e.target as HTMLInputElement).value;
-		this.dispatchEvent(
-			new CustomEvent('gl-tree-filter-changed', { detail: this._filterText, bubbles: true, composed: true }),
-		);
-		clearTimeout(this._filterDebounceTimer);
-		this._filterDebounceTimer = setTimeout(() => this.applyFilterToModel(), 150);
+		const value = (e.target as HTMLInputElement).value;
+		this.dispatchEvent(new CustomEvent('gl-tree-filter-changed', { detail: value, bubbles: true, composed: true }));
+		this._filter.setQuery(value, { debounce: true });
 	};
 
 	private handleFilterFocus = () => {
-		this._filterHasFocus = true;
 		// Seed the virtual active-descendant so the first ArrowDown/Enter targets something
 		// visible even if the user hasn't interacted yet.
 		if (!this._focusedItemPath && this.treeItems?.length) {
-			this._focusedItemPath = this.treeItems[0].path;
+			this._focusedItemPath = nodeId(this.treeItems[0]);
 			this._focusedItemIndex = 0;
 		}
-	};
-
-	private handleFilterBlur = () => {
-		this._filterHasFocus = false;
 	};
 
 	private handleFilterKeydown = (e: KeyboardEvent) => {
@@ -1642,11 +2008,12 @@ export class GlTreeView extends GlElement {
 		const item = this.treeItems?.[index];
 		if (!item) return;
 
-		this._focusedItemPath = item.path;
+		const id = nodeId(item);
+		this._focusedItemPath = id;
 		this._focusedItemIndex = index;
 		// Selection follows virtual focus, matching the in-list arrow-key model.
-		if (this._lastSelectedPath !== item.path) {
-			this._lastSelectedPath = item.path;
+		if (this._lastSelectedPath !== id) {
+			this._lastSelectedPath = id;
 		}
 		this.requestUpdate();
 		// Scroll into view without yanking focus away from the filter input.
@@ -1666,25 +2033,16 @@ export class GlTreeView extends GlElement {
 			this.rebuildFlattenedTree();
 		}
 	};
+}
 
-	private applyFilterToModel() {
-		this._filterLower = this._filterText.toLowerCase().trim();
-		// Split on whitespace into independent search terms
-		this._filterTerms = this._filterLower.split(/\s+/).filter(t => t.length > 0);
-		if (this._filterTerms.length === 0) {
-			this.filtered = false;
-			if (this._model != null) {
-				clearMatched(this._model);
-			}
-		} else {
-			this.filtered = true;
-			if (this._model != null) {
-				applyFilter(this._model, this._filterTerms);
-			}
-		}
-
-		this.rebuildFlattenedTree();
-	}
+/**
+ * Row identity — the optional group-scoped {@link TreeItemBase.key}, falling back to {@link
+ * TreeItemBase.path} (unique for ungrouped trees). Every path-keyed structure (node map, index,
+ * virtualizer, selection anchor, focus, expansion) keys off this so grouped trees, whose folder/file
+ * `path` recurs across groups, stay collision-free. Emitted `paths` keep the real `path`.
+ */
+function nodeId(node: { path: string; key?: string }): string {
+	return node.key ?? node.path;
 }
 
 /**
@@ -1705,7 +2063,7 @@ function flattenTree(
 
 	const result = out ?? [];
 
-	nodeMap?.set(tree.path, tree);
+	nodeMap?.set(nodeId(tree), tree);
 
 	result.push({
 		...tree,
@@ -1717,7 +2075,7 @@ function flattenTree(
 	if (tree.expanded !== false && tree.children != null && tree.children.length > 0) {
 		const childSize = tree.children.length;
 		for (let i = 0; i < childSize; i++) {
-			flattenTree(tree.children[i], childSize, i + 1, tree.path, nodeMap, hideNonMatched, result);
+			flattenTree(tree.children[i], childSize, i + 1, nodeId(tree), nodeMap, hideNonMatched, result);
 		}
 	}
 
@@ -1815,6 +2173,9 @@ declare global {
 		'gl-tree-generated-item-action-clicked': CustomEvent<TreeItemActionDetail>;
 		'gl-tree-generated-item-selected': CustomEvent<TreeItemSelectionDetail>;
 		'gl-tree-generated-item-checked': CustomEvent<TreeItemCheckedDetail>;
-		'gl-tree-expansion-changed': CustomEvent<{ path: string; expanded: boolean }>;
+		'gl-tree-generated-selection-changed': CustomEvent<TreeSelectionChangedDetail>;
+		// `path` is the real folder path; `key` is the row identity (group-scoped in grouped trees,
+		// otherwise equal to `path`) — persist/apply expansion by `key` to stay collision-free.
+		'gl-tree-expansion-changed': CustomEvent<{ path: string; key: string; expanded: boolean }>;
 	}
 }

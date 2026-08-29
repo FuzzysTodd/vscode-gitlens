@@ -15,7 +15,6 @@
  *
  * Events are co-located with their domain services:
  * - inspect.onCommitSelected (view-specific commit selection)
- * - inspect.onShowWip (host requests WIP mode)
  * - repositories.onRepositoryChanged (workspace-level repo changes)
  * - config.onConfigChanged
  * - integrations.onIntegrationsChanged
@@ -23,54 +22,48 @@
  * Note: subscription events (onSubscriptionChanged, onOrgSettingsChanged) are handled
  * via signal bridges — see commitDetails.ts _onRpcReady.
  */
-import type { Remote } from '@eamodio/supertalk';
-import type {
-	CommitDetailsServices,
-	CommitSelectionEvent,
-	ShowWipEvent,
-} from '../../commitDetails/commitDetailsService.js';
-import type { RepositoryChangeEventData, Unsubscribe } from '../../rpc/services/types.js';
+import type { Connection, Subscription } from '@eamodio/supertalk';
+import { subscribe } from '@eamodio/supertalk';
+import type { CommitDetailsServices, CommitSelectionEvent } from '../../commitDetails/commitDetailsService.js';
+import type { RepositoryChangeEventData } from '../../rpc/services/types.js';
 import { subscribeAll } from '../shared/events/subscriptions.js';
 import type { CommitDetailsActions } from './actions.js';
 import type { CommitDetailsState } from './state.js';
 
 /**
- * Resolved domain services needed for event subscriptions.
- */
-interface SubscriptionServices {
-	readonly inspect: Awaited<Remote<CommitDetailsServices>['inspect']>;
-	readonly repositories: Awaited<Remote<CommitDetailsServices>['repositories']>;
-	readonly config: Awaited<Remote<CommitDetailsServices>['config']>;
-	readonly integrations: Awaited<Remote<CommitDetailsServices>['integrations']>;
-}
-
-/**
  * Set up all event subscriptions from the backend.
- * Accepts state instance, resolved domain services, and actions.
- * Returns a cleanup function that unsubscribes from all events.
+ * Accepts the RPC connection, state instance, and actions.
+ * The library re-runs the subscriber on every successful handshake (including reconnects),
+ * so it re-resolves sub-services and re-subscribes each time.
  */
 export function setupSubscriptions(
+	connection: Connection,
 	state: CommitDetailsState,
-	services: SubscriptionServices,
 	actions: CommitDetailsActions,
-): Promise<Unsubscribe> {
-	return subscribeAll([
-		() =>
-			services.inspect.onCommitSelected((event: CommitSelectionEvent) =>
-				handleCommitSelected(state, event, actions),
-			),
-		() =>
-			services.repositories.onRepositoryChanged((event: RepositoryChangeEventData) =>
-				handleRepositoryChanged(state, event, actions),
-			),
-		() => services.config.onConfigChanged(() => handleConfigChanged(actions)),
-		// Note: onSubscriptionChanged removed — hasAccount signal bridged from host
-		// Note: onOrgSettingsChanged removed — orgSettings signal bridged from host
-		() =>
-			services.integrations.onIntegrationsChanged(data => handleIntegrationsChanged(state, data.hasAnyConnected)),
-		// Host requests WIP mode on an already-live webview (Launchpad, deep links, etc.)
-		() => services.inspect.onShowWip((event: ShowWipEvent) => handleShowWip(state, event, actions)),
-	]);
+): Subscription {
+	return subscribe<CommitDetailsServices>(connection, async services => {
+		const [inspect, repositories, config, integrations, ai] = await Promise.all([
+			services.inspect,
+			services.repositories,
+			services.config,
+			services.integrations,
+			services.ai,
+		]);
+
+		return subscribeAll([
+			() =>
+				inspect.onCommitSelected((event: CommitSelectionEvent) => handleCommitSelected(state, event, actions)),
+			() =>
+				repositories.onRepositoryChanged((event: RepositoryChangeEventData) =>
+					handleRepositoryChanged(state, event, actions),
+				),
+			() => config.onConfigChanged(() => handleConfigChanged(actions)),
+			// Note: onSubscriptionChanged/onOrgSettingsChanged removed — the bridged hasAccount and
+			// orgSettings signals are kept fresh by SubscriptionService's eager listeners (#5513)
+			() => integrations.onIntegrationsChanged(data => handleIntegrationsChanged(state, data.hasAnyConnected)),
+			() => ai.onModelChanged(model => state.aiModel.set(model)),
+		]);
+	});
 }
 
 // ============================================================
@@ -94,36 +87,20 @@ function handleCommitSelected(
 	// Clear stale search metadata when the new selection is not coming from search.
 	state.searchContext.set(event.searchContext);
 
-	// Only fetch when in commit mode — avoids unnecessary network round-trip while in WIP mode
-	if (state.mode.get() === 'commit') {
-		void actions.fetchCommit(event.repoPath, event.sha);
-	}
+	void actions.fetchCommit(event.repoPath, event.sha);
 }
 
 /**
  * Handle repository change event (generic, fires for all repos).
  * Filters by change type to decide what to refresh.
  *
- * - WIP mode: Index/Head changes for the current WIP repo trigger a WIP refetch
- *   (FS-level changes are handled separately via `onRepositoryWorkingChanged` in actions)
- * - Commit mode: Head/Heads changes clear stale reachability data
+ * - Head/Heads changes clear stale reachability data for the current commit
  */
 function handleRepositoryChanged(
 	state: CommitDetailsState,
 	event: RepositoryChangeEventData,
 	actions: CommitDetailsActions,
 ): void {
-	// WIP mode: refetch on Index/Head changes for the current WIP repo
-	if (state.mode.get() === 'wip') {
-		const wipRepoPath = state.wipState.get()?.repo?.path;
-		if (event.repoPath === wipRepoPath) {
-			const hasWipChanges = event.changes.some(c => c === 'index' || c === 'head');
-			if (hasWipChanges) {
-				void actions.fetchWipState(event.repoPath);
-			}
-		}
-	}
-
 	// Clear stale reachability on significant repo changes (Head/Heads)
 	const currentCommit = state.currentCommit.get();
 	if (currentCommit?.repoPath === event.repoPath) {
@@ -147,15 +124,4 @@ function handleConfigChanged(actions: CommitDetailsActions): void {
  */
 function handleIntegrationsChanged(state: CommitDetailsState, hasConnected: boolean): void {
 	state.capabilities.hasIntegrationsConnected = hasConnected;
-}
-
-/**
- * Handle host requesting WIP mode on an already-live webview.
- * Fired when Launchpad, deep links, or code review opens WIP in the existing Inspect panel.
- */
-function handleShowWip(state: CommitDetailsState, event: ShowWipEvent, actions: CommitDetailsActions): void {
-	state.mode.set('wip');
-	state.inReview.set(event.inReview);
-	state.draftState.set({ inReview: event.inReview });
-	void actions.fetchWipState(event.repoPath);
 }

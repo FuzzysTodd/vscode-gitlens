@@ -6,14 +6,12 @@ import type { GitPausedOperationStatus } from '@gitlens/git/models/pausedOperati
 import type { PullRequestShape } from '@gitlens/git/models/pullRequest.js';
 import type { GitBranchReference } from '@gitlens/git/models/reference.js';
 import type { GitCommitSearchContext } from '@gitlens/git/models/search.js';
+import type { SigningFormat } from '@gitlens/git/models/signature.js';
 import type { CurrentUserNameStyle } from '@gitlens/git/utils/commit.utils.js';
 import type { DateTimeFormat } from '@gitlens/utils/date.js';
 import type { Config, DateStyle } from '../../config.js';
-import type { Sources } from '../../constants.telemetry.js';
-import type { GlRepository } from '../../git/models/repository.js';
 import type { WebviewItemContext } from '../../system/webview.js';
 import { serializeWebviewItemContext } from '../../system/webview.js';
-import type { IpcScope } from '../ipc/models/ipc.js';
 import type { WebviewState } from '../protocol.js';
 import type { FileShowOptions, WipChange } from '../rpc/services/types.js';
 
@@ -21,7 +19,6 @@ export type { FileShowOptions } from '../rpc/services/types.js';
 // Re-export from shared types — canonical definition is in rpc/services/types.ts
 export type { CommitSignatureShape, WipChange, WipFileChange } from '../rpc/services/types.js';
 
-export const scope: IpcScope = 'commitDetails';
 export const messageHeadlineSplitterToken = '\x00\n\x00';
 
 export interface CommitSummary {
@@ -42,6 +39,11 @@ export type CommitFileChange = GitFileChangeShape & { stats?: GitFileChangeStats
 export interface CommitDetails extends CommitSummary {
 	files?: readonly CommitFileChange[];
 	stats?: GitCommitStats;
+	/**
+	 * `true` when the commit is reachable from a worktree other than the one this panel is scoped to,
+	 * so its files have a working copy elsewhere. Drives the file context-menu's "(Worktree)" file actions.
+	 */
+	reachableFromOtherWorktrees?: boolean;
 }
 
 export interface CompareDiff {
@@ -64,6 +66,9 @@ export interface Preferences {
 	indentGuides: 'none' | 'onHover' | 'always';
 	/** Working (WIP) file list sort, honoring VS Code's `scm.defaultViewSortKey` (list layout only). */
 	workingFilesOrderBy: WorkingFileSorting;
+	/** Whether the working (WIP) file list orders by stage (staged → mixed → unstaged) before the
+	 *  `scm.defaultViewSortKey` order, or sorts flat by the key alone. Mirrors `gitlens.sortWorkingChangesBy`. */
+	workingChangesSortBy: Config['sortWorkingChangesBy'];
 	aiEnabled: boolean;
 	enableSmartCommit: boolean;
 	showSignatureBadges: boolean;
@@ -74,7 +79,13 @@ export interface Preferences {
 }
 export type UpdateablePreferences = Partial<Pick<Preferences, 'pullRequestExpanded' | 'files'>>;
 
-export type Mode = 'commit' | 'wip';
+/** Fallback file-list layout when the persisted `views.commitDetails.files` preference is unavailable. */
+export const defaultViewFilesConfig: Preferences['files'] = {
+	layout: 'auto',
+	compact: true,
+	threshold: 5,
+	icon: 'type',
+};
 
 export interface GitBranchShape {
 	name: string;
@@ -91,10 +102,9 @@ export interface GitBranchShape {
 /**
  * Git-authoritative working-tree counts, computed host-side from `status.diffStatus` and embedded
  * IN the {@link Wip} so the file list and its summary counts travel as one atomic object — they
- * can never drift. Header / row badges read these (via the derived `workingTreeStats`); the panel
- * reads them directly. Structurally assignable to graph's `GraphWorkingTreeStats` (which is
- * `WorkDirStats & { hasConflicts?; conflictsCount?; pausedOpStatus? }`); `context` is the
- * serialized `GraphItemContext` string for the WIP row's right-click menu.
+ * can never drift. Header / row badges read these (via the graph's row-keyed `wipStateById` plane,
+ * which projects them with `toWipState`); the panel reads them directly. `context` is the serialized
+ * `GraphItemContext` string for the WIP row's right-click menu.
  */
 export interface WipStats {
 	added: number;
@@ -105,11 +115,27 @@ export interface WipStats {
 	conflictsCount?: number;
 	pausedOpStatus?: GitPausedOperationStatus;
 	context?: string;
+	/** Serialized `gitlens:branch` context for the WIP header's left "branch actions" kebab; undefined on detached HEAD. */
+	branchContext?: string;
+}
+
+/** Repo-level commit-signing status for the WIP commit box — see {@link Wip.signing}. */
+export interface WipSigning {
+	/** Whether commits will be signed (repo `commit.gpgsign` or the host's `git.enableCommitSigning` override). */
+	enabled: boolean;
+	format: SigningFormat;
 }
 
 export interface Wip {
 	changes: WipChange | undefined;
 	repositoryCount: number;
+	/**
+	 * Host-stamped, per-repo monotonic freshness marker, assigned when the producing `git status` read STARTS (so a
+	 * slow read of older state can't outrank a later read of newer state). Lets a consumer order payloads that can
+	 * arrive out of order — a delayed push vs. a newer push or forced refresh — and discard any that reflect an
+	 * older working tree than one already applied. Optional: only the Graph's `getWipForRepoAndStats` stamps it.
+	 */
+	revision?: number;
 	branch?: GitBranchShape;
 	repo: {
 		uri: string;
@@ -128,21 +154,16 @@ export interface Wip {
 	 * rely on it in practice (guard with `?.` for the shared-type contract).
 	 */
 	stats?: WipStats;
-}
-
-export interface DraftState {
-	inReview: boolean;
+	/**
+	 * Commit-signing status for this wip's repo — drives the "will be signed" indicator in the
+	 * Graph's commit box. Optional for the same reason as {@link Wip.stats}: only the Graph's
+	 * `getWipForRepoAndStats` populates it.
+	 */
+	signing?: WipSigning;
 }
 
 export interface State extends WebviewState<'gitlens.views.commitDetails'> {
-	mode: Mode;
-
 	pinned: boolean;
-	navigationStack: {
-		count: number;
-		position: number;
-		hint?: string;
-	};
 	preferences: Preferences;
 	orgSettings: {
 		ai: boolean;
@@ -153,21 +174,12 @@ export interface State extends WebviewState<'gitlens.views.commitDetails'> {
 	autolinksEnabled: boolean;
 	autolinkedIssues?: IssueOrPullRequest[];
 	pullRequest?: PullRequestShape;
-	wip?: Wip;
-	inReview?: boolean;
 	hasAccount: boolean;
 	hasIntegrationsConnected: boolean;
 	searchContext?: GitCommitSearchContext;
 }
 
 export type ShowCommitDetailsViewCommandArgs = string[];
-
-export interface ShowWipArgs {
-	type: 'wip';
-	inReview?: boolean;
-	repository?: GlRepository;
-	source: Sources;
-}
 
 // COMMANDS
 
@@ -207,6 +219,9 @@ export interface DetailsFileContextValue {
 	stashNumber?: string;
 	staged?: boolean;
 	status?: GitFileStatus;
+	/** A rename's original path. Only needed for comparison contexts, whose file isn't looked up in a
+	 *  fileset — `getFileCommitFromContext` synthesizes its `GitFileChange` from this context alone. */
+	originalPath?: string;
 }
 
 export interface DetailsFolderContextValue {

@@ -1,7 +1,7 @@
 import type { RepositoryChange } from '../models/repository.js';
 
 const classifyRegex =
-	/(worktrees|index|HEAD|FETCH_HEAD|ORIG_HEAD|CHERRY_PICK_HEAD|MERGE_HEAD|REBASE_HEAD|rebase-merge|rebase-apply|sequencer|REVERT_HEAD|config|gk\/config|info\/exclude|refs\/(?:heads|remotes|stash|tags))/;
+	/(worktrees|index|HEAD|FETCH_HEAD|ORIG_HEAD|CHERRY_PICK_HEAD|MERGE_HEAD|REBASE_HEAD|rebase-merge|rebase-apply|sequencer|REVERT_HEAD|config|gk\/config|info\/exclude|refs\/(?:heads|remotes|stash|tags)|packed-refs)/;
 
 /**
  * Maps a path relative to a `.git` directory to the corresponding
@@ -69,6 +69,13 @@ export function classifyGitDirChange(relativePath: string): RepositoryChange[] |
 		case 'sequencer':
 			return ['pausedOp'];
 
+		// `'heads'` is deliberately the ONLY thing a `refs/heads/*` event yields, including a create. It is
+		// tempting to read a create as "a new branch exists under this name" and use it to drop anything
+		// derived from the old branch's identity (its base, its merge target). That signal does not mean
+		// what it looks like: git rewrites an EXISTING loose ref by writing `<name>.lock` and renaming it
+		// over the file, which watchers report as a create of the destination — so every ordinary commit
+		// would look like a new branch and discard a live branch's metadata. Nothing here can distinguish
+		// the two; identity changes are handled where GitLens performs the operation itself.
 		case 'refs/heads':
 			return ['heads'];
 
@@ -80,6 +87,13 @@ export function classifyGitDirChange(relativePath: string): RepositoryChange[] |
 
 		case 'refs/tags':
 			return ['tags'];
+
+		// A `packed-refs` rewrite (after `git pack-refs` or `git gc`) changes ref state
+		// WITHOUT any `refs/**` file event — deleting a packed branch, for example, only
+		// rewrites this file. The file content is not inspected here, so classification
+		// is deliberately broad: it can add, remove, or move refs of any of these types.
+		case 'packed-refs':
+			return ['heads', 'remotes', 'tags'];
 
 		case 'worktrees':
 			return ['worktrees'];

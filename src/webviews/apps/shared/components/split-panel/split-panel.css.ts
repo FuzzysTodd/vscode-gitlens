@@ -1,33 +1,57 @@
 import { css } from 'lit';
 
 export const splitPanelStyles = css`
+	/* --gl-split-panel-end-reserve (default 0px, opt-in per consumer): space the start track can
+	   never take from the end slot, whatever the position or a --gl-split-panel-start-size override
+	   asks for — grid track sizing gives the start track its size first and lets the 1fr end track
+	   overflow, so rigid end content (e.g. a commit box) gets crushed without this cap. */
 	:host {
 		display: grid;
+		grid-template-rows: 1fr;
 		grid-template-columns:
 			var(
 				--gl-split-panel-start-size,
-				min(var(--_start-size, 0%), calc(100% - var(--gl-split-panel-divider-width, 4px)))
+				min(
+					var(--_start-size, 0%),
+					calc(100% - var(--gl-split-panel-divider-width, 4px) - var(--gl-split-panel-end-reserve, 0px))
+				)
 			)
 			var(--gl-split-panel-divider-width, 4px) 1fr;
-		grid-template-rows: 1fr;
-		height: 100%;
 		width: 100%;
-		overflow: hidden;
+		height: 100%;
+		overflow: clip;
 	}
 
 	:host([orientation='vertical']) {
-		grid-template-columns: 1fr;
 		grid-template-rows:
 			var(
 				--gl-split-panel-start-size,
-				min(var(--_start-size, 0%), calc(100% - var(--gl-split-panel-divider-width, 4px)))
+				min(
+					var(--_start-size, 0%),
+					calc(100% - var(--gl-split-panel-divider-width, 4px) - var(--gl-split-panel-end-reserve, 0px))
+				)
 			)
 			var(--gl-split-panel-divider-width, 4px) 1fr;
+		grid-template-columns: 1fr;
 	}
 
 	/* :host { display: grid } overrides the UA [hidden] rule; re-assert it. */
 	:host([hidden]) {
 		display: none;
+	}
+
+	/* Opt-in animated glide (see the animate property) — a deliberate transition on the tracks
+	   driven by --_start-size, distinct from the instant snap drag/keyboard/programmatic changes use. */
+	:host([animate]) {
+		transition:
+			grid-template-columns var(--gl-duration-medium, 200ms) ease,
+			grid-template-rows var(--gl-duration-medium, 200ms) ease;
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		:host([animate]) {
+			transition: none;
+		}
 	}
 
 	:host([dragging]) {
@@ -43,21 +67,21 @@ export const splitPanelStyles = css`
 	 * display: contents and have no box.
 	 */
 	::slotted(*) {
-		height: 100%;
 		min-width: 0;
+		height: 100%;
 		min-height: 0;
 	}
 
 	.divider {
-		display: flex;
 		position: relative;
+		z-index: 1;
+		display: flex;
 		align-items: center;
 		justify-content: center;
-		cursor: ew-resize;
 		touch-action: none;
+		cursor: ew-resize;
 		background-color: transparent;
-		transition: background-color 0.1s ease-out;
-		z-index: 1;
+		transition: background-color var(--gl-duration-x-fast) var(--gl-ease-out);
 	}
 
 	:host([orientation='vertical']) .divider {
@@ -73,8 +97,8 @@ export const splitPanelStyles = css`
 	}
 
 	.divider:hover {
-		transition-delay: 0.2s;
 		background-color: var(--vscode-sash-hoverBorder, var(--vscode-focusBorder));
+		transition-delay: 0.2s;
 	}
 
 	:host([dragging]) .divider,
@@ -84,19 +108,19 @@ export const splitPanelStyles = css`
 
 	/* Invisible hit area extending beyond the divider for easier grabbing */
 	.divider::after {
-		display: block;
-		content: '';
 		position: absolute;
-		height: 100%;
 		left: calc(var(--gl-split-panel-divider-hit-area, 8px) / -2 + var(--gl-split-panel-divider-width, 4px) / 2);
+		display: block;
 		width: var(--gl-split-panel-divider-hit-area, 8px);
+		height: 100%;
+		content: '';
 	}
 
 	:host([orientation='vertical']) .divider::after {
+		top: calc(var(--gl-split-panel-divider-hit-area, 8px) / -2 + var(--gl-split-panel-divider-width, 4px) / 2);
+		left: 0;
 		width: 100%;
 		height: var(--gl-split-panel-divider-hit-area, 8px);
-		left: 0;
-		top: calc(var(--gl-split-panel-divider-hit-area, 8px) / -2 + var(--gl-split-panel-divider-width, 4px) / 2);
 	}
 
 	@media (forced-colors: active) {
@@ -112,22 +136,22 @@ export const splitPanelStyles = css`
 	 * same --_start-size custom property the grid track would have used.
 	 */
 	:host([mode='overlay']) {
-		display: block;
 		position: relative;
-		grid-template-columns: unset;
+		display: block;
 		grid-template-rows: unset;
+		grid-template-columns: unset;
 	}
 
 	:host([mode='overlay']) ::slotted([slot='start']) {
 		position: absolute;
-		left: 0;
 		top: 0;
 		bottom: 0;
+		left: 0;
+		z-index: 2;
 		width: var(--_start-size, 0%);
 		max-width: 100%;
-		z-index: 2;
-		box-shadow: 0 0 0.5rem var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
-		transition: width 0.08s ease-out;
+		box-shadow: 0 0 0.5rem var(--vscode-widget-shadow, rgb(0 0 0 / 36%));
+		transition: width var(--gl-duration-x-fast) var(--gl-ease-out);
 	}
 
 	:host([mode='overlay'][dragging]) ::slotted([slot='start']) {
@@ -142,21 +166,44 @@ export const splitPanelStyles = css`
 
 	:host([mode='overlay']) .divider {
 		position: absolute;
+		top: 0;
+		bottom: 0;
+
 		/* Sit flush against the panel's right edge — not centered on the boundary like split
 		   mode — so the visible divider stays entirely outside the floating panel.
 		   The ::after hit area still extends 2px into the panel, keeping it grabbable. */
 		left: var(--_start-size, 0%);
-		top: 0;
-		bottom: 0;
+		z-index: 3;
 		width: var(--gl-split-panel-divider-width, 4px);
 		height: auto;
-		z-index: 3;
 		transition:
-			background-color 0.1s ease-out,
-			left 0.08s ease-out;
+			background-color var(--gl-duration-x-fast) var(--gl-ease-out),
+			left var(--gl-duration-x-fast) var(--gl-ease-out);
 	}
 
 	:host([mode='overlay'][dragging]) .divider {
 		transition: none;
+	}
+
+	/*
+	 * Maximize — the end panel floats over the full container instead of redistributing space.
+	 * Unlike a grid-track collapse, the start panel keeps its exact pre-maximize layout underneath,
+	 * so content behind it (e.g. the commit graph) never reflows and restoring is instant. The
+	 * divider is hidden since consumers disable it alongside this state anyway.
+	 */
+	:host([maximized]) {
+		position: relative;
+	}
+
+	:host([maximized]) ::slotted([slot='end']) {
+		position: absolute;
+		inset: 0;
+		z-index: 2;
+		width: 100%;
+		box-shadow: 0 0 0.5rem var(--vscode-widget-shadow, rgb(0 0 0 / 36%));
+	}
+
+	:host([maximized]) .divider {
+		display: none;
 	}
 `;

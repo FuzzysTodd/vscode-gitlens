@@ -76,6 +76,11 @@ export interface GitServiceConfig {
 
 	/** Graph-specific configuration defaults. */
 	readonly graph?: {
+		/** Whether to keep git's commit-graph file up to date in the background after graph loads —
+		 *  written when missing, periodically refreshed to cover new commits (accelerates ordered
+		 *  history walks — the graph's initial load). Fed from the master switch
+		 *  (`gitlens.gitOptimizations.enabled`); `false` disables the background write. */
+		readonly writeCommitGraph?: boolean;
 		/** Graph commit ordering (falls back to `commits.ordering` or `'date'`). */
 		readonly commitOrdering?: 'date' | 'author-date' | 'topo';
 		/** Whether to only follow first parent in graph. */
@@ -84,6 +89,33 @@ export interface GitServiceConfig {
 		readonly avatars?: boolean;
 		/** Maximum search items (0 = unlimited). */
 		readonly maxSearchItems?: number;
+	};
+
+	/** Auto-tier git-optimization (maintenance) preferences. */
+	readonly maintenance?: {
+		/** Master switch for the auto-tier optimizations (maps to `gitlens.gitOptimizations.enabled`). Defaults to `true`. */
+		readonly enabled?: boolean;
+	};
+
+	/** Force-push preferences. */
+	readonly push?: {
+		/** Whether to use `--force-with-lease` instead of a plain `--force` when force-pushing. Defaults to `true`. */
+		readonly useForceWithLease?: boolean;
+		/**
+		 * Whether to add `--force-if-includes` when force-pushing. Only applies when `useForceWithLease` is `true`
+		 * and the installed Git supports it. Defaults to `true`.
+		 */
+		readonly useForceIfIncludes?: boolean;
+	};
+
+	/** Commit-signing preferences. */
+	readonly signing?: {
+		/**
+		 * Host-level override for whether commit signing is enabled (e.g. VS Code's `git.enableCommitSigning`).
+		 * When `true`, signing is treated as enabled even if the repo's `commit.gpgsign` is unset/false. It never
+		 * forces signing off.
+		 */
+		readonly enabled?: boolean;
 	};
 }
 
@@ -116,9 +148,10 @@ export interface GitServiceHooks {
 		/**
 		 * Called when a commit is signed successfully.
 		 *
-		 * Note: currently fired only from explicit-sign paths in the patch provider
-		 * (where signing is requested via `-S` and confirmed up front). Operations
-		 * that sign implicitly via `commit.gpgsign=true` (`commit`, `merge`, `pull`,
+		 * Note: currently fired only from explicit-sign paths — the patch provider's
+		 * `commit-tree -S` and the commit operation when the host signing override
+		 * (`config.signing.enabled`) adds `-S`. Operations that sign implicitly via
+		 * `commit.gpgsign=true` (`commit` without the override, `merge`, `pull`,
 		 * `rebase`, `revert`, `cherryPick`) do not fire this hook because the
 		 * library cannot cheaply confirm that signing actually occurred without an
 		 * extra `git config`/`log --show-signature` call.
@@ -137,6 +170,17 @@ export interface GitServiceHooks {
 		onConflicted?(command: GitConflictCommand, conflicts?: GitConflictFile[]): void;
 		/** Called when getGitDir resolves to a non-existent .git directory or rev-parse fails */
 		onGitDirResolveFailed?(repoPath: string, gitDir: string, errorMessage: string): void;
+		/**
+		 * Called when a git operation that can start a rebase begins (`'started'`, before the
+		 * process runs) and again when the command exits (`'ended'`, on success and failure alike).
+		 * Fired at start (not from the result) because `git rebase` exits 0 when stopping at
+		 * `edit`/`break`, and fired for every pull because `pull.rebase=true` config can start
+		 * a rebase the host can't predict from the arguments. The `'ended'` phase lets the host
+		 * check whether the operation actually left a rebase in progress.
+		 * @param repoPath The path the rebase state will appear under (the worktree path for
+		 * worktree-targeted pulls)
+		 */
+		onRebaseCapableOperation?(repoPath: string, command: 'rebase' | 'pull', phase: 'started' | 'ended'): void;
 	};
 }
 

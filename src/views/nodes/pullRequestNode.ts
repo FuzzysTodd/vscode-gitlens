@@ -250,7 +250,7 @@ export async function getPullRequestChildren(
 
 export function getPullRequestTooltip(
 	pullRequest: PullRequest,
-	context?: { commit?: GitCommit; idPrefix?: string; codeSuggestionsCount?: number },
+	context?: { commit?: GitCommit; idPrefix?: string },
 ): MarkdownString {
 	const tooltip = new MarkdownString('', true);
 	tooltip.supportHtml = true;
@@ -263,19 +263,23 @@ export function getPullRequestTooltip(
 	}
 
 	const linkTitle = ` "Open Pull Request \\#${pullRequest.id} on ${pullRequest.provider.name}"`;
+	// A provider can report a pull request with no author (a deleted account, or a host with no per-item
+	// creator), which normalizes to an absent `url` and `name`. Interpolating the url produced a link to nowhere,
+	// so fall back to plain text; with no name there's nothing to attribute, so drop the `by …` clause rather
+	// than render `by @undefined` (the provider layer deliberately doesn't invent a placeholder name).
+	const authorName = pullRequest.author.name;
+	const by =
+		authorName == null
+			? ''
+			: pullRequest.author.url
+				? ` by [@${authorName}](${pullRequest.author.url} "Open @${authorName} on ${pullRequest.provider.name}")`
+				: ` by @${authorName}`;
 	tooltip.appendMarkdown(
 		`${getIssueOrPullRequestMarkdownIcon(pullRequest)} [**${pullRequest.title.trim()}**](${
 			pullRequest.url
-		}${linkTitle}) \\\n[${context?.idPrefix ?? ''}#${pullRequest.id}](${pullRequest.url}${linkTitle}) by [@${
-			pullRequest.author.name
-		}](${pullRequest.author.url} "Open @${pullRequest.author.name} on ${
-			pullRequest.provider.name
-		}") was ${pullRequest.state.toLowerCase()} ${PullRequest.formatDateFromNow(pullRequest)}`,
+		}${linkTitle}) \\\n[${context?.idPrefix ?? ''}#${pullRequest.id}](${
+			pullRequest.url
+		}${linkTitle})${by} was ${pullRequest.state.toLowerCase()} ${PullRequest.formatDateFromNow(pullRequest)}`,
 	);
-	if (context?.codeSuggestionsCount != null && context.codeSuggestionsCount > 0) {
-		tooltip.appendMarkdown(
-			`\n\n$(gitlens-code-suggestion) ${pluralize('code suggestion', context.codeSuggestionsCount)}`,
-		);
-	}
 	return tooltip;
 }

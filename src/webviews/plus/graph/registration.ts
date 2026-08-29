@@ -1,5 +1,5 @@
 import type { TextEditor, Uri } from 'vscode';
-import { Disposable, ViewColumn, window } from 'vscode';
+import { Disposable, ViewColumn, window, workspace } from 'vscode';
 import type { GitReference } from '@gitlens/git/models/reference.js';
 import type { SearchQuery } from '@gitlens/git/models/search.js';
 import { isUri } from '@gitlens/utils/uri.js';
@@ -7,9 +7,8 @@ import type { Source } from '../../../constants.telemetry.js';
 import type { Container } from '../../../container.js';
 import { GitUri } from '../../../git/gitUri.js';
 import type { GlRepository } from '../../../git/models/repository.js';
-import { executeCommand, executeCoreCommand, registerCommand } from '../../../system/-webview/command.js';
+import { executeCommand, registerCommand } from '../../../system/-webview/command.js';
 import { configuration } from '../../../system/-webview/configuration.js';
-import { getContext } from '../../../system/-webview/context.js';
 import { loadChunk } from '../../../system/-webview/loadChunk.js';
 import { getScmResourceFolderUri, getScmResourceUri, isScm } from '../../../system/-webview/scm.js';
 import { ViewNode } from '../../../views/nodes/abstract/viewNode.js';
@@ -25,14 +24,37 @@ import type {
 	WebviewsController,
 	WebviewViewProxy,
 } from '../../webviewsController.js';
-import type { GraphActionTarget, GraphShowAction, GraphSidebarPanel, State } from './protocol.js';
+import type {
+	GraphActionTarget,
+	GraphCompareSeed,
+	GraphComposeScopeSeed,
+	GraphScopeBranch,
+	GraphScopeOrigin,
+	GraphShowAction,
+	GraphSidebarPanel,
+	State,
+	VisualizationMode,
+} from './protocol.js';
 
 export type GraphWebviewShowingArgs = [
 	| GlRepository
 	| { ref: GitReference; source?: Source }
 	| { repository: GlRepository; search?: SearchQuery; source?: Source }
+	| { repository: GlRepository; compare: GraphCompareSeed; source?: Source }
 	| { sidebarPanel: GraphSidebarPanel; source?: Source }
-	| { action: GraphShowAction; target?: GraphActionTarget; source?: Source }
+	| { visualization: VisualizationMode; repository?: GlRepository; source?: Source }
+	| {
+			action: GraphShowAction;
+			target?: GraphActionTarget;
+			source?: Source;
+			composeInstructions?: string;
+			composeScope?: GraphComposeScopeSeed;
+			agentSessionId?: string;
+			revealOnly?: boolean;
+			followed?: boolean;
+			scopeBranch?: GraphScopeBranch;
+			scopeOrigin?: GraphScopeOrigin;
+	  }
 	| undefined,
 ];
 
@@ -42,6 +64,13 @@ export type ShowInCommitGraphCommandArgs =
 			repository: GlRepository;
 			search?: SearchQuery;
 			selectSha?: string;
+			preserveFocus?: boolean;
+			source?: Source;
+			viewColumn?: ViewColumn;
+	  }
+	| {
+			repository: GlRepository;
+			compare: GraphCompareSeed;
 			preserveFocus?: boolean;
 			source?: Source;
 			viewColumn?: ViewColumn;
@@ -96,7 +125,6 @@ export function registerGraphWebviewView(
 			trackingFeature: 'graphView',
 			type: 'graph',
 			plusFeature: true,
-			location: 'panel',
 			webviewHostOptions: {
 				retainContextWhenHidden: true,
 			},
@@ -114,6 +142,46 @@ export function registerGraphWebviewCommands<T>(
 	container: Container,
 	panels: WebviewPanelsProxy<'gitlens.graph', GraphWebviewShowingArgs, T>,
 ): Disposable {
+	if (DEBUG) {
+		void import(/* webpackChunkName: "__debug__" */ './__debug__signInGateDebug.js').then(m => {
+			m.registerSignInGateDebug(container, panels);
+		});
+	}
+
+	/** Routes to the best graph surface: an existing/visible instance wins over the configured
+	 *  layout, so the request lands on the graph the user is looking at instead of opening a
+	 *  second one in the other surface. */
+	function showOnBestGraphSurface(
+		options: { preserveFocus?: boolean; column?: ViewColumn; source?: Source },
+		...args: GraphWebviewShowingArgs
+	): void {
+		const { preserveFocus = false, column, source } = options;
+		if (configuration.get('graph.layout') === 'panel') {
+			if (!container.views.graph.visible) {
+				const instance = panels.getBestInstance({ preserveFocus: preserveFocus }, ...args);
+				if (instance != null) {
+					void instance.show({ preserveFocus: preserveFocus, column: column, source: source }, ...args);
+					return;
+				}
+			}
+
+			void container.views.graph.show({ preserveFocus: preserveFocus, source: source }, ...args);
+		} else {
+			const instance = panels.getBestInstance({ preserveFocus: preserveFocus }, ...args);
+			if (instance != null) {
+				void instance.show({ preserveFocus: preserveFocus, column: column, source: source }, ...args);
+				return;
+			}
+
+			if (container.views.graph.visible) {
+				void container.views.graph.show({ preserveFocus: preserveFocus, source: source }, ...args);
+				return;
+			}
+
+			void panels.show({ preserveFocus: preserveFocus, column: column, source: source }, ...args);
+		}
+	}
+
 	function showInCommitGraph(args: ShowInCommitGraphCommandArgs): void {
 		if (args instanceof PullRequestNode) {
 			if (args.ref == null) return;
@@ -124,30 +192,7 @@ export function registerGraphWebviewCommands<T>(
 		const preserveFocus = 'preserveFocus' in args ? (args.preserveFocus ?? false) : false;
 		const column = 'viewColumn' in args ? args.viewColumn : undefined;
 		const source = 'source' in args ? args.source : undefined;
-		if (configuration.get('graph.layout') === 'panel') {
-			if (!container.views.graph.visible) {
-				const instance = panels.getBestInstance({ preserveFocus: preserveFocus }, args);
-				if (instance != null) {
-					void instance.show({ preserveFocus: preserveFocus, column: column, source: source }, args);
-					return;
-				}
-			}
-
-			void container.views.graph.show({ preserveFocus: preserveFocus, source: source }, args);
-		} else {
-			const instance = panels.getBestInstance({ preserveFocus: preserveFocus }, args);
-			if (instance != null) {
-				void instance.show({ preserveFocus: preserveFocus, column: column, source: source }, args);
-				return;
-			}
-
-			if (container.views.graph.visible) {
-				void container.views.graph.show({ preserveFocus: preserveFocus, source: source }, args);
-				return;
-			}
-
-			void panels.show({ preserveFocus: preserveFocus, column: column, source: source }, args);
-		}
+		showOnBestGraphSurface({ preserveFocus: preserveFocus, column: column, source: source }, args);
 	}
 
 	async function openFileHistoryInGraph(...args: any[]): Promise<void> {
@@ -199,6 +244,81 @@ export function registerGraphWebviewCommands<T>(
 	}
 
 	return Disposable.from(
+		registerCommand('gitlens.showGitHealth', async (...args: unknown[]) => {
+			// Canonical entry point for the Health surface — the palette, the Phase 3 banner CTA, and any
+			// future link all route through here, so the surface can move without breaking its callers.
+			const [arg] = args;
+			const source =
+				arg != null && typeof arg === 'object' && 'source' in arg
+					? (arg as { source?: Source }).source
+					: undefined;
+
+			// Untrusted workspaces block git execution outright, so the maintenance sub-provider would
+			// never populate — check this before the other gates so the message is unambiguous.
+			if (!workspace.isTrusted) {
+				void window.showInformationMessage('Repository Health requires a trusted workspace.');
+				return;
+			}
+
+			// The whole visualizations area (Health included) is behind this flag, so without it the command
+			// would silently open the graph on the timeline with no way to reach Health and no explanation.
+			if (!configuration.get('graph.experimental.visualizations.enabled')) {
+				const enable = 'Enable Visualizations';
+				const picked = await window.showInformationMessage(
+					'Repository Health is part of the Commit Graph visualizations, which are currently turned off.',
+					enable,
+					'Cancel',
+				);
+				if (picked !== enable) return;
+
+				await configuration.updateEffective('graph.experimental.visualizations.enabled', true);
+			}
+
+			// With optimizations off, every probe in gitHealthService short-circuits, so the view would
+			// render an all-clear for a repo it never examined instead of the real report.
+			if (configuration.get('gitOptimizations.enabled') !== true) {
+				const enable = 'Enable Git Optimizations';
+				const picked = await window.showInformationMessage(
+					'Repository Health requires Git optimizations, which are currently turned off.',
+					enable,
+					'Cancel',
+				);
+				if (picked !== enable) return;
+
+				await configuration.updateEffective('gitOptimizations.enabled', true);
+			}
+
+			// Health needs the maintenance sub-provider, which is absent on web builds, virtual repos, and
+			// Live Share guests. Select a concrete supported repository rather than merely proving one
+			// exists — the graph otherwise keeps whatever repo it currently has selected (e.g. a virtual
+			// repo in a mixed workspace), which silently falls back to Timeline. An empty workspace falls
+			// through and lets the graph handle its own empty state.
+			const { openRepositories } = container.git;
+			const best = container.git.getBestRepositoryOrFirst();
+			const repository =
+				best?.git.maintenance != null ? best : openRepositories.find(r => r.git.maintenance != null);
+			if (openRepositories.length > 0 && repository == null) {
+				void window.showInformationMessage(
+					"Repository Health isn't available here — it requires a local repository with Git installed.",
+				);
+				return;
+			}
+
+			const showingArg = {
+				visualization: 'health',
+				repository: repository,
+				source: source,
+			} satisfies GraphWebviewShowingArgs[0];
+
+			// The view command forwards its raw args straight through as showing-args, so it must NOT be
+			// given a leading options object — only the panel command takes one. Mirrors `gitlens.showGraph`.
+			if (configuration.get('graph.layout') === 'panel') {
+				await executeCommand('gitlens.showGraphView', showingArg);
+				return;
+			}
+
+			await executeCommand<WebviewPanelShowCommandArgs>('gitlens.showGraphPage', { source: source }, showingArg);
+		}),
 		registerCommand('gitlens.showGraph', (...args: unknown[]) => {
 			const [arg] = args;
 
@@ -223,11 +343,26 @@ export function registerGraphWebviewCommands<T>(
 				return;
 			}
 
+			const source =
+				arg != null && typeof arg === 'object' && 'source' in arg
+					? (arg as { source?: Source }).source
+					: undefined;
+
+			// An action (e.g. `enter-compose` from a recompose command) targets the graph the user
+			// can see — route through the same instance-aware selection as `showInCommitGraph`, so
+			// acting from a tree view doesn't open a second graph in the other surface.
+			if (arg != null && typeof arg === 'object' && 'action' in arg) {
+				showOnBestGraphSurface({ source: source }, arg as GraphWebviewShowingArgs[0]);
+				return;
+			}
+
 			if (configuration.get('graph.layout') === 'panel') {
+				// Panel-layout source-forwarding is deferred: `container.views.graph.show({ source }, ...args)`
+				// doesn't typecheck here since `args` is `unknown[]`, not the `WebviewShowingArgs` tuple.
 				return executeCommand('gitlens.showGraphView', ...args);
 			}
 
-			return executeCommand<WebviewPanelShowCommandArgs>('gitlens.showGraphPage', undefined, ...args);
+			return executeCommand<WebviewPanelShowCommandArgs>('gitlens.showGraphPage', { source: source }, ...args);
 		}),
 		registerCommand(`${panels.id}.switchToEditorLayout`, async () => {
 			await configuration.updateEffective('graph.layout', 'editor');
@@ -238,25 +373,7 @@ export function registerGraphWebviewCommands<T>(
 		}),
 		registerCommand(`${panels.id}.switchToPanelLayout`, async () => {
 			await configuration.updateEffective('graph.layout', 'panel');
-			queueMicrotask(async () => {
-				await executeCoreCommand('gitlens.views.graph.resetViewLocation');
-				void executeCommand('gitlens.showGraphView');
-			});
-		}),
-		registerCommand('gitlens.toggleGraph', (...args: any[]) => {
-			if (getContext('gitlens:webviewView:graph:visible')) {
-				void executeCoreCommand('workbench.action.closePanel');
-			} else {
-				void executeCommand('gitlens.showGraphView', ...args);
-			}
-		}),
-		registerCommand('gitlens.toggleMaximizedGraph', (...args: any[]) => {
-			if (getContext('gitlens:webviewView:graph:visible')) {
-				void executeCoreCommand('workbench.action.toggleMaximizedPanel');
-			} else {
-				void executeCommand('gitlens.showGraphView', ...args);
-				void executeCoreCommand('workbench.action.toggleMaximizedPanel');
-			}
+			queueMicrotask(() => void executeCommand('gitlens.showGraphView'));
 		}),
 		registerCommand('gitlens.showInCommitGraph', showInCommitGraph),
 		registerCommand('gitlens.showInCommitGraphView', (args: ShowInCommitGraphCommandArgs) => {

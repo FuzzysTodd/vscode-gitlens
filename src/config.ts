@@ -1,3 +1,4 @@
+import type { GraphStyle } from '@gitkraken/commit-graph/view.js';
 import type { AIProviderAndModel, SupportedAIModels } from '@gitlens/ai/constants.js';
 import type { DateTimeFormat } from '@gitlens/utils/date.js';
 import type { GroupableTreeViewTypes } from './constants.views.js';
@@ -8,7 +9,6 @@ export interface Config {
 	readonly autolinks: AutolinkConfig[] | null;
 	readonly blame: BlameConfig;
 	readonly changes: ChangesConfig;
-	readonly cloudIntegrations: CloudIntegrationsConfig;
 	readonly cloudPatches: CloudPatchesConfig;
 	readonly codeLens: CodeLensConfig;
 	readonly currentLine: CurrentLineConfig;
@@ -26,6 +26,7 @@ export interface Config {
 	readonly fileAnnotations: FileAnnotationsConfig;
 	readonly gitCommands: GitCommandsConfig;
 	readonly gitkraken: GitKrakenConfig;
+	readonly gitOptimizations: GitOptimizationsConfig;
 	readonly graph: GraphConfig;
 	readonly heatmap: HeatmapConfig;
 	readonly hovers: HoversConfig;
@@ -36,6 +37,7 @@ export interface Config {
 	readonly menus: boolean | MenuConfig;
 	readonly mode: ModeConfig;
 	readonly modes: ModesConfig | null;
+	readonly openInTerminalLocation: 'panel' | 'editor';
 	readonly partners: PartnersConfig | null;
 	readonly plusFeatures: PlusFeaturesConfig;
 	readonly rebaseEditor: RebaseEditorConfig;
@@ -47,6 +49,7 @@ export interface Config {
 	readonly sortTagsBy: TagSorting;
 	readonly sortRepositoriesBy: RepositoriesSorting;
 	readonly sortWorktreesBy: WorktreeSorting;
+	readonly sortWorkingChangesBy: WorkingChangesSorting;
 	readonly statusBar: StatusBarConfig;
 	readonly strings: StringsConfig;
 	readonly telemetry: TelemetryConfig;
@@ -93,6 +96,7 @@ export type ContributorSorting =
 	| 'score:asc';
 export type RepositoriesSorting = 'discovered' | 'lastFetched:desc' | 'lastFetched:asc' | 'name:asc' | 'name:desc';
 export type WorktreeSorting = 'date:desc' | 'date:asc' | 'name:asc' | 'name:desc';
+export type WorkingChangesSorting = 'stage' | 'flat';
 export type CustomRemoteType =
 	| 'AzureDevOps'
 	| 'Bitbucket'
@@ -109,6 +113,7 @@ export type DateStyle = 'absolute' | 'relative';
 export type FileAnnotationType = 'blame' | 'changes' | 'heatmap';
 export type GitCommandSorting = 'name' | 'usage';
 export type GraphBranchesVisibility = 'all' | 'smart' | 'current' | 'favorited' | 'agents';
+export type GraphActivityDecay = '30s' | '1m' | '2m' | '5m' | '10m' | '30m';
 export type GraphMultiSelectionMode = boolean | 'topological';
 export type GraphScrollMarkersAdditionalTypes =
 	| 'localBranches'
@@ -117,6 +122,8 @@ export type GraphScrollMarkersAdditionalTypes =
 	| 'tags'
 	| 'pullRequests'
 	| 'wip';
+export type GraphMinimapDefaultVisibility = 'hidden' | 'onSearch' | 'always';
+export type GraphOverviewBarVisibility = 'always' | 'worktrees' | 'dirtyWorktrees' | 'never';
 export type GraphMinimapMarkersAdditionalTypes =
 	| 'localBranches'
 	| 'remoteBranches'
@@ -219,6 +226,10 @@ interface AIConfig {
 	readonly enabled: boolean;
 	readonly openInAgent: 'ask' | 'manual' | 'agent';
 	readonly defaultAgent: string | null;
+	readonly autoRebase: {
+		/** Minimum AI confidence (0–1) required to auto-apply a conflict resolution during an automatic rebase */
+		readonly confidenceThreshold: number;
+	};
 	readonly exclude: {
 		/** Glob patterns for files to exclude from AI prompts (like files.exclude). May be undefined on extension upgrade due to VS Code bug. */
 		readonly files: Record<string, boolean> | undefined;
@@ -252,13 +263,13 @@ interface AIConfig {
 	readonly generateCreateCloudPatch: {
 		readonly customInstructions: string;
 	};
-	readonly generateCreateCodeSuggest: {
-		readonly customInstructions: string;
-	};
 	readonly generateCreatePullRequest: {
 		readonly customInstructions: string;
 	};
 	readonly generateSearchQuery: {
+		readonly customInstructions: string;
+	};
+	readonly resolveConflicts: {
 		readonly customInstructions: string;
 	};
 	readonly gitkraken: {
@@ -320,10 +331,6 @@ interface BlameConfig {
 interface ChangesConfig {
 	readonly locations: ChangesLocations[];
 	/*readonly*/ toggleMode: AnnotationsToggleMode;
-}
-
-interface CloudIntegrationsConfig {
-	readonly enabled: boolean;
 }
 
 interface CloudPatchesConfig {
@@ -415,6 +422,10 @@ interface GitKrakenMcpConfig {
 	};
 }
 
+export interface GitOptimizationsConfig {
+	readonly enabled: boolean;
+}
+
 export interface GraphConfig {
 	readonly allowMultiple: boolean;
 	readonly autoFetch: {
@@ -422,12 +433,17 @@ export interface GraphConfig {
 	};
 	readonly avatars: boolean;
 	readonly branchesVisibility: GraphBranchesVisibility;
+	readonly changesColumn: {
+		readonly enabled: boolean;
+		readonly mode: 'numbers' | 'squares' | 'bar' | 'bipolar';
+	};
 	readonly commitOrdering: 'date' | 'author-date' | 'topo';
 	readonly dateFormat: DateTimeFormat | string | null;
 	readonly dateStyle: DateStyle | null;
 	readonly defaultItemLimit: number;
 	readonly details: {
-		readonly location: 'right' | 'bottom';
+		readonly location: 'auto' | 'right' | 'bottom';
+		readonly maximizeOnMode: boolean;
 	};
 	readonly dimMergeCommits: boolean;
 	readonly editorOpeningBehavior: 'auto' | 'active';
@@ -437,25 +453,52 @@ export interface GraphConfig {
 		};
 		readonly visualizations: {
 			readonly enabled: boolean;
+			readonly activityDecay: GraphActivityDecay;
 		};
 	};
-	readonly highlightRowsOnRefHover: boolean;
+	readonly followTerminal: {
+		readonly enabled: boolean;
+		readonly allowRepositorySwitching: boolean;
+	};
 	readonly initialRowSelection: 'head' | 'wip';
 	readonly issues: {
 		readonly enabled: boolean;
 	};
+	readonly lanes: {
+		readonly folding: {
+			readonly enabled: boolean;
+			readonly default: 'none' | 'all' | 'auto';
+		};
+		readonly density: 'expanded' | 'compact';
+		readonly grouped: {
+			readonly min: number;
+			readonly max: number;
+		};
+	};
 	readonly layout: 'editor' | 'panel';
 	readonly minimap: {
+		/** Whether the minimap is available at all — when `false` it is never shown and has no header toggle */
 		readonly enabled: boolean;
+		/** When to show an available minimap; the stored per-workspace toggle overrides this */
+		readonly defaultVisibility: GraphMinimapDefaultVisibility;
 		readonly dataType: 'commits' | 'lines';
 		readonly additionalTypes: GraphMinimapMarkersAdditionalTypes[];
 		readonly reversed: boolean;
 	};
 	readonly multiselect: GraphMultiSelectionMode;
 	readonly onlyFollowFirstParent: boolean;
+	readonly overviewBar: {
+		readonly visibility: GraphOverviewBarVisibility;
+	};
 	readonly pageItemLimit: number;
 	readonly pullRequests: {
 		readonly enabled: boolean;
+	};
+	readonly refFindAutoHide: boolean;
+	readonly refs: {
+		readonly maxInline: number | 'auto';
+		readonly maxStacked: number | 'auto';
+		readonly layout: 'inline' | 'stacked';
 	};
 	readonly scrollMarkers: {
 		readonly enabled: boolean;
@@ -467,6 +510,7 @@ export interface GraphConfig {
 	readonly showGhostRefsOnRowHover: boolean;
 	readonly showRemoteNames: boolean;
 	readonly showUpstreamStatus: boolean;
+	readonly showWorkingTreeBadge: boolean;
 	readonly showWorktreeWipStats: boolean;
 	readonly sidebar: {
 		readonly enabled: boolean;
@@ -476,6 +520,8 @@ export interface GraphConfig {
 		readonly enabled: boolean;
 	};
 	readonly stickyTimeline: boolean;
+	readonly style: GraphStyle;
+	readonly timelineSeparators: boolean;
 }
 
 interface HeatmapConfig {
@@ -678,7 +724,7 @@ interface PlusFeaturesConfig {
 interface RebaseEditorConfig {
 	readonly density: 'compact' | 'comfortable';
 	readonly openBehavior: 'auto' | 'beside';
-	readonly openOnPausedRebase: boolean | 'interactive';
+	readonly openOnPausedRebase: boolean | 'auto' | 'interactive';
 	readonly ordering: 'asc' | 'desc';
 	readonly revealLocation: 'graph' | 'inspect';
 	readonly revealBehavior: 'onDoubleClick' | 'onSelection';
@@ -716,6 +762,7 @@ export interface RemotesUrlsConfig {
 	readonly fileInCommit: string;
 	readonly fileLine: string;
 	readonly fileRange: string;
+	readonly avatar?: string;
 }
 
 interface SigningConfig {
@@ -756,6 +803,8 @@ interface TerminalConfig {
 
 interface TerminalLinksConfig {
 	readonly enabled: boolean;
+	readonly showIn: 'graph' | 'inspect' | 'quickpick';
+	/** @deprecated use {@link showIn} */
 	readonly showDetailsView: boolean;
 }
 
@@ -1097,7 +1146,7 @@ interface VisualHistoryConfig {
 
 interface WorktreesConfig {
 	readonly defaultLocation: string | null;
-	readonly openAfterCreate: 'always' | 'alwaysNewWindow' | 'onlyWhenEmpty' | 'never' | 'prompt';
+	readonly openAfterCreate: 'newWindow' | 'currentWindow' | 'addToWorkspace' | 'none' | 'onlyWhenEmpty';
 	readonly promptForLocation: boolean;
 }
 

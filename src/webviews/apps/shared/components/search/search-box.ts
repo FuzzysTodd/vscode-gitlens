@@ -1,5 +1,5 @@
 import type { TemplateResult } from 'lit';
-import { css, html } from 'lit';
+import { css, html, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
 import { when } from 'lit/directives/when.js';
@@ -7,16 +7,18 @@ import type { Disposable } from 'vscode';
 import { isMac } from '@env/platform.js';
 import type { SearchQuery } from '@gitlens/git/models/search.js';
 import { pluralize } from '@gitlens/utils/string.js';
+import type { GraphSearchRelaxation } from '../../../../plus/graph/protocol.js';
 import type { AppState } from '../../../plus/graph/context.js';
 import { DOM } from '../../dom.js';
 import { GlElement } from '../element.js';
 import type { GlSearchInput, SearchModeChangeEventDetail, SearchNavigationEventDetail } from './search-input.js';
 import '../button.js';
+import '../actions/action-nav.js';
 import '../code-icon.js';
 import '../overlays/tooltip.js';
 import './search-input.js';
 
-export { SearchModeChangeEventDetail, SearchNavigationEventDetail };
+export type { SearchModeChangeEventDetail, SearchNavigationEventDetail };
 
 declare global {
 	interface HTMLElementTagNameMap {
@@ -27,6 +29,7 @@ declare global {
 		'gl-search-openinview': CustomEvent<void>;
 		'gl-search-pause': CustomEvent<void>;
 		'gl-search-resume': CustomEvent<void>;
+		'gl-search-exit': CustomEvent<void>;
 	}
 }
 
@@ -34,15 +37,16 @@ declare global {
 export class GlSearchBox extends GlElement {
 	static override styles = css`
 		:host {
-			display: inline-flex;
-			flex-direction: row;
-			align-items: center;
-			gap: 0.8rem;
-			color: var(--color-foreground);
-			flex: 1 100 auto;
-			min-width: 16rem;
 			position: relative;
+			display: inline-flex;
+			flex: 1 100 auto;
+			flex-direction: row;
+			gap: var(--gl-space-8);
+			align-items: center;
+			min-width: 16rem;
+			color: var(--color-foreground);
 		}
+
 		:host(:focus) {
 			outline: 0;
 		}
@@ -50,23 +54,28 @@ export class GlSearchBox extends GlElement {
 		.search-navigation {
 			display: inline-flex;
 			flex-direction: row;
-			align-items: center;
 			gap: 0.3rem;
+			align-items: center;
 			color: var(--color-foreground);
 		}
+
 		.search-navigation:focus {
 			outline: 0;
 		}
 
+		.search-navigation action-nav {
+			display: contents;
+		}
+
 		.count {
 			flex: 0 1 auto;
-			margin-right: 0.4rem;
-			font-size: 1.2rem;
 			min-width: 0;
 			max-width: 12ch;
-			white-space: nowrap;
+			margin-right: var(--gl-space-4);
 			overflow: hidden;
 			text-overflow: ellipsis;
+			font-size: var(--gl-font-md);
+			white-space: nowrap;
 		}
 
 		.count.error {
@@ -78,26 +87,31 @@ export class GlSearchBox extends GlElement {
 			height: 2.4rem;
 			padding: 0;
 			color: inherit;
-			border: none;
-			border-radius: 3px;
-			background: none;
 			text-align: center;
+			background: none;
+			border: none;
+			border-radius: var(--gl-radius-sm);
 		}
+
 		.button[disabled] {
 			color: var(--vscode-disabledForeground);
 		}
+
 		.button:focus {
-			background-color: var(--vscode-toolbar-activeBackground);
-			outline: 1px solid var(--vscode-focusBorder);
+			outline: var(--gl-border-width) solid var(--vscode-focusBorder);
 			outline-offset: -1px;
+			background-color: var(--vscode-toolbar-activeBackground);
 		}
+
 		.button:not([disabled]) {
 			cursor: pointer;
 		}
+
 		.button:hover:not([disabled]) {
 			color: var(--vscode-foreground);
 			background-color: var(--vscode-toolbar-hoverBackground);
 		}
+
 		.button > code-icon[icon='arrow-up'] {
 			transform: translateX(-0.1rem);
 		}
@@ -107,6 +121,7 @@ export class GlSearchBox extends GlElement {
 			100% {
 				transform: translateY(0) translateX(-0.1rem);
 			}
+
 			50% {
 				transform: translateY(-0.3rem) translateX(-0.1rem);
 			}
@@ -117,17 +132,18 @@ export class GlSearchBox extends GlElement {
 			100% {
 				transform: translateY(0);
 			}
+
 			50% {
 				transform: translateY(0.3rem);
 			}
 		}
 
 		.button.navigating > code-icon[icon='arrow-up'] {
-			animation: bounce-up 0.6s ease-in-out 0.15s infinite;
+			animation: bounce-up 0.6s var(--gl-ease-in-out) 0.15s infinite;
 		}
 
 		.button.navigating > code-icon[icon='arrow-down'] {
-			animation: bounce-down 0.6s ease-in-out 0.15s infinite;
+			animation: bounce-down 0.6s var(--gl-ease-in-out) 0.15s infinite;
 		}
 
 		.sr-hidden {
@@ -135,13 +151,12 @@ export class GlSearchBox extends GlElement {
 		}
 
 		.sr-only {
-			clip: rect(0 0 0 0);
-			clip-path: inset(50%);
+			position: absolute;
+			width: 1px;
 			height: 1px;
 			overflow: hidden;
-			position: absolute;
 			white-space: nowrap;
-			width: 1px;
+			clip-path: inset(50%);
 		}
 
 		.search-button {
@@ -171,6 +186,22 @@ export class GlSearchBox extends GlElement {
 
 	@property({ type: Boolean }) aiAllowed = true;
 	@property({ type: String }) errorMessage = '';
+	/** Renders {@link errorMessage} in calm/info styling instead of error/red — a ref name that's
+	 *  merely incomplete mid-typing (`reason === 'invalidRef'`), not a real error. */
+	@property({ type: Boolean }) errorCalm = false;
+	/** The active search's pattern failed to compile as regex and matched literally instead — dims the
+	 *  regex toggle (still checked) rather than flipping it off. */
+	@property({ type: Boolean }) fallbackActive = false;
+	@property({ type: String }) fallbackDetail = '';
+	/** The settled (non-partial) search used the literal fallback and found nothing — offers a
+	 *  "Match literally" action in the message area instead of a bare zero-results count. */
+	@property({ type: Boolean }) showFallbackHelper = false;
+	@property({ type: Array }) relaxations: GraphSearchRelaxation[] = [];
+	/** The settled (non-partial) NL search found nothing but has counted relaxation offers — renders
+	 *  them as calm inline chips instead of a bare zero-results count. */
+	@property({ type: Boolean }) showRelaxationsHelper = false;
+	/** The active error is an unavailable-AI NL failure — offers a "Search as text instead" action. */
+	@property({ type: Boolean }) showSearchAsTextHelper = false;
 	@property({ type: Boolean }) filter = false;
 	@property({ type: Boolean }) matchAll = false;
 	@property({ type: Boolean }) matchCase = false;
@@ -234,8 +265,8 @@ export class GlSearchBox extends GlElement {
 		this.emit('gl-search-navigate', { direction: direction });
 	}
 
-	logSearch(query: SearchQuery): void {
-		void this.searchInput?.logSearch(query);
+	logSearch(query: SearchQuery, options?: { store?: boolean }): void {
+		void this.searchInput?.logSearch(query, options);
 	}
 
 	setSearchQuery(query: string): void {
@@ -257,6 +288,13 @@ export class GlSearchBox extends GlElement {
 		this.searchInput?.setExternalSearchQuery(search);
 	}
 
+	/** Restores only the filter toggle — see `search-input`'s `setExternalFilter` for why this must
+	 *  never carry the query text. */
+	setExternalFilter(filter: boolean): void {
+		this.filter = filter;
+		this.searchInput?.setExternalFilter(filter);
+	}
+
 	async pickAuthors(): Promise<void> {
 		await this.searchInput?.pickAuthors();
 	}
@@ -274,7 +312,7 @@ export class GlSearchBox extends GlElement {
 	}
 
 	private handleShortcutKeys(e: KeyboardEvent) {
-		if (e.altKey) return;
+		if (e.defaultPrevented || e.altKey || this.inert) return;
 
 		if ((e.key === 'F3' && !e.ctrlKey && !e.metaKey) || (e.key === 'g' && e.metaKey && !e.ctrlKey && isMac)) {
 			e.preventDefault();
@@ -316,7 +354,37 @@ export class GlSearchBox extends GlElement {
 		this.emit('gl-search-cancel', { preserveResults: this.total > 0 });
 	}
 
-	private get resultsHtml() {
+	/** The optional stop (while searching) / resume (while paused) button that leads the roving navigation group. */
+	private get progressButton() {
+		if (this.searching) {
+			return html`<gl-button
+				class="search-button"
+				appearance="toolbar"
+				tooltip="Stop Searching"
+				@click="${this.handleCancel}"
+			>
+				<code-icon class="search-button__spinner" icon="loading" modifier="spin"></code-icon>
+				<code-icon class="search-button__stop" icon="stop-circle"></code-icon>
+			</gl-button>`;
+		}
+
+		// Show play button when search is paused with more results
+		if (!this.searching && this.resultsHasMore) {
+			return html`<gl-button
+				class="search-button"
+				appearance="toolbar"
+				tooltip="Resume Search"
+				@click="${() => this.emit('gl-search-resume')}"
+			>
+				<code-icon icon="play-circle"></code-icon>
+			</gl-button>`;
+		}
+
+		return nothing;
+	}
+
+	/** The non-focusable results count, rendered OUTSIDE the roving navigation group. */
+	private get resultsCount() {
 		// Determine the display state based on searching and results
 		const hasResults = this.total > 0;
 		const isSearching = this.searching;
@@ -357,45 +425,6 @@ export class GlSearchBox extends GlElement {
 			countText = html`<span></span>`;
 		}
 
-		// Show combined spinner/stop button when actively searching
-		if (isSearching) {
-			return html`<gl-button
-					class="search-button"
-					appearance="toolbar"
-					tooltip="Stop Searching"
-					@click="${this.handleCancel}"
-				>
-					<code-icon class="search-button__spinner" icon="loading" modifier="spin"></code-icon>
-					<code-icon class="search-button__stop" icon="stop-circle"></code-icon>
-				</gl-button>
-				<gl-tooltip
-					placement="top"
-					?disabled="${!tooltip}"
-					class="count${!hasResults && this.valid && isComplete ? ' error' : ''}"
-					>${countText}<span slot="content">${tooltip}</span></gl-tooltip
-				>`;
-		}
-
-		// Show play button when search is paused with more results
-		const isPaused = !isSearching && this.resultsHasMore;
-		if (isPaused) {
-			return html`<gl-button
-					class="search-button"
-					appearance="toolbar"
-					tooltip="Resume Search"
-					@click="${() => this.emit('gl-search-resume')}"
-				>
-					<code-icon icon="play-circle"></code-icon>
-				</gl-button>
-				<gl-tooltip
-					placement="top"
-					?disabled="${!tooltip}"
-					class="count${!hasResults && this.valid && isComplete ? ' error' : ''}"
-					>${countText}<span slot="content">${tooltip}</span></gl-tooltip
-				>`;
-		}
-
-		// Not searching - just show results
 		return html`<gl-tooltip
 			placement="top"
 			?disabled="${!tooltip}"
@@ -410,6 +439,13 @@ export class GlSearchBox extends GlElement {
 				exportparts="search: search"
 				?aiAllowed="${this.aiAllowed}"
 				.errorMessage="${this.errorMessage}"
+				?errorCalm="${this.errorCalm}"
+				?fallbackActive="${this.fallbackActive}"
+				.fallbackDetail="${this.fallbackDetail}"
+				?showFallbackHelper="${this.showFallbackHelper}"
+				.relaxations="${this.relaxations}"
+				?showRelaxationsHelper="${this.showRelaxationsHelper}"
+				?showSearchAsTextHelper="${this.showSearchAsTextHelper}"
 				?filter=${this.filter}
 				?matchAll="${this.matchAll}"
 				?matchCase="${this.matchCase}"
@@ -432,50 +468,57 @@ export class GlSearchBox extends GlElement {
 					e.stopImmediatePropagation();
 					this.emit('gl-search-pause');
 				}}"
+				@gl-search-exit="${(e: Event) => {
+					e.stopImmediatePropagation();
+					this.emit('gl-search-exit');
+				}}"
 			></gl-search-input>
 			${when(
 				this.resultsLoaded || this.searching,
 				() =>
-					html`<div class="search-navigation" aria-label="Search navigation">
-						${this.resultsHtml}
-						<gl-tooltip>
-							<button
-								type="button"
-								class="button ${this.navigating === 'previous' ? 'navigating' : ''}"
-								?disabled="${!this.hasResults || this.isAtFirstResult}"
-								@click="${this.handlePrevious}"
-							>
-								<code-icon
-									icon="arrow-up"
-									aria-label="Previous Match (Shift+Enter)&#10;First Match (Shift+Click)"
-								></code-icon>
-							</button>
-							<span slot="content">Previous Match (Shift+Enter)<br />First Match (Shift+Click)</span>
-						</gl-tooltip>
-						<gl-tooltip>
-							<button
-								type="button"
-								class="button ${this.navigating === 'next' ? 'navigating' : ''}"
-								?disabled="${!this.hasResults || this.isAtLastResult}"
-								@click="${this.handleNext}"
-							>
-								<code-icon
-									icon="arrow-down"
-									aria-label="Next Match (Enter)&#10;Last Match (Shift+Click)"
-								></code-icon>
-							</button>
-							<span slot="content">Next Match (Enter)<br />Last Match (Shift+Click)</span>
-						</gl-tooltip>
-						<gl-tooltip content="Show Results in Side Bar">
-							<button
-								type="button"
-								class="button"
-								?disabled="${!this.hasResults}"
-								@click="${this.handleOpenInView}"
-							>
-								<code-icon icon="link-external" aria-label="Show Results in Side Bar"></code-icon>
-							</button>
-						</gl-tooltip>
+					html`<div class="search-navigation">
+						${this.resultsCount}
+						<action-nav role="toolbar" aria-label="Search navigation">
+							${this.progressButton}
+							<gl-tooltip>
+								<button
+									type="button"
+									class="button ${this.navigating === 'previous' ? 'navigating' : ''}"
+									?disabled="${!this.hasResults || this.isAtFirstResult}"
+									@click="${this.handlePrevious}"
+								>
+									<code-icon
+										icon="arrow-up"
+										aria-label="Previous Match (Shift+Enter)&#10;First Match (Shift+Click)"
+									></code-icon>
+								</button>
+								<span slot="content">Previous Match (Shift+Enter)<br />First Match (Shift+Click)</span>
+							</gl-tooltip>
+							<gl-tooltip>
+								<button
+									type="button"
+									class="button ${this.navigating === 'next' ? 'navigating' : ''}"
+									?disabled="${!this.hasResults || this.isAtLastResult}"
+									@click="${this.handleNext}"
+								>
+									<code-icon
+										icon="arrow-down"
+										aria-label="Next Match (Enter)&#10;Last Match (Shift+Click)"
+									></code-icon>
+								</button>
+								<span slot="content">Next Match (Enter)<br />Last Match (Shift+Click)</span>
+							</gl-tooltip>
+							<gl-tooltip content="Show Results in Side Bar">
+								<button
+									type="button"
+									class="button"
+									?disabled="${!this.hasResults}"
+									@click="${this.handleOpenInView}"
+								>
+									<code-icon icon="link-external" aria-label="Show Results in Side Bar"></code-icon>
+								</button>
+							</gl-tooltip>
+						</action-nav>
 					</div>`,
 			)}`;
 	}

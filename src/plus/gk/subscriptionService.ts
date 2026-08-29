@@ -34,7 +34,6 @@ import { flatten } from '@gitlens/utils/object.js';
 import { pauseOnCancelOrTimeout } from '@gitlens/utils/promise.js';
 import { pluralize } from '@gitlens/utils/string.js';
 import { satisfies } from '@gitlens/utils/version.js';
-import type { OpenWalkthroughCommandArgs } from '../../commands/walkthroughs.js';
 import type { CoreColors } from '../../constants.colors.js';
 import type { GlCommands } from '../../constants.commands.js';
 import { urls } from '../../constants.js';
@@ -73,9 +72,15 @@ import { authenticationProviderScopes } from './authenticationProvider.js';
 import type { GKCheckInResponse } from './models/checkin.js';
 import type { Organization } from './models/organization.js';
 import type { Promo } from './models/promo.js';
-import type { PaidSubscriptionPlanIds, Subscription, SubscriptionUpgradeCommandArgs } from './models/subscription.js';
+import type {
+	PaidSubscriptionPlanIds,
+	Subscription,
+	SubscriptionLoginCommandArgs,
+	SubscriptionUpgradeCommandArgs,
+} from './models/subscription.js';
 import type { ServerConnection } from './serverConnection.js';
-import { ensurePlusFeaturesEnabled } from './utils/-webview/plus.utils.js';
+import { autoResetTrialIfEligible } from './trialAutoReset.js';
+import { arePlusFeaturesEnabled, ensurePlusFeaturesEnabled } from './utils/-webview/plus.utils.js';
 import { getConfiguredActiveOrganizationId, updateActiveOrganizationId } from './utils/-webview/subscription.utils.js';
 import { getSubscriptionFromCheckIn } from './utils/checkin.utils.js';
 import {
@@ -122,7 +127,6 @@ export class SubscriptionService implements Disposable {
 
 	private _disposable: Disposable;
 	private _subscription!: Subscription;
-	private _getCheckInData: () => Promise<GKCheckInResponse | undefined>;
 	private _statusBarSubscription: StatusBarItem | undefined;
 	private _validationTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -151,11 +155,6 @@ export class SubscriptionService implements Disposable {
 		);
 
 		const subscription = this.getStoredSubscription();
-		this._getCheckInData = () => Promise.resolve(undefined);
-		if (subscription?.account?.id != null) {
-			this._getCheckInData = () => this.loadStoredCheckInData(subscription.account!.id);
-		}
-
 		this.changeSubscription(subscription, undefined, { silent: true });
 		setTimeout(() => void this.ensureSession(false, undefined), 10000);
 
@@ -220,7 +219,7 @@ export class SubscriptionService implements Disposable {
 
 					// Replace the next `onAuthenticationChanged` handler to avoid our own trigger below
 					const fn = this.onAuthenticationChanged;
-					// eslint-disable-next-line @typescript-eslint/require-await
+					// oxlint-disable-next-line typescript/require-await
 					this.onAuthenticationChanged = async () => {
 						this.onAuthenticationChanged = fn;
 					};
@@ -242,6 +241,7 @@ export class SubscriptionService implements Disposable {
 
 				m.registerAccountDebug(this.container, {
 					getSubscription: () => this._subscription,
+					getSession: () => this._session,
 					overrideFeaturePreviews: ({ day, durationSeconds }) => {
 						savedFeaturePreviewOverrides ??= {
 							getFn: this.getStoredFeaturePreview,
@@ -356,8 +356,12 @@ export class SubscriptionService implements Disposable {
 
 	private registerCommands(): Disposable[] {
 		return [
-			registerCommand('gitlens.plus.login', (src?: Source) => this.loginOrSignUp(false, src)),
-			registerCommand('gitlens.plus.signUp', (src?: Source) => this.loginOrSignUp(true, src)),
+			registerCommand('gitlens.plus.login', (args?: SubscriptionLoginCommandArgs) =>
+				this.loginOrSignUp(false, args, { openAccountView: args?.openAccountView }),
+			),
+			registerCommand('gitlens.plus.signUp', (args?: SubscriptionLoginCommandArgs) =>
+				this.loginOrSignUp(true, args, { openAccountView: args?.openAccountView }),
+			),
 			registerCommand('gitlens.plus.logout', (src?: Source) => this.logout(src)),
 			registerCommand('gitlens.plus.referFriend', (src?: Source) => this.referFriend(src)),
 			registerCommand('gitlens.gk.switchOrganization', (src?: Source) => this.switchOrganization(src)),
@@ -443,46 +447,6 @@ export class SubscriptionService implements Disposable {
 		return featurePreviews.map(f => this.getStoredFeaturePreview(f));
 	}
 
-	@trace()
-	async learnAboutPro(source: Source, originalSource: Source | undefined): Promise<void> {
-		if (originalSource != null) {
-			source.detail = {
-				...(typeof source.detail === 'string' ? { action: source.detail } : source.detail),
-				...flatten(originalSource, 'original'),
-			};
-		}
-
-		const subscription = await this.getSubscription();
-		switch (subscription.state) {
-			case SubscriptionState.VerificationRequired:
-			case SubscriptionState.Community:
-				void executeCommand<OpenWalkthroughCommandArgs>('gitlens.openWalkthrough', {
-					step: 'get-started-community',
-					source: source,
-				});
-				break;
-			case SubscriptionState.Trial:
-				void executeCommand<OpenWalkthroughCommandArgs>('gitlens.openWalkthrough', {
-					step: 'welcome-in-trial',
-					source: source,
-				});
-				break;
-			case SubscriptionState.TrialReactivationEligible:
-			case SubscriptionState.TrialExpired:
-				void executeCommand<OpenWalkthroughCommandArgs>('gitlens.openWalkthrough', {
-					step: 'welcome-in-trial-expired',
-					source: source,
-				});
-				break;
-			case SubscriptionState.Paid:
-				void executeCommand<OpenWalkthroughCommandArgs>('gitlens.openWalkthrough', {
-					step: 'welcome-paid',
-					source: source,
-				});
-				break;
-		}
-	}
-
 	private async showPlanMessage(source: Source | undefined) {
 		if (!(await this.ensureSession(false, source))) return;
 
@@ -504,6 +468,12 @@ export class SubscriptionService implements Disposable {
 
 			if (result === verify) {
 				void this.resendVerification(source);
+			} else if (result === confirm) {
+				// The email may have been verified while the modal was open, so re-check before moving on
+				await this.validate({ force: true }, source);
+				if (this._subscription.account?.verified) {
+					void this.showPlanMessage(source);
+				}
 			}
 		} else if (isSubscriptionPaid(this._subscription)) {
 			const learn: MessageItem = { title: 'Learn More' };
@@ -516,7 +486,7 @@ export class SubscriptionService implements Disposable {
 			);
 
 			if (result === learn) {
-				void this.learnAboutPro({ source: 'prompt', detail: { action: 'upgraded' } }, source);
+				void executeCommand('gitlens.showWelcomeView');
 			}
 		} else if (isSubscriptionTrial(this._subscription)) {
 			const days = getSubscriptionTimeRemaining(this._subscription, 'days') ?? 0;
@@ -536,7 +506,7 @@ export class SubscriptionService implements Disposable {
 			);
 
 			if (result === learn) {
-				void this.learnAboutPro({ source: 'prompt', detail: { action: 'trial-started' } }, source);
+				void executeCommand('gitlens.showWelcomeView');
 			}
 		} else {
 			const upgrade: MessageItem = { title: 'Upgrade to Pro' };
@@ -556,13 +526,17 @@ export class SubscriptionService implements Disposable {
 			if (result === upgrade) {
 				void this.upgrade('pro', source);
 			} else if (result === learn) {
-				void this.learnAboutPro({ source: 'prompt', detail: { action: 'trial-ended' } }, source);
+				void executeCommand('gitlens.showWelcomeView');
 			}
 		}
 	}
 
 	@debug()
-	async loginOrSignUp(signUp: boolean, source: Source | undefined): Promise<boolean> {
+	async loginOrSignUp(
+		signUp: boolean,
+		source: Source | undefined,
+		options?: { openAccountView?: boolean },
+	): Promise<boolean> {
 		if (!(await ensurePlusFeaturesEnabled())) return false;
 
 		if (this.container.telemetry.enabled) {
@@ -574,7 +548,12 @@ export class SubscriptionService implements Disposable {
 		}
 
 		const context = getTrackingContextFromSource(source);
-		return this.loginCore({ signUp: signUp, source: source, context: context });
+		return this.loginCore({
+			signUp: signUp,
+			source: source,
+			context: context,
+			openAccountView: options?.openAccountView,
+		});
 	}
 
 	async loginWithCode(authentication: { code: string; state?: string }, source?: Source): Promise<boolean> {
@@ -597,10 +576,15 @@ export class SubscriptionService implements Disposable {
 		source?: Source;
 		signIn?: { code: string; state?: string };
 		context?: TrackingContext;
+		openAccountView?: boolean;
 	}): Promise<boolean> {
 		// Abort any waiting authentication to ensure we can start a new flow
 		await this.container.accountAuthentication.abort();
-		void this.showAccountView();
+		// Skip revealing the Account view when the caller is already showing sign-in UI (e.g. the Graph's
+		// access screen) and only suppress it on an explicit `false` so all other callers keep the reveal.
+		if (options?.openAccountView !== false) {
+			void this.showAccountView();
+		}
 
 		const session = await this.ensureSession(true, options?.source, {
 			signIn: options?.signIn,
@@ -753,6 +737,30 @@ export class SubscriptionService implements Disposable {
 		}
 	}
 
+	/**
+	 * Attempts the one-time out-of-window Pro trial reset.
+	 * Remove along with the promo.
+	 */
+	@gate(() => '')
+	@debug()
+	async autoResetTrialIfEligible(source: Source): Promise<void> {
+		// Silent check on purpose — never prompt from this background path
+		if (!arePlusFeaturesEnabled()) return;
+
+		return autoResetTrialIfEligible(
+			this.container,
+			this.connection,
+			{
+				getSubscription: () => this.getSubscription(),
+				ensureSession: () => this.ensureSession(false, source),
+				refreshSubscription: async session => {
+					await this.checkInAndValidate(session, source, { force: true });
+				},
+			},
+			source,
+		);
+	}
+
 	@debug()
 	async referFriend(source: Source | undefined): Promise<void> {
 		if (this.container.telemetry.enabled) {
@@ -840,9 +848,7 @@ export class SubscriptionService implements Disposable {
 	async showAccountView(silent: boolean = false): Promise<void> {
 		if (silent && !configuration.get('plusFeatures.enabled', undefined, true)) return;
 
-		if (!this.container.views.home.visible) {
-			await executeCommand('gitlens.showAccountView');
-		}
+		await executeCommand('gitlens.showAccountView');
 	}
 
 	@debug()
@@ -1068,21 +1074,15 @@ export class SubscriptionService implements Disposable {
 			);
 
 			if (!rsp.ok) {
-				this._getCheckInData = () => Promise.resolve(undefined);
 				throw new AccountValidationError('Unable to validate account', undefined, rsp.status, rsp.statusText);
 			}
 
 			this._onDidCheckIn.fire({ force: force });
 
 			const data: GKCheckInResponse = (await rsp.json()) as GKCheckInResponse;
-			this._getCheckInData = () => Promise.resolve(data);
-			this.storeCheckInData(data);
-
-			await this.validateAndUpdateSubscriptions(data, session, source);
+			await this.validateAndUpdateSubscriptions(data, session, source, organizationId);
 			return data;
 		} catch (ex) {
-			this._getCheckInData = () => Promise.resolve(undefined);
-
 			scope?.error(ex);
 			debugger;
 
@@ -1112,67 +1112,39 @@ export class SubscriptionService implements Disposable {
 		);
 	}
 
-	private storeCheckInData(data: GKCheckInResponse): void {
-		if (data.user?.id == null) return;
-
-		void this.container.storage
-			.store(`gk:${data.user.id}:checkin`, {
-				v: 1,
-				timestamp: Date.now(),
-				data: data,
-			})
-			.catch();
-	}
-
-	@trace()
-	private async loadStoredCheckInData(userId: string): Promise<GKCheckInResponse | undefined> {
-		const scope = getScopedLogger();
-
-		const storedCheckIn = this.container.storage.get(`gk:${userId}:checkin`);
-		// If more than a day old, ignore
-		if (storedCheckIn?.timestamp == null || Date.now() - storedCheckIn.timestamp > 24 * 60 * 60 * 1000) {
-			// Attempt a check-in to see if we can get a new one
-			const session = await this.getAuthenticationSession(false);
-			if (session == null) return undefined;
-
-			try {
-				return await this.checkInAndValidate(session, undefined, { force: true });
-			} catch (ex) {
-				scope?.error(ex);
-				return undefined;
-			}
-		}
-
-		return storedCheckIn?.data;
-	}
-
 	@trace()
 	private async validateAndUpdateSubscriptions(
 		data: GKCheckInResponse,
 		session: AuthenticationSession,
 		source: Source | undefined,
+		organizationId?: string,
 	): Promise<void> {
 		const scope = getScopedLogger();
-		let organizations: Organization[];
+		let organizations: Organization[] | undefined;
 		try {
 			organizations =
 				(await this.container.organizations.getOrganizations({
 					force: true,
 					accessToken: session.accessToken,
 					userId: session.account.id,
-				})) ?? [];
+				})) ?? undefined;
 		} catch (ex) {
 			scope?.error(ex);
-			organizations = [];
+			organizations = undefined;
 		}
-		let chosenOrganizationId = getConfiguredActiveOrganizationId();
+		let chosenOrganizationId = organizationId ?? getConfiguredActiveOrganizationId();
 		if (chosenOrganizationId === '') {
 			chosenOrganizationId = undefined;
-		} else if (chosenOrganizationId != null && !organizations.some(o => o.id === chosenOrganizationId)) {
+		} else if (
+			chosenOrganizationId != null &&
+			organizations != null &&
+			!organizations.some(o => o.id === chosenOrganizationId)
+		) {
+			// Only reset the chosen organization when the fetched list actually excludes it, not when the list couldn't be fetched
 			chosenOrganizationId = undefined;
 			void updateActiveOrganizationId(undefined);
 		}
-		const subscription = getSubscriptionFromCheckIn(data, organizations, chosenOrganizationId);
+		const subscription = getSubscriptionFromCheckIn(data, organizations ?? [], chosenOrganizationId);
 		this._lastValidatedDate = new Date();
 		this.changeSubscription(
 			{
@@ -1206,24 +1178,22 @@ export class SubscriptionService implements Disposable {
 		if (!options?.force && this._session != null) return this._session;
 		if (this._session === null && !createIfNeeded) return undefined;
 
-		if (this._sessionPromise === undefined) {
-			this._sessionPromise = this.getOrCreateSession(createIfNeeded, source, {
-				signUp: options?.signUp,
-				signIn: options?.signIn,
-				context: options?.context,
-			}).then(
-				s => {
-					this._session = s;
-					this._sessionPromise = undefined;
-					return this._session;
-				},
-				() => {
-					this._session = null;
-					this._sessionPromise = undefined;
-					return this._session;
-				},
-			);
-		}
+		this._sessionPromise ??= this.getOrCreateSession(createIfNeeded, source, {
+			signUp: options?.signUp,
+			signIn: options?.signIn,
+			context: options?.context,
+		}).then(
+			s => {
+				this._session = s;
+				this._sessionPromise = undefined;
+				return this._session;
+			},
+			() => {
+				this._session = null;
+				this._sessionPromise = undefined;
+				return this._session;
+			},
+		);
 
 		const session = await this._sessionPromise;
 		return session ?? undefined;
@@ -1632,23 +1602,9 @@ export class SubscriptionService implements Disposable {
 			return;
 		}
 
-		const checkInData = await this._getCheckInData();
-		if (checkInData == null) return;
-
-		const organizationSubscription = getSubscriptionFromCheckIn(checkInData, organizations, pick.org.id);
-
 		if (getConfiguredActiveOrganizationId() !== pick.org.id) {
 			await updateActiveOrganizationId(pick.org.id);
 		}
-
-		this.changeSubscription(
-			{
-				...this._subscription,
-				...organizationSubscription,
-			},
-			source,
-			{ store: true },
-		);
 	}
 
 	@info()

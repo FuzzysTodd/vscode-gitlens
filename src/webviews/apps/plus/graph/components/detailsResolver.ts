@@ -1,15 +1,22 @@
 import type { Remote } from '@eamodio/supertalk';
-import type { BranchComparisonOptions, GraphServices, ScopeSelection } from '../../../../plus/graph/graphService.js';
+import type {
+	BranchComparisonOptions,
+	ComposeSessionKey,
+	GraphServices,
+	ScopeSelection,
+} from '../../../../plus/graph/graphService.js';
+import { initialPastAgentSessionLimit } from '../../../shared/agentUtils.js';
 import { createResource } from '../../../shared/state/resource.js';
 import type { DetailsResources, ResolvedServices } from './detailsActions.js';
 import { DetailsActions } from './detailsActions.js';
 import type { DetailsState } from './detailsState.js';
 
 /**
- * Resolves all remote sub-services for the Graph Details panel, wraps them into the
- * `DetailsResources` bag of RPC-backed resources, and constructs the `DetailsActions`
- * orchestrator. The Lit element that mounts the panel should call this and then kick
- * off initial fetches — service resolution itself is not an element concern.
+ * Resolves the remote sub-services needed for the Graph Details panel's initial state,
+ * wraps them into the `DetailsResources` bag of RPC-backed resources, and constructs the
+ * `DetailsActions` orchestrator. The Agents service remains deferred until agent history
+ * is fetched. The Lit element that mounts the panel should call this and then kick off
+ * initial fetches — service resolution itself is not an element concern.
  *
  * Keeping this out of the element keeps the component focused on render routing and
  * lifecycle, and makes the resource wiring reviewable in isolation.
@@ -18,6 +25,7 @@ export async function resolveDetailsActions(
 	services: Remote<GraphServices>,
 	state: DetailsState,
 ): Promise<DetailsActions> {
+	const agents = services.agents;
 	const [
 		files,
 		drafts,
@@ -51,6 +59,7 @@ export async function resolveDetailsActions(
 	]);
 
 	const resolved: ResolvedServices = {
+		agents: agents,
 		files: files,
 		drafts: drafts,
 		graphInspect: graphInspect,
@@ -73,6 +82,18 @@ export async function resolveDetailsActions(
 		),
 		wip: createResource((signal, repoPath: string, force?: boolean) =>
 			graphInspect.getWip(repoPath, signal, force),
+		),
+		pastAgentSessions: createResource(
+			async (signal, worktreePath: string, limit = initialPastAgentSessionLimit) => {
+				const service = await agents;
+				return service.getPastSessionsForWorktree(worktreePath, { limit: limit }, signal);
+			},
+		),
+		pastAgentSessionDetail: createResource(
+			async (signal, sessionId: string, providerId: string | undefined, cwd: string | undefined) => {
+				const service = await agents;
+				return service.getPastSessionDetail(sessionId, providerId, cwd, signal);
+			},
 		),
 		compare: createResource((signal, repoPath: string, fromSha: string, toSha: string) =>
 			graphInspect.getCompareDiff(repoPath, fromSha, toSha, signal),
@@ -104,11 +125,29 @@ export async function resolveDetailsActions(
 			(
 				signal,
 				repoPath: string,
+				sessionKey: ComposeSessionKey,
 				scope: ScopeSelection,
 				instructions: string | undefined,
 				excludedFiles: string[] | undefined,
 				aiExcludedFiles: string[] | undefined,
-			) => graphInspect.composeChanges(repoPath, scope, instructions, excludedFiles, aiExcludedFiles, signal),
+			) =>
+				graphInspect.composeChanges(
+					repoPath,
+					sessionKey,
+					scope,
+					instructions,
+					excludedFiles,
+					aiExcludedFiles,
+					signal,
+				),
+		),
+		resolve: createResource(
+			(
+				signal,
+				repoPath: string,
+				focusedFilePaths: readonly string[] | undefined,
+				instructions: string | undefined,
+			) => graphInspect.resolveConflicts(repoPath, focusedFilePaths, instructions, signal),
 		),
 		scopeFiles: createResource((signal, repoPath: string, scope: ScopeSelection) =>
 			graphInspect.getScopeFiles(repoPath, scope, signal),

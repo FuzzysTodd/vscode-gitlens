@@ -1,16 +1,21 @@
 import type { PropertyValues } from 'lit';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
+import { pluralize } from '@gitlens/utils/string.js';
 import { createCommandLink } from '../../../../../system/commands.js';
 import type { AgentSessionState } from '../../../../home/protocol.js';
 import type { AgentSessionCategory, StickyDetailResolver } from '../../agentUtils.js';
 import {
 	agentPhaseToCategory,
+	canResolvePermission,
+	createAgentSessionArchiveHref,
+	createAgentSessionOpenHref,
 	createStickyDetailResolver,
 	describeAgentSession,
 	formatAgentElapsed,
 	getAgentCategoryLabel,
 	getAgentPhaseLabel,
+	getAgentSessionOpenAction,
 } from '../../agentUtils.js';
 import { renderRunningTool } from '../agents/agent-status-render.js';
 import { agentPhaseElapsedStyles, agentToolStyles } from '../agents/agent-status-styles.css.js';
@@ -28,20 +33,29 @@ interface AgentPillSummary {
 	sessions: readonly AgentSessionState[];
 }
 
-function formatElapsed(value: Date | number | undefined): string | undefined {
+/** Summary popovers cap at the most recent rows — the input arrays arrive most-recent-first
+ *  (sorted upstream by `sortAgentSessions`), so a slice keeps the freshest sessions. A hover is a
+ *  glance surface, not a browser: the footer hands off to the resume picker for the rest, which
+ *  matters most for ended sessions since those accumulate into the hundreds. */
+const maxSummaryRows = 3;
+
+function formatElapsed(value: number | undefined): string | undefined {
 	if (value == null) return undefined;
 
-	const timestamp = typeof value === 'number' ? value : value.getTime();
-	const seconds = Math.floor((Date.now() - timestamp) / 1000);
+	const seconds = Math.floor((Date.now() - value) / 1000);
 	if (seconds < 60) return `${seconds}s`;
 
 	const minutes = Math.floor(seconds / 60);
-	const remainingSeconds = seconds % 60;
-	if (minutes < 60) return `${minutes}m ${remainingSeconds}s`;
+	if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
 
 	const hours = Math.floor(minutes / 60);
-	const remainingMinutes = minutes % 60;
-	return `${hours}h ${remainingMinutes}m`;
+	if (hours < 24) return `${hours}h ${minutes % 60}m`;
+
+	const days = Math.floor(hours / 24);
+	if (days < 7) return `${days}d ${hours % 24}h`;
+
+	const weeks = Math.floor(days / 7);
+	return `${weeks}w ${days % 7}d`;
 }
 
 declare global {
@@ -63,17 +77,17 @@ export class GlAgentStatusPill extends LitElement {
 				--max-width: 30rem;
 
 				/* Phase colors — pulled from the unified --gl-agent-working-color /
-				   --gl-agent-waiting-color / --gl-agent-idle-color palette in theme.scss so the
-				   pill, card, sidebar leaf, tooltip, and WIP file decoration all share one
-				   source of truth. Local *-bg / *-border derivations stay because the pill
-				   applies different opacity envelopes than other surfaces. */
+		   --gl-agent-waiting-color / --gl-agent-idle-color palette in theme.scss so the
+		   pill, card, sidebar leaf, tooltip, and WIP file decoration all share one
+		   source of truth. Local *-bg / *-border derivations stay because the pill
+		   applies different opacity envelopes than other surfaces. */
 				--gl-agent-pill-working-color: var(--gl-agent-working-color);
 				--gl-agent-pill-working-bg: color-mix(in srgb, var(--gl-agent-pill-working-color) 10%, transparent);
 				--gl-agent-pill-working-border: color-mix(in srgb, var(--gl-agent-pill-working-color) 50%, transparent);
 
 				/* Needs Input border is brighter than the other categories (75% vs. 50%/35%) so the
-				   static state already communicates "this one's different" before the breathing
-				   animation kicks in. */
+		   static state already communicates "this one's different" before the breathing
+		   animation kicks in. */
 				--gl-agent-pill-attention-color: var(--gl-agent-waiting-color);
 				--gl-agent-pill-attention-bg: color-mix(in srgb, var(--gl-agent-pill-attention-color) 10%, transparent);
 				--gl-agent-pill-attention-bg-peak: color-mix(
@@ -91,50 +105,56 @@ export class GlAgentStatusPill extends LitElement {
 				--gl-agent-pill-idle-color: var(--gl-agent-idle-color);
 				--gl-agent-pill-idle-bg: color-mix(in srgb, var(--gl-agent-pill-idle-color) 10%, transparent);
 				--gl-agent-pill-idle-border: color-mix(in srgb, var(--gl-agent-pill-idle-color) 35%, transparent);
+
+				/* Ended (terminal) — neutral descriptionForeground, matching the details panel's
+		   ended accent, so done reads as history rather than another live state. */
+				--gl-agent-pill-ended-color: var(--gl-agent-ended-color);
+				--gl-agent-pill-ended-bg: color-mix(in srgb, var(--gl-agent-pill-ended-color) 10%, transparent);
+				--gl-agent-pill-ended-border: color-mix(in srgb, var(--gl-agent-pill-ended-color) 35%, transparent);
 			}
 
 			/* Pill badge */
 			.pill {
 				/* border-box so the 1px border counts inside the 100% width — without it the pill
-				   bleeds 2px past its container in full mode. */
+		   bleeds 2px past its container in full mode. */
 				box-sizing: border-box;
 				display: inline-flex;
 				align-items: center;
 				padding: 0.1rem 0.6rem;
-				border-radius: 0.4rem;
-				border: 1px solid transparent;
 				font-size: 0.85em;
 				font-weight: 500;
 				line-height: normal;
 				white-space: nowrap;
 				cursor: default;
+				border: var(--gl-border-width) solid transparent;
+				border-radius: var(--gl-radius-sm);
 				transition:
-					background-color 250ms ease,
-					border-color 250ms ease,
-					color 250ms ease;
+					background-color var(--gl-duration-slow) ease,
+					border-color var(--gl-duration-slow) ease,
+					color var(--gl-duration-slow) ease;
 			}
 
 			.pill__label {
 				display: inline-flex;
+				gap: var(--gl-space-4);
 				align-items: center;
-				gap: 0.4rem;
 				min-width: 0;
 			}
 
 			.pill__dot {
+				flex: none;
 				width: 5px;
 				height: 5px;
 				border-radius: 50%;
-				flex: none;
-				transition: background-color 250ms ease;
+				transition: background-color var(--gl-duration-slow) ease;
 			}
 
 			/* Full mode — pill grows to fill its container and surfaces inline actions on the
-			   right of the label. The popover anchor still wraps the whole pill so hover/focus
-			   keeps surfacing the rich detail (without duplicating the action row).
-			   full-active is a host-managed attribute, distinct from the public full prop, so the
-			   needs-input + !canResolve fallback can still render compact even when the consumer
-			   requested full. */
+	   right of the label. The popover anchor still wraps the whole pill so hover/focus
+	   keeps surfacing the rich detail (without duplicating the action row).
+	   full-active is a host-managed attribute, distinct from the public full prop, so the
+	   needs-input + !canResolve fallback can still render compact even when the consumer
+	   requested full. */
 			:host([full-active]) {
 				display: block;
 				width: 100%;
@@ -147,16 +167,17 @@ export class GlAgentStatusPill extends LitElement {
 
 			:host([full-active]) .pill {
 				display: flex;
-				width: 100%;
 				justify-content: space-between;
+				width: 100%;
 				padding: 0.3rem 0.6rem;
 			}
 
 			.pill__actions {
 				flex: none;
+
 				/* Tighten the inline action row so it sits flush with the pill's right padding
-				   instead of stretching the pill height. action-nav is a flex container itself —
-				   we just nudge gap and offset here. */
+		   instead of stretching the pill height. action-nav is a flex container itself —
+		   we just nudge gap and offset here. */
 				gap: 0.1rem;
 				margin-inline-end: -0.3rem;
 			}
@@ -164,12 +185,12 @@ export class GlAgentStatusPill extends LitElement {
 			.pill__actions action-item {
 				width: 1.8rem;
 				height: 1.8rem;
-				border-radius: 0.4rem;
 				color: inherit;
+				border-radius: var(--gl-radius-sm);
 			}
 
 			/* Background-only animation (no box-shadow) so it doesn't get clipped by ancestors
-			   with overflow: hidden. */
+	   with overflow: hidden. */
 			.pill--working .pill__dot {
 				animation: gl-agent-pill-pulse 1.5s ease 0s infinite;
 			}
@@ -178,16 +199,18 @@ export class GlAgentStatusPill extends LitElement {
 				0% {
 					box-shadow: 0 0 0 0 var(--pill-pulse-color, transparent);
 				}
+
 				70% {
 					box-shadow: 0 0 0 5px transparent;
 				}
+
 				100% {
 					box-shadow: 0 0 0 0 transparent;
 				}
 			}
 
 			.pill--needs-input {
-				animation: gl-agent-pill-breathing 3.5s ease-in-out 0s infinite;
+				animation: gl-agent-pill-breathing 3.5s var(--gl-ease-in-out) 0s infinite;
 			}
 
 			@keyframes gl-agent-pill-breathing {
@@ -195,6 +218,7 @@ export class GlAgentStatusPill extends LitElement {
 				100% {
 					background-color: var(--gl-agent-pill-attention-bg);
 				}
+
 				50% {
 					background-color: var(--gl-agent-pill-attention-bg-peak);
 				}
@@ -202,10 +226,11 @@ export class GlAgentStatusPill extends LitElement {
 
 			/* Working */
 			.pill--working {
+				color: var(--gl-agent-pill-working-color);
 				background-color: var(--gl-agent-pill-working-bg);
 				border-color: var(--gl-agent-pill-working-border);
-				color: var(--gl-agent-pill-working-color);
 			}
+
 			.pill--working .pill__dot {
 				background-color: var(--gl-agent-pill-working-color);
 				--pill-pulse-color: color-mix(in srgb, var(--gl-agent-pill-working-color) 50%, transparent);
@@ -213,22 +238,35 @@ export class GlAgentStatusPill extends LitElement {
 
 			/* Needs Input */
 			.pill--needs-input {
+				color: var(--gl-agent-pill-attention-color);
 				background-color: var(--gl-agent-pill-attention-bg);
 				border-color: var(--gl-agent-pill-attention-border);
-				color: var(--gl-agent-pill-attention-color);
 			}
+
 			.pill--needs-input .pill__dot {
 				background-color: var(--gl-agent-pill-attention-color);
 			}
 
 			/* Idle */
 			.pill--idle {
+				color: var(--gl-agent-pill-idle-color);
 				background-color: var(--gl-agent-pill-idle-bg);
 				border-color: var(--gl-agent-pill-idle-border);
-				color: var(--gl-agent-pill-idle-color);
 			}
+
 			.pill--idle .pill__dot {
 				background-color: var(--gl-agent-pill-idle-color);
+			}
+
+			/* Ended */
+			.pill--ended {
+				color: var(--gl-agent-pill-ended-color);
+				background-color: var(--gl-agent-pill-ended-bg);
+				border-color: var(--gl-agent-pill-ended-border);
+			}
+
+			.pill--ended .pill__dot {
+				background-color: var(--gl-agent-pill-ended-color);
 			}
 
 			@media (prefers-reduced-motion: reduce) {
@@ -247,32 +285,38 @@ export class GlAgentStatusPill extends LitElement {
 			.hover-card {
 				display: flex;
 				flex-direction: column;
-				gap: 0.6rem;
-				white-space: normal;
+				gap: var(--gl-space-6);
 				min-width: 16rem;
+				white-space: normal;
 			}
 
 			.hover-header {
 				display: flex;
-				align-items: center;
 				gap: 0.5rem;
+				align-items: center;
 			}
 
 			.hover-header__dot {
+				flex: none;
 				width: 8px;
 				height: 8px;
 				border-radius: 50%;
-				flex: none;
 			}
 
 			.hover-header__dot--working {
 				background-color: var(--gl-agent-pill-working-color);
 			}
+
 			.hover-header__dot--needs-input {
 				background-color: var(--gl-agent-pill-attention-color);
 			}
+
 			.hover-header__dot--idle {
 				background-color: var(--gl-agent-pill-idle-color);
+			}
+
+			.hover-header__dot--ended {
+				background-color: var(--gl-agent-pill-ended-color);
 			}
 
 			.hover-header__text {
@@ -283,54 +327,51 @@ export class GlAgentStatusPill extends LitElement {
 
 			.hover-header__elapsed {
 				flex: none;
-				color: var(--vscode-descriptionForeground);
 				font-size: 0.9em;
+				color: var(--vscode-descriptionForeground);
 			}
 
 			.hover-section {
 				display: flex;
 				flex-direction: column;
-				gap: 0.2rem;
+				gap: var(--gl-space-2);
 			}
 
 			.hover-section__label {
-				text-transform: uppercase;
 				font-size: 0.8em;
 				color: var(--vscode-descriptionForeground);
+				text-transform: uppercase;
 				opacity: 0.7;
 			}
 
-			.hover-section__value {
-			}
-
 			.hover-prompt {
+				display: -webkit-box;
+				overflow: hidden;
+				-webkit-line-clamp: 3;
 				font-size: 0.9em;
 				color: var(--vscode-descriptionForeground);
-				word-break: break-word;
-				display: -webkit-box;
-				-webkit-line-clamp: 3;
+				overflow-wrap: anywhere;
 				-webkit-box-orient: vertical;
-				overflow: hidden;
 			}
 
 			.hover-actions {
 				display: flex;
 				flex-direction: column;
-				gap: 0.4rem;
-				margin-top: 0.2rem;
+				gap: var(--gl-space-4);
+				margin-top: var(--gl-space-2);
 			}
 
 			.hover-actions__row {
 				display: flex;
 				flex-direction: row;
-				gap: 0.4rem;
+				gap: var(--gl-space-4);
 			}
 
 			.hover-actions__row > gl-button {
 				/* min-width: max-content keeps Allow / Deny from shrinking below their icon+label
-				   content when the popover is anchored in a narrow sidebar — the popover body
-				   grows horizontally to fit instead. flex: 1 1 0 keeps the row evenly distributed
-				   when there's slack. */
+		   content when the popover is anchored in a narrow sidebar — the popover body
+		   grows horizontally to fit instead. flex: 1 1 0 keeps the row evenly distributed
+		   when there's slack. */
 				flex: 1 1 0;
 				min-width: max-content;
 			}
@@ -339,41 +380,47 @@ export class GlAgentStatusPill extends LitElement {
 				flex: 0 0 auto;
 			}
 
+			.hover-actions__hint {
+				font-size: 0.8em;
+				color: var(--vscode-descriptionForeground);
+				text-align: center;
+			}
+
 			/* "…" overflow menu — anchored off the third action button. */
 			.more-menu {
 				display: flex;
 				flex-direction: column;
 				min-width: 14rem;
-				padding: 0.2rem;
+				padding: var(--gl-space-2);
 			}
 
 			.more-menu__item {
 				display: flex;
+				gap: var(--gl-space-6);
 				align-items: center;
-				gap: 0.6rem;
-				padding: 0.4rem 0.6rem;
-				border-radius: 0.3rem;
+				padding: var(--gl-space-4) var(--gl-space-6);
+				font-size: 0.95em;
 				color: var(--vscode-foreground);
 				text-decoration: none;
 				cursor: pointer;
-				font-size: 0.95em;
+				border-radius: var(--gl-radius-sm);
 			}
 
 			.more-menu__item:hover {
-				background-color: var(--vscode-list-hoverBackground);
 				color: var(--vscode-list-hoverForeground, var(--vscode-foreground));
 				text-decoration: none;
+				background-color: var(--vscode-list-hoverBackground);
 			}
 
 			.more-menu__item code-icon {
-				color: var(--vscode-descriptionForeground);
 				flex: none;
+				color: var(--vscode-descriptionForeground);
 			}
 
 			.hover-summary {
 				display: flex;
 				flex-direction: column;
-				gap: 0.6rem;
+				gap: var(--gl-space-6);
 				min-width: 24rem;
 				max-width: min(44rem, 60vw);
 				max-height: 28rem;
@@ -382,42 +429,59 @@ export class GlAgentStatusPill extends LitElement {
 
 			.hover-summary-row {
 				display: grid;
+
 				/* minmax(0, 1fr) lets the name column shrink below its min-content size, enabling
-				   ellipsis on long session names. Right column auto-sizes to the phase label. */
+		   ellipsis on long session names. Right column auto-sizes to the phase label. */
 				grid-template-columns: auto minmax(0, 1fr) auto;
-				column-gap: 0.6rem;
-				row-gap: 0.1rem;
+				gap: 0.1rem 0.6rem;
 				align-items: center;
 			}
 
 			.hover-summary-row + .hover-summary-row {
-				padding-top: 0.6rem;
-				border-top: 1px solid
+				padding-top: var(--gl-space-6);
+				border-top: var(--gl-border-width) solid
 					var(--vscode-widget-border, color-mix(in srgb, var(--vscode-foreground) 15%, transparent));
 			}
 
+			/* Ended rows add a 4th track for Resume/Archive actions — rows without actions keep
+	   the base 3-track layout. */
+			.hover-summary-row--actions {
+				grid-template-columns: auto minmax(0, 1fr) auto auto;
+			}
+
+			.hover-summary-row__actions {
+				justify-self: end;
+			}
+
 			.hover-summary-row__dot {
+				flex: none;
 				width: 0.7rem;
 				height: 0.7rem;
 				border-radius: 50%;
-				flex: none;
 			}
+
 			.hover-summary-row__dot--working {
 				background-color: var(--gl-agent-pill-working-color);
 			}
+
 			.hover-summary-row__dot--needs-input {
 				background-color: var(--gl-agent-pill-attention-color);
 			}
+
 			.hover-summary-row__dot--idle {
 				background-color: var(--gl-agent-pill-idle-color);
 			}
 
+			.hover-summary-row__dot--ended {
+				background-color: var(--gl-agent-pill-ended-color);
+			}
+
 			.hover-summary-row__name {
 				min-width: 0;
-				white-space: nowrap;
 				overflow: hidden;
 				text-overflow: ellipsis;
 				font-weight: 600;
+				white-space: nowrap;
 			}
 
 			.hover-summary-row__phase {
@@ -429,24 +493,38 @@ export class GlAgentStatusPill extends LitElement {
 			}
 
 			.hover-summary-row__phase--needs-input {
-				color: var(--gl-agent-pill-attention-color);
 				font-weight: 600;
+				color: var(--gl-agent-pill-attention-color);
 			}
 
 			.hover-summary-row__detail {
 				grid-column: 2 / -1;
 				min-width: 0;
+				overflow: hidden;
+				text-overflow: ellipsis;
 				font-size: 0.9em;
 				color: var(--vscode-descriptionForeground);
 				white-space: nowrap;
-				overflow: hidden;
-				text-overflow: ellipsis;
 			}
 
 			/* Summary-row tool detail places the shared .agent-tool composite into the row's
-			   second grid cell — visual styling lives in the shared agentToolStyles. */
+	   second grid cell — visual styling lives in the shared agentToolStyles. */
 			.hover-summary-row__tool {
 				grid-column: 2 / -1;
+			}
+
+			.hover-summary__footer {
+				font-size: 0.9em;
+				color: var(--vscode-descriptionForeground);
+			}
+
+			a.hover-summary__more {
+				color: var(--vscode-textLink-foreground);
+				text-decoration: none;
+			}
+
+			a.hover-summary__more:hover {
+				text-decoration: underline;
 			}
 		`,
 	];
@@ -504,9 +582,9 @@ export class GlAgentStatusPill extends LitElement {
 		if (this._stickyResolver.size === 0) return;
 
 		if (this.summary != null) {
-			this._stickyResolver.prune(this.summary.sessions.map(s => s.id));
+			this._stickyResolver.prune(this.summary.sessions);
 		} else if (this.session != null) {
-			this._stickyResolver.prune([this.session.id]);
+			this._stickyResolver.prune([this.session]);
 		} else {
 			this._stickyResolver.prune([]);
 		}
@@ -521,10 +599,10 @@ export class GlAgentStatusPill extends LitElement {
 		const category = agentPhaseToCategory[session.phase];
 		const permission = session.pendingPermission;
 		const label = getAgentPhaseLabel(category, permission);
-		const canResolve = category === 'needs-input' && permission != null;
+		const canResolve = canResolvePermission(category, permission);
 
 		return html`
-			<gl-popover placement="bottom" hoist>
+			<gl-popover placement="bottom">
 				<span slot="anchor" class=${`pill ${category ? `pill--${category}` : ''}`.trim()} tabindex="0">
 					<span class="pill__label">
 						<span class="pill__dot"></span>
@@ -544,9 +622,14 @@ export class GlAgentStatusPill extends LitElement {
 		const baseLabel = getAgentCategoryLabel(category);
 		const count = sessions.length;
 		const label = count > 1 ? `${baseLabel} · ${count}` : baseLabel;
+		const shown = sessions.slice(0, maxSummaryRows);
 
+		// `auto-size-vertical` caps the popover to the space the view actually has and scrolls the
+		// overflow. Home's sidebar view is often shorter than the popover, and the row cap leaves
+		// the content just under `.hover-summary`'s own max-height — so without it the footer sits
+		// past the viewport edge with no scrollbar anywhere to reach it.
 		return html`
-			<gl-popover placement="bottom" hoist>
+			<gl-popover placement="bottom" auto-size-vertical>
 				<span slot="anchor" class=${`pill pill--${category}`} tabindex="0">
 					<span class="pill__label">
 						<span class="pill__dot"></span>
@@ -554,9 +637,55 @@ export class GlAgentStatusPill extends LitElement {
 					</span>
 				</span>
 				<div slot="content" class="hover-card" tabindex="-1">
-					<div class="hover-summary">${sessions.map(s => this.renderSummaryRow(s, category))}</div>
+					<div class="hover-summary">
+						${shown.map(s => this.renderSummaryRow(s, category))}
+						${this.renderSummaryFooter(category, sessions, shown.length)}
+					</div>
 				</div>
 			</gl-popover>
+		`;
+	}
+
+	/** Beyond `maxSummaryRows`, the popover switches to a count-only footer instead of growing
+	 *  unbounded — ended sessions especially can accumulate into the hundreds. The footer links
+	 *  into the resume picker (scoped to the shared worktree) only for ended sessions that all
+	 *  share one worktree — `showResumeSessionPicker` no-ops without a `worktreePath`, and other
+	 *  categories have no equivalent picker to route to. */
+	private renderSummaryFooter(
+		category: AgentSessionCategory,
+		sessions: readonly AgentSessionState[],
+		shown: number,
+	): unknown {
+		if (sessions.length <= shown) return nothing;
+
+		const countText = pluralize(
+			`more ${getAgentCategoryLabel(category).toLowerCase()} session`,
+			sessions.length - shown,
+		);
+
+		let sharedWorktreePath: string | undefined;
+		if (category === 'ended') {
+			sharedWorktreePath = sessions[0].worktreePath ?? undefined;
+			if (sharedWorktreePath != null && !sessions.every(s => s.worktreePath === sharedWorktreePath)) {
+				sharedWorktreePath = undefined;
+			}
+		}
+
+		return html`
+			<div class="hover-summary__footer">
+				${
+					sharedWorktreePath != null
+						? html`<a
+								class="hover-summary__more"
+								href=${createCommandLink('gitlens.agents.showResumeSessionPicker', {
+									worktreePath: sharedWorktreePath,
+								})}
+								@mousedown=${this.onActionMouseDown}
+								>${countText}…</a
+							>`
+						: html`<span class="hover-summary__more">${countText}</span>`
+				}
+			</div>
 		`;
 	}
 
@@ -572,13 +701,13 @@ export class GlAgentStatusPill extends LitElement {
 		const detail =
 			stickyTool != null
 				? undefined
-				: describeAgentSession(session, category, elapsed, {
+				: describeAgentSession(session, category, {
 						awaitingPrefix: 'short',
 						idleFallback: 'lastPrompt',
 					});
 
 		return html`
-			<div class="hover-summary-row">
+			<div class=${`hover-summary-row${category === 'ended' ? ' hover-summary-row--actions' : ''}`}>
 				<span class=${`hover-summary-row__dot hover-summary-row__dot--${category}`}></span>
 				<gl-tooltip content=${session.displayName} placement="bottom">
 					<span class="hover-summary-row__name">${session.displayName}</span>
@@ -586,9 +715,28 @@ export class GlAgentStatusPill extends LitElement {
 				<span class=${`hover-summary-row__phase hover-summary-row__phase--${category}`}>
 					${phaseLabel}${elapsed != null ? html` · <span class="agent-phase-elapsed">${elapsed}</span>` : ''}
 				</span>
-				${this.renderSummaryRowDetail(stickyTool, detail)}
+				${this.renderSummaryRowActions(session, category)} ${this.renderSummaryRowDetail(stickyTool, detail)}
 			</div>
 		`;
+	}
+
+	/** Ended rows keep their Resume / Archive affordances even after rolling up into the
+	 *  summary popover — rolling up shouldn't cost the actions a live pill would have offered. */
+	private renderSummaryRowActions(session: AgentSessionState, category: AgentSessionCategory): unknown {
+		if (category !== 'ended') return nothing;
+
+		const openAction = getAgentSessionOpenAction(session);
+		const openActionHref = createAgentSessionOpenHref(session);
+		const archiveHref = createAgentSessionArchiveHref(session);
+
+		return html`<action-nav class="hover-summary-row__actions" @mousedown=${this.onActionMouseDown}>
+			<action-item label=${openAction.label} icon=${openAction.icon} href=${openActionHref}></action-item>
+			${
+				archiveHref != null
+					? html`<action-item label="Archive Session" icon="archive" href=${archiveHref}></action-item>`
+					: nothing
+			}
+		</action-nav>`;
 	}
 
 	private renderSummaryRowDetail(stickyTool: string | undefined, detail: string | undefined): unknown {
@@ -615,7 +763,7 @@ export class GlAgentStatusPill extends LitElement {
 		// input tool name from the still-fresh cache. Matches the eviction-on-needs-input pattern
 		// in gl-graph-kanban + gl-details-agent-status.
 		if (category !== 'working') {
-			this._stickyResolver.evict(session.id);
+			this._stickyResolver.evict(session);
 		}
 
 		switch (category) {
@@ -624,6 +772,7 @@ export class GlAgentStatusPill extends LitElement {
 			case 'needs-input':
 				return this.renderNeedsInputHover(session, omitActions);
 			case 'idle':
+			case 'ended':
 				return this.renderIdleHover(session, omitActions);
 		}
 	}
@@ -637,22 +786,30 @@ export class GlAgentStatusPill extends LitElement {
 		category: AgentSessionCategory,
 		canResolve: boolean,
 	): unknown {
-		const openHref = createCommandLink('gitlens.agents.openSession', JSON.stringify(session.id));
+		// Plain openSession link — feeds `renderMoreActionsMenu`, which is only reached from the
+		// needs-input path (never ended), so it never needs the resume variant.
+		const openHref = createCommandLink('gitlens.agents.openSession', {
+			sessionId: session.id,
+			providerId: session.providerId,
+		});
 
 		if (category === 'needs-input' && canResolve) {
 			const permission = session.pendingPermission!;
 			const allowHref = createCommandLink('gitlens.agents.resolvePermission', {
 				sessionId: session.id,
+				providerId: session.providerId,
 				decision: 'allow' as const,
 			});
 			const denyHref = createCommandLink('gitlens.agents.resolvePermission', {
 				sessionId: session.id,
+				providerId: session.providerId,
 				decision: 'deny' as const,
 			});
 			const alwaysAllowHref =
 				permission.kind === 'tool' && permission.suggestions != null && permission.suggestions.length > 0
 					? createCommandLink('gitlens.agents.resolvePermission', {
 							sessionId: session.id,
+							providerId: session.providerId,
 							decision: 'allow' as const,
 							alwaysAllow: true,
 						})
@@ -669,16 +826,28 @@ export class GlAgentStatusPill extends LitElement {
 			`;
 		}
 
+		const archiveHref = category === 'ended' ? createAgentSessionArchiveHref(session) : undefined;
+		const openAction = getAgentSessionOpenAction(session);
+		const openActionHref = createAgentSessionOpenHref(session);
+
 		return html`
 			<action-nav class="pill__actions" @mousedown=${this.onActionMouseDown}>
-				<action-item label="Open Session" icon="link-external" href=${openHref}></action-item>
+				<action-item label=${openAction.label} icon=${openAction.icon} href=${openActionHref}></action-item>
+				${
+					archiveHref != null
+						? html`<action-item label="Archive Session" icon="archive" href=${archiveHref}></action-item>`
+						: nothing
+				}
 			</action-nav>
 		`;
 	}
 
 	private renderWorkingHover(session: AgentSessionState, omitActions: boolean): unknown {
 		const elapsed = formatElapsed(session.phaseSince);
-		const openHref = createCommandLink('gitlens.agents.openSession', JSON.stringify(session.id));
+		const openHref = createCommandLink('gitlens.agents.openSession', {
+			sessionId: session.id,
+			providerId: session.providerId,
+		});
 		// Route through the sticky resolver so the "Current Tool" section doesn't blink between
 		// tool calls — matches the kanban + details-panel running-tool surfaces. `resolveLiveTool`
 		// returns the live `statusDetail` when present and the cached one for ~3s after it drops
@@ -692,44 +861,56 @@ export class GlAgentStatusPill extends LitElement {
 				<span class="hover-header__text">${session.displayName}</span>
 				${elapsed != null ? html`<span class="hover-header__elapsed">${elapsed}</span>` : nothing}
 			</div>
-			${session.lastPrompt
-				? html`
-						<div class="hover-section">
-							<span class="hover-section__label">Last Prompt</span>
-							<span class="hover-prompt">${session.lastPrompt}</span>
-						</div>
-					`
-				: nothing}
-			${stickyTool != null
-				? html`
-						<div class="hover-section">
-							<span class="hover-section__label">Current Tool</span>
-							<span class="hover-section__value">${stickyTool}</span>
-						</div>
-					`
-				: nothing}
-			${omitActions
-				? nothing
-				: html`
-						<div class="hover-actions" @mousedown=${this.onActionMouseDown}>
-							<gl-button appearance="secondary" full density="compact" href=${openHref}>
-								<code-icon icon="link-external" slot="prefix"></code-icon>
-								Open Session
-							</gl-button>
-						</div>
-					`}
+			${
+				session.lastPrompt
+					? html`
+							<div class="hover-section">
+								<span class="hover-section__label">Last Prompt</span>
+								<span class="hover-prompt">${session.lastPrompt}</span>
+							</div>
+						`
+					: nothing
+			}
+			${
+				stickyTool != null
+					? html`
+							<div class="hover-section">
+								<span class="hover-section__label">Current Tool</span>
+								<span class="hover-section__value">${stickyTool}</span>
+							</div>
+						`
+					: nothing
+			}
+			${
+				omitActions
+					? nothing
+					: html`
+							<div class="hover-actions" @mousedown=${this.onActionMouseDown}>
+								<gl-button appearance="secondary" full density="compact" href=${openHref}>
+									<code-icon icon="link-external" slot="prefix"></code-icon>
+									Open Session
+								</gl-button>
+							</div>
+						`
+			}
 		`;
 	}
 
 	private renderNeedsInputHover(session: AgentSessionState, omitActions: boolean): unknown {
 		const elapsed = formatElapsed(session.phaseSince);
 		const permission = session.pendingPermission;
-		const openHref = createCommandLink('gitlens.agents.openSession', JSON.stringify(session.id));
+		const openHref = createCommandLink('gitlens.agents.openSession', {
+			sessionId: session.id,
+			providerId: session.providerId,
+		});
 
-		const canResolve = permission != null;
+		// This hover only renders for needs-input, so the category is implied; an unresolvable ask
+		// still shows its detail but offers Open Session instead of buttons that can't route.
+		const canResolve = canResolvePermission('needs-input', permission);
 		const allowHref = canResolve
 			? createCommandLink('gitlens.agents.resolvePermission', {
 					sessionId: session.id,
+					providerId: session.providerId,
 					decision: 'allow' as const,
 				})
 			: undefined;
@@ -740,6 +921,7 @@ export class GlAgentStatusPill extends LitElement {
 			permission.suggestions.length > 0
 				? createCommandLink('gitlens.agents.resolvePermission', {
 						sessionId: session.id,
+						providerId: session.providerId,
 						decision: 'allow' as const,
 						alwaysAllow: true,
 					})
@@ -747,6 +929,7 @@ export class GlAgentStatusPill extends LitElement {
 		const denyHref = canResolve
 			? createCommandLink('gitlens.agents.resolvePermission', {
 					sessionId: session.id,
+					providerId: session.providerId,
 					decision: 'deny' as const,
 				})
 			: undefined;
@@ -759,54 +942,67 @@ export class GlAgentStatusPill extends LitElement {
 				<span class="hover-header__text">${session.displayName}</span>
 				${elapsed != null ? html`<span class="hover-header__elapsed">${elapsed}</span>` : nothing}
 			</div>
-			${permission != null
-				? html`
-						<div class="hover-section">
-							<span class="hover-section__label">Request</span>
-							<gl-agent-prompt-detail .permission=${permission}></gl-agent-prompt-detail>
-						</div>
-					`
-				: nothing}
-			${session.lastPrompt
-				? html`
-						<div class="hover-section">
-							<span class="hover-section__label">Last Prompt</span>
-							<span class="hover-prompt">${session.lastPrompt}</span>
-						</div>
-					`
-				: nothing}
-			${omitActions
-				? nothing
-				: canResolve
+			${
+				permission != null
 					? html`
-							<div class="hover-actions" @mousedown=${this.onActionMouseDown}>
-								<div class="hover-actions__row">
-									<gl-button full density="compact" href=${allowHref!}>
-										<code-icon icon="check" slot="prefix"></code-icon>
-										${allowLabel}
-									</gl-button>
-									<gl-button
-										appearance="secondary"
-										full
-										density="compact"
-										variant="danger"
-										href=${denyHref!}
-									>
-										<code-icon icon="x" slot="prefix"></code-icon>
-										${denyLabel}
-									</gl-button>
-									${this.renderMoreActionsMenu(openHref, alwaysAllowHref)}
-								</div>
+							<div class="hover-section">
+								<span class="hover-section__label">Request</span>
+								<gl-agent-prompt-detail .permission=${permission}></gl-agent-prompt-detail>
 							</div>
 						`
-					: html`
-							<div class="hover-actions" @mousedown=${this.onActionMouseDown}>
-								<gl-button appearance="secondary" full density="compact" href=${openHref}>
-									<code-icon icon="link-external" slot="prefix"></code-icon>
-									Open Session
-								</gl-button>
+					: nothing
+			}
+			${
+				session.lastPrompt
+					? html`
+							<div class="hover-section">
+								<span class="hover-section__label">Last Prompt</span>
+								<span class="hover-prompt">${session.lastPrompt}</span>
 							</div>
-						`}
+						`
+					: nothing
+			}
+			${
+				omitActions
+					? nothing
+					: canResolve
+						? html`
+								<div class="hover-actions" @mousedown=${this.onActionMouseDown}>
+									<div class="hover-actions__row">
+										<gl-button full density="compact" href=${allowHref!}>
+											<code-icon icon="check" slot="prefix"></code-icon>
+											${allowLabel}
+										</gl-button>
+										<gl-button
+											appearance="secondary"
+											full
+											density="compact"
+											variant="danger"
+											href=${denyHref!}
+										>
+											<code-icon icon="x" slot="prefix"></code-icon>
+											${denyLabel}
+										</gl-button>
+										${this.renderMoreActionsMenu(openHref, alwaysAllowHref)}
+									</div>
+								</div>
+							`
+						: html`
+								<div class="hover-actions" @mousedown=${this.onActionMouseDown}>
+									<gl-button appearance="secondary" full density="compact" href=${openHref}>
+										<code-icon icon="link-external" slot="prefix"></code-icon>
+										Open Session
+									</gl-button>
+									${
+										permission != null
+											? html`<span class="hover-actions__hint"
+													>Answer in the agent's session</span
+												>`
+											: nothing
+									}
+								</div>
+							`
+			}
 		`;
 	}
 
@@ -815,15 +1011,17 @@ export class GlAgentStatusPill extends LitElement {
 	 *  trigger — the parent hover popover stays open while focus is on this anchor. */
 	private renderMoreActionsMenu(openHref: string, alwaysAllowHref: string | undefined): unknown {
 		return html`
-			<gl-popover placement="bottom-end" trigger="click" hoist>
+			<gl-popover placement="bottom-end" trigger="click">
 				<action-item slot="anchor" label="More actions" icon="ellipsis"></action-item>
 				<div slot="content" class="more-menu" role="menu" @mousedown=${this.onActionMouseDown}>
-					${alwaysAllowHref != null
-						? html`<a class="more-menu__item" role="menuitem" href=${alwaysAllowHref}>
-								<code-icon icon="check-all"></code-icon>
-								<span>Always Allow</span>
-							</a>`
-						: nothing}
+					${
+						alwaysAllowHref != null
+							? html`<a class="more-menu__item" role="menuitem" href=${alwaysAllowHref}>
+									<code-icon icon="check-all"></code-icon>
+									<span>Always Allow</span>
+								</a>`
+							: nothing
+					}
 					<a class="more-menu__item" role="menuitem" href=${openHref}>
 						<code-icon icon="link-external"></code-icon>
 						<span>Open Session</span>
@@ -834,31 +1032,56 @@ export class GlAgentStatusPill extends LitElement {
 	}
 
 	private renderIdleHover(session: AgentSessionState, omitActions: boolean): unknown {
-		const openHref = createCommandLink('gitlens.agents.openSession', JSON.stringify(session.id));
+		const openAction = getAgentSessionOpenAction(session);
+		const openHref = createAgentSessionOpenHref(session);
+		// Archive is offered only on terminal (ended) sessions — a live idle one would have to be
+		// killed first, so it's not surfaced here.
+		const archiveHref = session.phase === 'ended' ? createAgentSessionArchiveHref(session) : undefined;
+
+		const dotModifier = session.phase === 'ended' ? 'ended' : 'idle';
 
 		return html`
 			<div class="hover-header">
-				<span class="hover-header__dot hover-header__dot--idle"></span>
+				<span class="hover-header__dot hover-header__dot--${dotModifier}"></span>
 				<span class="hover-header__text">${session.displayName}</span>
 			</div>
-			${session.lastPrompt
-				? html`
-						<div class="hover-section">
-							<span class="hover-section__label">Last Prompt</span>
-							<span class="hover-prompt">${session.lastPrompt}</span>
-						</div>
-					`
-				: nothing}
-			${omitActions
-				? nothing
-				: html`
-						<div class="hover-actions" @mousedown=${this.onActionMouseDown}>
-							<gl-button appearance="secondary" full density="compact" href=${openHref}>
-								<code-icon icon="link-external" slot="prefix"></code-icon>
-								Open Session
-							</gl-button>
-						</div>
-					`}
+			${
+				session.lastPrompt
+					? html`
+							<div class="hover-section">
+								<span class="hover-section__label">Last Prompt</span>
+								<span class="hover-prompt">${session.lastPrompt}</span>
+							</div>
+						`
+					: nothing
+			}
+			${
+				omitActions
+					? nothing
+					: html`
+							<div class="hover-actions" @mousedown=${this.onActionMouseDown}>
+								<div class="hover-actions__row">
+									<gl-button appearance="secondary" full density="compact" href=${openHref}>
+										<code-icon icon=${openAction.icon} slot="prefix"></code-icon>
+										${openAction.label}
+									</gl-button>
+									${
+										archiveHref != null
+											? html`<gl-button
+													appearance="secondary"
+													full
+													density="compact"
+													href=${archiveHref}
+												>
+													<code-icon icon="archive" slot="prefix"></code-icon>
+													Archive
+												</gl-button>`
+											: nothing
+									}
+								</div>
+							</div>
+						`
+			}
 		`;
 	}
 }

@@ -8,11 +8,29 @@ export type GitCoreConfigKeys =
 	| 'core.excludesFile'
 	| 'diff.guitool'
 	| 'diff.tool'
+	/** `fetch.prune` — whether `git fetch` removes remote-tracking branches that no longer exist on the remote */
+	| 'fetch.prune'
 	| 'gpg.format'
 	| 'gpg.program'
 	| 'gpg.ssh.program'
 	| 'gpg.ssh.allowedSignersFile'
 	| 'init.defaultBranch'
+	/** `merge.autoStash` — whether `git merge` (and so a merging `git pull`) stashes and reapplies uncommitted changes */
+	| 'merge.autoStash'
+	/** `merge.ff` — whether `git merge` fast-forwards when possible; also accepts `'only'` to require it */
+	| 'merge.ff'
+	/** `pull.autoStash` — overrides `merge.autoStash`/`rebase.autoStash` for `git pull`, in either mode */
+	| 'pull.autoStash'
+	/** `pull.rebase` — whether `git pull` rebases instead of merging; also accepts `merges`/`interactive` */
+	| 'pull.rebase'
+	/** `rebase.autoStash` — whether `git rebase` (and so a rebasing `git pull`) stashes and reapplies uncommitted changes */
+	| 'rebase.autoStash'
+	/** `rebase.autosquash` — whether `git rebase` automatically folds `fixup!`/`squash!` commits into the commits they target */
+	| 'rebase.autosquash'
+	/** `rebase.updateRefs` — whether `git rebase` also updates branches pointing to the rebased commits */
+	| 'rebase.updateRefs'
+	/** `remote.pushDefault` — the remote `git push` targets when a branch has no explicit push remote configured */
+	| 'remote.pushDefault'
 	| 'user.email'
 	| 'user.name'
 	| 'user.signingkey';
@@ -22,7 +40,9 @@ export type GitConfigKeys =
 	/** `vscode-merge-base` — value determined by VS Code that is used to determine the merge base for the current branch. Once `gk-merge-base` is determined, we stop using `vscode-merge-base` */
 	| `branch.${string}.vscode-merge-base`
 	/** `github-pr-owner-number` — value determined by VS Code/GitHub PR extension that is used to determine the PR number for the current branch */
-	| `branch.${string}.github-pr-owner-number`;
+	| `branch.${string}.github-pr-owner-number`
+	/** `rebase` — per-branch override of `pull.rebase`; takes precedence over the repository-wide setting */
+	| `branch.${string}.rebase`;
 
 export type GkConfigKeys =
 	/** `gk-merge-base` — the branch that the current branch was created from (the original base at branch creation time) */
@@ -42,7 +62,40 @@ export type GkConfigKeys =
 	/** `gk-disposition` — user-assigned branch disposition: 'starred' or 'archived' */
 	| `branch.${string}.gk-disposition`
 	/** `gk.defaultRemote` — the user-designated default remote for the repository */
-	| 'gk.defaultRemote';
+	| 'gk.defaultRemote'
+	/** `gk.maintenanceLastRun` — ISO 8601 timestamp of the last auto-tier git-optimization maintenance pass */
+	| 'gk.maintenanceLastRun'
+	/** `gk.commitGraphDisabled` — `'true'` once the user disables GitLens's automatic commit-graph maintenance for this repo */
+	| 'gk.commitGraphDisabled'
+	/** `gk.fsmonitorNotApplicable` — `'true'` once FSMonitor failed to enable for this repo, so it's never re-suggested */
+	| 'gk.fsmonitorNotApplicable'
+	/** `gk.untrackedCacheNotApplicable` — `'true'` once the untracked cache failed git's filesystem probe here, so it's never re-suggested */
+	| 'gk.untrackedCacheNotApplicable'
+	/**
+	 * `gk.applied.*` — Git Health ownership + undo markers under `[gk "applied"]`. Each value is the lever's
+	 * prior LOCAL-scope value (so undo restores it exactly) or the literal `unset` sentinel when it was absent;
+	 * the marker's mere presence also means "applied by GitLens" (so undo is never offered for a user-enabled
+	 * lever). `backgroundMaintenance` is a presence-only ownership flag (registration is global; undo =
+	 * unregister), and `maintenanceAuto` holds the prior `maintenance.auto` that `git maintenance start` sets
+	 * to false and unregister does not restore.
+	 */
+	| 'gk.applied.untrackedCache'
+	| 'gk.applied.fsmonitor'
+	| 'gk.applied.manyFiles'
+	| 'gk.applied.skipHash'
+	| 'gk.applied.backgroundMaintenance'
+	| 'gk.applied.maintenanceAuto'
+	/** `git maintenance register` sets `maintenance.strategy` too, and `unregister` does NOT restore it. */
+	| 'gk.applied.maintenanceStrategy'
+	/**
+	 * Write-ahead records for direct Git Health config mutations. A pending record is finalized into the
+	 * corresponding `gk.applied.*` marker only after the local config write succeeds; interrupted records are
+	 * reconciled on the next probe so a crash cannot silently lose ownership or claim a failed write.
+	 */
+	| 'gk.pending.untrackedCache'
+	| 'gk.pending.fsmonitor'
+	| 'gk.pending.manyFiles'
+	| 'gk.pending.skipHash';
 
 export type DeprecatedGkConfigKeys = `branch.${string}.gk-target-base`;
 
@@ -88,11 +141,7 @@ export interface GitConfigSubProvider {
 		| []
 	>;
 
-	getGkConfig?(
-		repoPath: string,
-		key: GkConfigKeys | DeprecatedGkConfigKeys,
-		options?: { type?: GitConfigType },
-	): Promise<string | undefined>;
+	getGkConfig?(repoPath: string, key: GkConfigKeys | DeprecatedGkConfigKeys): Promise<string | undefined>;
 	getGkConfigRegex?(repoPath: string, pattern: string): Promise<Map<string, string>>;
 	setGkConfig?(
 		repoPath: string,
@@ -100,6 +149,16 @@ export interface GitConfigSubProvider {
 		value: string | undefined,
 		options?: { skipInvalidation?: readonly GkConfigInvalidationTarget[] },
 	): Promise<void>;
+	/**
+	 * Drops every gk key stored for `ref` — call when a branch stops existing under that name. Deliberately
+	 * includes user-owned values (`gk-merge-target-user`, `gk-disposition`, `gk-associated-issues`): the
+	 * branch is confirmed gone, and leaving them would hand the next branch reusing that name a dead one's
+	 * starred state and issue links. Only call where git guarantees the name is free —
+	 * a completed delete.
+	 */
+	removeGkConfigBranchSection?(repoPath: string, ref: string): Promise<void>;
+	/** Moves every gk key stored for `oldRef` to `newRef` — call when a branch is renamed. */
+	renameGkConfigBranchSection?(repoPath: string, oldRef: string, newRef: string): Promise<void>;
 
 	getSigningConfig?(repoPath: string): Promise<SigningConfig>;
 	getSigningConfigFlags?(config: SigningConfig): string[];

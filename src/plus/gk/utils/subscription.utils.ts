@@ -28,6 +28,29 @@ export function compareSubscriptionPlans(
 	return getSubscriptionPlanOrder(planA) - getSubscriptionPlanOrder(planB);
 }
 
+/**
+ * Whether this user is allowed to buy AI credit add-ons for whoever is paying: inside an organization only
+ * its owner, admin, or billing contact can, and someone with no active organization is spending their own
+ * money. Says nothing about whether they NEED more credits — callers still gate on the plan.
+ *
+ * Shared with the webviews on purpose: the Settings account panel's AI usage card and the weekly
+ * usage-limit notification both decide who gets a purchase path from this one predicate, so they can't
+ * drift into offering it to different people.
+ */
+export function canPurchaseAiCredits(subscription: Subscription): boolean {
+	const role = subscription.activeOrganization?.role;
+	return role == null || role === 'owner' || role === 'admin' || role === 'billing';
+}
+
+/**
+ * Whether the account itself blocks access — none connected, or one whose email isn't verified.
+ * Surfaces gated on this (e.g. the Commit Graph) replace their entire content with an account screen,
+ * so callers routing work to one must treat it as unusable ahead of any plan/visibility check.
+ */
+export function isAccountAccessRequired(subscription: Subscription): boolean {
+	return subscription.account == null || subscription.account.verified === false;
+}
+
 export function computeSubscriptionState(subscription: Optional<Subscription, 'state'>): SubscriptionState {
 	const {
 		account,
@@ -192,6 +215,35 @@ export function getSubscriptionProductPlanNameFromState(
 	}
 }
 
+/**
+ * Weekly GitKraken AI credit allowance for a paid plan — the bare figure only (e.g. `'1M'`, `'500K'`);
+ * each caller composes its own "… credits/week" phrasing, since consumers phrase it differently (a plan
+ * card's feature bullet, an upsell pitch sentence, a popover tooltip). Takes `PaidSubscriptionPlanIds`
+ * rather than `SubscriptionPlanIds` — Community plans have no AI credit allowance at all, so the type
+ * system makes passing one impossible rather than silently returning Pro's figure for it; callers with a
+ * possibly-unpaid id must narrow first (see `isSubscriptionPaidPlan`).
+ *
+ * A trial carries its OWN, much smaller grant (`'250K'`) than the plan it previews — reading the
+ * previewed plan's number here would overstate a trial's budget 4x — so `trial` short-circuits the
+ * per-plan table rather than being derived from `planId`.
+ */
+export function getSubscriptionPlanAiCredits(planId: PaidSubscriptionPlanIds, trial: boolean): string {
+	if (trial) return '250K';
+
+	switch (planId) {
+		case 'student':
+			return '500K';
+		case 'pro':
+			return '1M';
+		case 'advanced':
+			return '2M';
+		case 'teams':
+			return '3M';
+		case 'enterprise':
+			return '4M';
+	}
+}
+
 export function getSubscriptionStateString(state: SubscriptionState | undefined): SubscriptionStateString {
 	switch (state) {
 		case SubscriptionState.VerificationRequired:
@@ -208,6 +260,26 @@ export function getSubscriptionStateString(state: SubscriptionState | undefined)
 			return 'paid';
 		default:
 			return 'unknown';
+	}
+}
+
+/**
+ * Which entitlement is currently active, collapsing the finer states: unverified, expired, and
+ * reactivation-eligible all mean Pro isn't active. `undefined` when the state isn't known yet — callers
+ * should treat that as "don't assert anything" rather than as unpaid.
+ */
+export function getSubscriptionEntitlement(
+	state: SubscriptionState | undefined,
+): 'unpaid' | 'trial' | 'paid' | undefined {
+	switch (getSubscriptionStateString(state)) {
+		case 'paid':
+			return 'paid';
+		case 'trial':
+			return 'trial';
+		case 'unknown':
+			return undefined;
+		default:
+			return 'unpaid';
 	}
 }
 

@@ -5,10 +5,15 @@ import type { Disposable, WorkspaceFolder } from 'vscode';
 import { extensions, FileType, Uri, window, workspace } from 'vscode';
 import { fetch } from '@env/fetch.js';
 import { isLinux, isWindows } from '@env/platform.js';
+import type { CliGitProviderOptions } from '@gitlens/git-cli/cliGitProvider.js';
+import { CliGitProvider } from '@gitlens/git-cli/cliGitProvider.js';
+import type { GitLocation } from '@gitlens/git-cli/exec/locator.js';
+import { findGitPath, InvalidGitConfigError, UnableToFindGitError } from '@gitlens/git-cli/exec/locator.js';
 import type { Cache } from '@gitlens/git/cache.js';
 import type { GitRemote } from '@gitlens/git/models/remote.js';
 import { RemoteResourceType } from '@gitlens/git/models/remoteResource.js';
 import type { GitDir } from '@gitlens/git/models/repository.js';
+import { forcedRepositoryChanges } from '@gitlens/git/models/repository.js';
 import { deletedOrMissing, uncommitted } from '@gitlens/git/models/revision.js';
 import type { GitProvider } from '@gitlens/git/providers/provider.js';
 import type { GitProviderDescriptor, RepositoryVisibility } from '@gitlens/git/providers/types.js';
@@ -23,10 +28,6 @@ import {
 } from '@gitlens/git/utils/revision.utils.js';
 import type { RevisionUriData, RevisionUriOptions } from '@gitlens/git/utils/uriAuthority.js';
 import { encodeGitLensRevisionUriAuthority } from '@gitlens/git/utils/uriAuthority.js';
-import type { CliGitProviderOptions } from '@gitlens/git-cli/cliGitProvider.js';
-import { CliGitProvider } from '@gitlens/git-cli/cliGitProvider.js';
-import type { GitLocation } from '@gitlens/git-cli/exec/locator.js';
-import { findGitPath, InvalidGitConfigError, UnableToFindGitError } from '@gitlens/git-cli/exec/locator.js';
 import { debounce } from '@gitlens/utils/debounce.js';
 import { debug, trace } from '@gitlens/utils/decorators/log.js';
 import type { UnifiedDisposable } from '@gitlens/utils/disposable.js';
@@ -64,7 +65,7 @@ import type {
 import { createGitProviderContext } from '../../../git/gitProviderContext.js';
 import type { GitUri } from '../../../git/gitUri.js';
 import { isGitUri } from '../../../git/gitUri.js';
-import type { RepositoryChangeEvent } from '../../../git/models/repository.js';
+import type { RepositoryChange, RepositoryChangeEvent } from '../../../git/models/repository.js';
 import { GlRepository } from '../../../git/models/repository.js';
 import { getRemoteProviderUrl } from '../../../git/utils/-webview/remote.utils.js';
 import {
@@ -212,6 +213,14 @@ export class GlCliGitProvider implements GlGitProvider {
 				...baseContext,
 				workspace: {
 					...baseContext.workspace!,
+					// Spreading `baseContext.workspace` evaluates its `isTrusted` getter and copies a static
+					// boolean — snapshotted at provider construction, which during untrusted activation freezes
+					// it at `false`. Every git command then reads that stale value and throws
+					// WorkspaceUntrustedError until a window reload rebuilds the context, so a runtime trust
+					// grant never takes. Re-declare it as a live getter so trust changes are seen immediately.
+					get isTrusted(): boolean {
+						return workspace.isTrusted;
+					},
 					getWorktreeDefaultUri: (repoPath: string): Uri | undefined => {
 						let location = configuration.get('worktrees.defaultLocation');
 						if (location == null) {
@@ -263,6 +272,12 @@ export class GlCliGitProvider implements GlGitProvider {
 							maxConcurrent: info.maxConcurrent,
 						});
 					},
+					onSlowCommand: info => {
+						// Feed the Git Health passive-slowness counters. Resolution stays in-memory only
+						// (`getRepository`) — never invoke git here, or we'd recurse through the exec layer
+						// that just fired this hook.
+						container.gitHealth.recordSlowCommand(info.cwd ?? '', info.duration, info.operation);
+					},
 				},
 			},
 		};
@@ -278,7 +293,14 @@ export class GlCliGitProvider implements GlGitProvider {
 		const repo = new GlRepository(this.container, this.descriptor, folder, uri, gitDir, root, opened);
 
 		repo.onDidChange(e => {
-			this.cache.onRepositoryChanged(repo.path, [...e.changes]);
+			// Only force-fired changes need telling here: they're delivered straight to this emitter, bypassing the
+			// watch session, so nothing upstream told the cache. Everything else went through the session, which
+			// already did it once, before notifying anyone (see `GitProviderService`'s global wiring) — telling it
+			// again would land a second time mid-notification, and a consumer reading status synchronously in that
+			// gap would spawn a duplicate `git status` the second advance immediately fences out.
+			if (e.changed(...forcedRepositoryChanges)) {
+				this.onRepositoryChanged(repo.path, e.changes);
+			}
 
 			if (!e.changed('unknown', 'closed')) {
 				if (e.changed('head')) {
@@ -293,8 +315,16 @@ export class GlCliGitProvider implements GlGitProvider {
 			this._onWillChangeRepository.fire(e);
 			this._onDidChangeRepository.fire(e);
 		});
+		// Working-tree changes are not wired here: they're driven onto the cache's status clock once, globally,
+		// at the watch session (see `GitProviderService`), so open repos and closed worktrees share one increment.
 
 		return repo;
+	}
+
+	/** Advance the cache for a FORCE-fired repo change (`opened`/`closed`/`lastFetched`), which bypasses the watch
+	 *  session — session-routed changes are advanced once by the session itself (see `GitProviderService`). */
+	private onRepositoryChanged(repoPath: string, changes: Iterable<RepositoryChange>): void {
+		this.cache.onRepositoryChanged(repoPath, changes);
 	}
 
 	private _gitLocator: Promise<GitLocation> | undefined;
@@ -1003,12 +1033,23 @@ export class GlCliGitProvider implements GlGitProvider {
 
 		// If the ref is the index, then try to create a Uri using the Git extension, but if we can't find a repo for it, then generate our own Uri
 		if (isUncommittedStaged(rev)) {
+			// If the repoPath is a canonical path, then we need to remap it to the real path, because the vscode.git extension always uses the real path
+			const realUri = this.fromCanonicalMap.get(repoPath);
+
 			let scmRepo = await this.getScmRepository(repoPath);
+			if (scmRepo == null && realUri != null) {
+				scmRepo = await this.getScmRepository(realUri.fsPath);
+			}
+
 			if (scmRepo == null) {
-				// If the repoPath is a canonical path, then we need to remap it to the real path, because the vscode.git extension always uses the real path
-				const realUri = this.fromCanonicalMap.get(repoPath);
-				if (realUri != null) {
-					scmRepo = await this.getScmRepository(realUri.fsPath);
+				// Not registered — or only an ancestor is, e.g. a worktree nested inside another repo — so
+				// force-register it: the built-in Stage/Unstage Hunk gutter actions only appear for `git:`
+				// index Uris the Git extension can resolve. Verify the root, since `openRepository`
+				// discovers the root from the path itself
+				const uri = realUri ?? Uri.file(repoPath);
+				const opened = await this.getOrOpenScmRepository(uri);
+				if (opened != null && arePathsEqual(opened.rootUri.fsPath, uri.fsPath)) {
+					scmRepo = opened;
 				}
 			}
 
@@ -1604,7 +1645,26 @@ export class GlCliGitProvider implements GlGitProvider {
 		const scope = getScopedLogger();
 		try {
 			const gitApi = await this.getScmGitApi();
-			return gitApi?.getRepository(Uri.file(repoPath)) ?? undefined;
+			const repo = gitApi?.getRepository(Uri.file(repoPath));
+			if (repo == null) return undefined;
+
+			// `getRepository` returns any opened repository that "contains" the path, so a worktree or
+			// nested repo living inside an opened repo resolves to that ancestor instead. Callers mean
+			// this exact repo: they build `git:` Uris for it (which carry no repo, so the Git extension
+			// re-resolves them by path against the ancestor, where the path isn't in the index) or they
+			// write to its SCM input box (landing the text in the ancestor's box). Both fail silently,
+			// so require the roots to match. `arePathsEqual` normalizes separators and drive casing,
+			// which a Uri/string comparison would trip over on Windows.
+			if (!arePathsEqual(repo.rootUri.fsPath, repoPath)) {
+				scope?.info(
+					`no SCM repository for '${repoPath}'; closest match is the containing repository '${repo.rootUri.toString(
+						true,
+					)}'`,
+				);
+				return undefined;
+			}
+
+			return repo;
 		} catch (ex) {
 			scope?.error(ex);
 			return undefined;

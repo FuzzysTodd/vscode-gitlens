@@ -91,6 +91,36 @@ export async function batchResults<T, R>(
 	return results;
 }
 
+/**
+ * `Promise.all(items.map(task))` with at most `concurrency` tasks in flight. Unlike {@link batchResults} this is
+ * a sliding window rather than a barrier per batch, so a slow item doesn't idle the rest of the window. Results
+ * are returned in input order and the first rejection propagates, matching `Promise.all`.
+ *
+ * Use it for a fan-out whose width is data-driven (one task per org/project/provider): unbounded `Promise.all`
+ * over such a list opens as many concurrent upstream requests as there are items, which invites provider rate
+ * limiting and socket exhaustion.
+ */
+export async function mapBounded<T, R>(
+	items: readonly T[],
+	concurrency: number,
+	task: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+	const limit = Math.max(1, Math.trunc(concurrency));
+	if (items.length <= limit) return Promise.all(items.map((item, index) => task(item, index)));
+
+	const results = new Array<R>(items.length);
+	let next = 0;
+
+	async function worker(): Promise<void> {
+		for (let index = next++; index < items.length; index = next++) {
+			results[index] = await task(items[index], index);
+		}
+	}
+
+	await Promise.all(Array.from({ length: limit }, () => worker()));
+	return results;
+}
+
 export class PromiseCancelledError<T extends Promise<any> = Promise<any>> extends Error {
 	constructor(
 		public readonly promise: T,
@@ -177,7 +207,7 @@ export function cancellable<T>(
 				disposeCancellation?.dispose();
 				disposeTimeout?.dispose();
 
-				// eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+				// oxlint-disable-next-line typescript/prefer-promise-reject-errors
 				reject(ex);
 			},
 		);
@@ -222,7 +252,7 @@ export function getDeferredPromiseIfPending<T>(deferred: Deferred<T> | undefined
 export type MaybePromiseArr<T> = (Promise<T | undefined> | T | undefined)[];
 
 export async function nonnullSettled<T>(arr: MaybePromiseArr<T>): Promise<T[]> {
-	// eslint-disable-next-line @typescript-eslint/await-thenable
+	// oxlint-disable-next-line typescript/await-thenable
 	const all = await Promise.allSettled(arr);
 	return all.map(r => getSettledValue(r)).filter(v => v != null);
 }
@@ -485,7 +515,7 @@ export async function pauseOnCancelOrTimeoutMapTuple<Id, T, U extends unknown[]>
 	}
 
 	const results = await Promise.all(
-		// eslint-disable-next-line @typescript-eslint/await-thenable
+		// oxlint-disable-next-line typescript/await-thenable
 		map(source, ([id, [promise, ...rest]]) =>
 			promise == null
 				? ([id, [undefined, ...rest]] as const)

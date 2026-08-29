@@ -11,6 +11,7 @@ import type { GitFileChangeShape, GitFileChangeStats } from '@gitlens/git/models
 import type { GitPausedOperationStatus } from '@gitlens/git/models/pausedOperationStatus.js';
 import type { RepositoryChange } from '@gitlens/git/models/repository.js';
 import type { Source, TelemetryEventData, TelemetryEvents } from '../../../constants.telemetry.js';
+import type { AIModelScope } from '../../../plus/ai/aiProviderService.js';
 
 // Re-export for webview-side consumers (avoids deep `../../../../git/` imports)
 export type { RepositoryChange } from '@gitlens/git/models/repository.js';
@@ -64,15 +65,6 @@ export interface SerializedRepository {
 	readonly uri: string;
 	readonly closed: boolean;
 	readonly starred: boolean;
-}
-
-/**
- * Serialized commit reference for RPC.
- */
-export interface SerializedCommitRef {
-	readonly repoPath: string;
-	readonly sha: string;
-	readonly message?: string;
 }
 
 /**
@@ -139,6 +131,28 @@ export interface IntegrationChangeEventData {
 }
 
 /**
+ * Serializable per-agent info for the Agents settings table.
+ * `mcp`/`hooks` are present only for gkcli-provided CLI agents and hook-only editor agents;
+ * Chat/Extension agents omit them. `editor` agents are hook-capable IDE agents (cursor, antigravity)
+ * that aren't detected CLIs — they render under their own "Editors" section, with no Default radio
+ * or MCP action; `detected` gates their dimmed "Not detected" treatment.
+ */
+export interface AgentInfo {
+	readonly id: string;
+	readonly label: string;
+	readonly kind: 'ide-chat' | 'claude-extension' | 'cli' | 'editor';
+	readonly detected?: boolean;
+	readonly mcp?: { readonly supported: boolean; readonly installed: boolean };
+	/** `manualActivation` mirrors `AgentCapabilities.manualActivation` (see
+	 *  `packages/plus/agents/src/agentCapabilities.ts`) — an extra step the agent's host requires
+	 *  before installed hooks actually fire, surfaced unconditionally whenever `installed` is true. */
+	readonly hooks?: { readonly supported: boolean; readonly installed: boolean; readonly manualActivation?: string };
+	/** For an IDE-host row that supports hooks, the gkcli agent name to target for hooks install/uninstall
+	 *  (e.g. `cursor`) — this row's own `id` may be `ide-chat`. Absent when `id` is already the hooks target. */
+	readonly hooksAgentId?: string;
+}
+
+/**
  * Serializable AI model info.
  * A simplified shape that crosses the RPC boundary safely.
  */
@@ -146,6 +160,18 @@ export interface AiModelInfo {
 	readonly id: string;
 	readonly name: string;
 	readonly provider: { readonly id: string; readonly name: string };
+	/** Provider-supplied consumption-rate label (GitKraken AI only); undefined for other providers. */
+	readonly consumptionRateLabel?: string;
+}
+
+/** Per-scope AI model selection for the Settings AI panel. */
+export interface ScopedAiModelInfo {
+	/** The operation this selection applies to. */
+	readonly scope: AIModelScope;
+	/** The model the scope will actually use — the override when set, otherwise the resolved default. */
+	readonly model: AiModelInfo | undefined;
+	/** True only when the scope has its own stored selection AND that selection is what resolved. */
+	readonly isOverride: boolean;
 }
 
 /**
@@ -163,28 +189,50 @@ export interface AIState {
 	/** MCP state, nested under AI since MCP requires AI to be enabled. */
 	readonly mcp: {
 		readonly bundled: boolean;
+		/** True iff the running host can register the bundled MCP server (independent of the opt-in). */
+		readonly capable: boolean;
 		readonly settingEnabled: boolean;
 		readonly installed: boolean;
 	};
-	/** AI hooks state — whether a hook-supporting agent is detected. */
+	/** AI hooks state — per hook-capable agent from `gk agents list`, plus aggregate flags. */
 	readonly hooks: {
-		/** Per-agent Claude hook state from `gk agents list`. `supported` may be false if gkcli is missing. */
-		readonly claude: {
-			readonly detected: boolean;
-			readonly supported: boolean;
-			readonly installed: boolean;
-		};
+		/** Detected, hooks-supported agents (`detected && hooksSupported`). Empty when gkcli is missing. */
+		readonly agents: readonly { readonly id: string; readonly displayName: string; readonly installed: boolean }[];
 		/**
-		 * True when the install action is currently relevant (supported, detected, not yet installed).
-		 * Banners and the integrations-chip "Install" CTA gate on this; the uninstall CTA gates on `claude.installed`.
+		 * True when at least one agent in `agents` lacks hooks (install action is relevant).
+		 * Banners and the integrations-chip "Install" CTA gate on this; the uninstall CTA gates on `anyInstalled`.
 		 */
-		readonly canInstallClaudeHook: boolean;
+		readonly canInstallHooks: boolean;
+		/** True when at least one agent in `agents` has hooks installed. */
+		readonly anyInstalled: boolean;
 	};
 	/**
 	 * Currently-selected default coding agent (resolved from `gitlens.ai.defaultAgent`).
 	 * Undefined when no default is set or the persisted agent is not currently available.
 	 */
 	readonly defaultAgent: { readonly id: string; readonly label: string } | undefined;
+}
+
+/**
+ * GitKraken AI weekly usage standing (allowance, consumption, reset). `limit === -1` means unlimited,
+ * `limit === 0` means no allowance — never conflate the two.
+ */
+export interface AiUsageInfo {
+	readonly limit: number;
+	readonly used: number;
+	readonly resetsOn: string;
+	/**
+	 * The organization's shared pool rollup, when the backend reports a usable one — 20% of every seat's
+	 * weekly allowance funds it, which is why `limit` above reads below the plan's stated per-week figure.
+	 * Same sentinels as `limit`.
+	 */
+	readonly organization?: { readonly used: number; readonly limit: number };
+	/**
+	 * This user's own consumption drawn from the shared organization pool — the slice of
+	 * `organization.used` attributable to the current account, NOT a separate allowance and NOT part of
+	 * `used` above. Lets the pool's bar separate this user's draw from the rest of the organization's.
+	 */
+	readonly sharedUsed?: number;
 }
 
 // ============================================================
@@ -203,6 +251,16 @@ export interface CommitSignatureShape {
 	fingerprint?: string;
 	trustLevel?: 'ultimate' | 'full' | 'marginal' | 'never' | 'unknown';
 	errorMessage?: string;
+}
+
+/**
+ * Provider-resolved avatars for a commit, as serialized URI strings. Fetched off the critical path —
+ * the core commit payload carries a synchronous cached-or-gravatar avatar, and this upgrades it.
+ * `committer` is only set when the committer differs from the author.
+ */
+export interface CommitAvatarsShape {
+	author?: string;
+	committer?: string;
 }
 
 // ============================================================
@@ -267,6 +325,50 @@ export interface SerializedGitFileChange extends GitFileChangeShape {
 }
 
 // ============================================================
+// Conflict Details Types
+// ============================================================
+
+/** One commit that changed a conflicted file on one side (merge-base → side ref). */
+export interface ConflictDetailsCommit {
+	readonly sha: string;
+	readonly shortSha: string;
+	readonly message: string;
+	readonly author: string;
+	readonly authorEmail?: string;
+	readonly avatarUrl?: string;
+	/** Committer identity (avatar overlay + hover) — set only when the committer differs from the author. */
+	readonly committerAvatarUrl?: string;
+	readonly committerName?: string;
+	readonly committerEmail?: string;
+	/** Committer date as epoch ms — set only when the committer differs from the author. */
+	readonly committerDate?: number;
+	/** Author date as epoch ms (webview renders via `new Date(date)`). */
+	readonly date: number;
+}
+
+/** One side (current/incoming) of a conflict: its ref, how to render it, and the commits behind it. */
+export interface ConflictDetailsSide {
+	readonly ref: string;
+	/** Whether the side resolves to a branch (render a branch pill) or a bare commit (sha pill). */
+	readonly refKind: 'branch' | 'commit';
+	/** Branch name (when `refKind === 'branch'`) or commit sha (when `'commit'`) for the pill. */
+	readonly refName: string;
+	readonly commits: readonly ConflictDetailsCommit[];
+}
+
+/** Per-side history + stage affordances for a conflicted file, for the graph WIP Conflict Details sheet. */
+export interface ConflictDetails {
+	readonly path: string;
+	readonly status: string;
+	/** False when no merge-base is available — per-side commit history can't be computed. */
+	readonly hasMergeBase: boolean;
+	readonly canStageCurrent: boolean;
+	readonly canStageIncoming: boolean;
+	readonly current: ConflictDetailsSide;
+	readonly incoming: ConflictDetailsSide;
+}
+
+// ============================================================
 // Working Tree / WIP Types
 // ============================================================
 
@@ -309,6 +411,12 @@ export interface WipChange {
 	files: WipFileChange[];
 	hasConflicts?: boolean;
 	pausedOpStatus?: GitPausedOperationStatus;
+	/** An automatic (AI) rebase session owns the paused rebase, so continuing should resume that run
+	 *  rather than issue a plain `--continue` */
+	aiRebaseActive?: boolean;
+	/** A continue/skip is still running. `<op> --continue` blocks for as long as git's commit-message tab
+	 *  stays open, so only the host knows when it ends — the bar can't time it. */
+	pausedOpContinuing?: boolean;
 }
 
 // ============================================================

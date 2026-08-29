@@ -127,16 +127,18 @@ export const urls = Object.freeze({
 	graph: `https://gitkraken.com/solutions/commit-graph?${utm}`,
 	launchpad: `https://gitkraken.com/solutions/launchpad?${utm}`,
 	platform: `https://gitkraken.com/devex?${utm}`,
-	pricing: `https://gitkraken.com/gitlens/pricing?${utm}`,
+	pricing: `https://gitkraken.com/pricing?${utm}`,
 	proFeatures: `https://gitkraken.com/gitlens/pro-features?${utm}`,
 	security: `https://help.gitkraken.com/gitlens/security?${utm}`,
 	workspaces: `https://gitkraken.com/solutions/workspaces?${utm}`,
+
+	kepler: `https://www.gitkraken.com/kepler?${utm}`,
 
 	cli: `https://gitkraken.com/cli?${utm}`,
 	browserExtension: `https://gitkraken.com/browser-extension?${utm}`,
 	desktop: `https://gitkraken.com/git-client?${utm}`,
 
-	githubIssues: `https://github.com/gitkraken/vscode-gitlens/issues/?${utm}`,
+	githubNewIssue: `https://github.com/gitkraken/vscode-gitlens/issues/new/choose?${utm}`,
 	githubDiscussions: `https://github.com/gitkraken/vscode-gitlens/discussions/?${utm}`,
 	helpCenter: `https://help.gitkraken.com/gitlens/gitlens-start-here/?${utm}`,
 	helpCenterHome: `https://help.gitkraken.com/gitlens/home-view/?${utm}`,

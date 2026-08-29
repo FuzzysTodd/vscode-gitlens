@@ -10,6 +10,7 @@ import {
 	isBranchReference,
 	isRevisionReference,
 } from '@gitlens/git/utils/reference.utils.js';
+import { getIssueOwner } from '@gitlens/integrations/providers/utils.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import type { Deferred } from '@gitlens/utils/promise.js';
 import { defer } from '@gitlens/utils/promise.js';
@@ -18,7 +19,6 @@ import type { GlRepository } from '../../../git/models/repository.js';
 import { addAssociatedIssueToBranch } from '../../../git/utils/-webview/branch.issue.utils.js';
 import { showGitErrorMessage } from '../../../messages.js';
 import type { StartReviewChatAction, StartWorkChatAction } from '../../../plus/chat/chatActions.js';
-import { getIssueOwner } from '../../../plus/integrations/providers/utils.js';
 import type { FlagsQuickPickItem } from '../../../quickpicks/items/flags.js';
 import { createFlagsQuickPickItem } from '../../../quickpicks/items/flags.js';
 import { executeCommand } from '../../../system/-webview/command.js';
@@ -39,12 +39,7 @@ import { pickBranchOrTagStep } from '../../quick-wizard/steps/references.js';
 import { canSkipRepositoryPick, pickRepositoryStep } from '../../quick-wizard/steps/repositories.js';
 import { StepsController } from '../../quick-wizard/stepsController.js';
 import { getSteps } from '../../quick-wizard/utils/quickWizard.utils.js';
-import {
-	appendReposToTitle,
-	assertStepState,
-	canPickStepContinue,
-	createConfirmStep,
-} from '../../quick-wizard/utils/steps.utils.js';
+import { appendReposToTitle, assertStepState, canPickStepContinue } from '../../quick-wizard/utils/steps.utils.js';
 import type { BranchContext } from '../branch.js';
 
 const Steps = {
@@ -95,6 +90,10 @@ export class BranchCreateGitCommand extends QuickCommand<State> {
 		});
 
 		this.initialState = { confirm: args?.confirm, ...args?.state };
+	}
+
+	protected override get supportsSkipConfirmToggle(): boolean {
+		return true;
 	}
 
 	protected createContext(context?: StepsContext<any>): Context {
@@ -263,7 +262,10 @@ export class BranchCreateGitCommand extends QuickCommand<State> {
 				steps.markStepsComplete();
 
 				if (state.flags.includes('--switch')) {
-					await state.repo.git.switch(state.reference.ref, { createBranch: state.name });
+					await state.repo.git.switch(state.reference.ref, {
+						createBranch: state.name,
+						...(isRemoteBranch && state.name !== remoteBranchName ? { noTracking: true } : undefined),
+					});
 				} else {
 					try {
 						await state.repo.git.branches.createBranch?.(
@@ -367,10 +369,11 @@ export class BranchCreateGitCommand extends QuickCommand<State> {
 			);
 		}
 
-		const step: QuickPickStep<FlagsQuickPickItem<Flags>> = createConfirmStep(
+		const step: QuickPickStep<FlagsQuickPickItem<Flags>> = this.createConfirmStep(
 			appendReposToTitle(`Confirm ${context.title}`, state, context),
 			confirmItems,
-			context,
+			undefined,
+			{ placeholder: `Confirm ${context.title}` },
 		);
 		const selection: StepSelection<typeof step> = yield step;
 		return canPickStepContinue(step, state, selection) ? selection[0].item : StepResultBreak;

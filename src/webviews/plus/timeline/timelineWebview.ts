@@ -41,7 +41,8 @@ import { openTextEditor } from '../../../system/-webview/vscode/editors.js';
 import { getTabUri, tabContainsPath } from '../../../system/-webview/vscode/tabs.js';
 import type { EventVisibilityBuffer, SubscriptionTracker } from '../../rpc/eventVisibilityBuffer.js';
 import { createRpcEventSubscription } from '../../rpc/eventVisibilityBuffer.js';
-import { createSharedServices, proxyServices } from '../../rpc/services/common.js';
+import { createSharedServices } from '../../rpc/services/common.js';
+import { proxyServices } from '../../rpc/services/proxy.js';
 import type { WebviewHost, WebviewProvider, WebviewShowingArgs } from '../../webviewProvider.js';
 import type { WebviewShowOptions } from '../../webviewsController.js';
 import { isSerializedState } from '../../webviewsController.js';
@@ -60,7 +61,6 @@ import type {
 	TimelineScopeSerialized,
 	TimelineServices,
 } from './protocol.js';
-import { DidChangeNotification } from './protocol.js';
 import type { TimelineWebviewShowingArgs } from './registration.js';
 import { buildTimelineDataset, buildWipDatums } from './timelineDataset.js';
 import {
@@ -101,9 +101,6 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 		return getTabUri(window.tabGroups.activeTabGroup.activeTab);
 	}
 
-	/** Subscription listener — fires legacy IPC notification for PromosContext cache invalidation */
-	private readonly _subscriptionDisposable: Disposable;
-
 	constructor(
 		private readonly container: Container,
 		private readonly host: WebviewHost<'gitlens.views.timeline' | 'gitlens.timeline'>,
@@ -111,21 +108,9 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 		if (this.host.is('view')) {
 			this.host.description = proBadge;
 		}
-
-		// Bridge: fire legacy DidChangeNotification on subscription changes so
-		// PromosContext (which listens for IPC, not RPC) can clear its cache
-		this._subscriptionDisposable = this.container.subscription.onDidChange(() => {
-			const state: Partial<State> = {
-				webviewId: this.host.id,
-				webviewInstanceId: this.host.instanceId,
-				timestamp: Date.now(),
-			};
-			void this.host.notify(DidChangeNotification, { state: state as State });
-		});
 	}
 
 	dispose(): void {
-		this._subscriptionDisposable.dispose();
 		this._onScopeChanged.dispose();
 		this._disposable?.dispose();
 		this._repositorySubscription?.dispose();
@@ -277,15 +262,9 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 	}
 
 	getRpcServices(buffer?: EventVisibilityBuffer, tracker?: SubscriptionTracker): TimelineServices {
-		const base = createSharedServices(
-			this.container,
-			this.host,
-			context => {
-				this._telemetryContext = context as TimelineWebviewTelemetryContext;
-			},
-			buffer,
-			tracker,
-		);
+		const base = createSharedServices(this.container, this.host, buffer, tracker, context => {
+			this._telemetryContext = context as TimelineWebviewTelemetryContext;
+		});
 
 		return proxyServices({
 			...base,
@@ -342,7 +321,11 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 				await git.isDiscoveringRepositories;
 			}
 
-			const repo = git.getRepository(scope.uri) ?? (await git.getOrAddRepository(scope.uri, { opened: false }));
+			// `detectNested: true` resolves a worktree nested in scope.uri's container (getRepository alone folds to
+			// the ancestor). Fall back to getRepository when discovery can't resolve a root (e.g. virtual repos).
+			const repo =
+				(await git.getOrAddRepository(scope.uri, { opened: false, detectNested: true })) ??
+				git.getRepository(scope.uri);
 			if (repo != null) {
 				if (areUrisEqual(scope.uri, repo.uri)) {
 					scope.type = 'repo';
@@ -398,11 +381,19 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 			this.updateViewTitle(scope, repo);
 		}
 
+		// `mixed` means the workspace has both public and private repos — so a gated (private) scope can
+		// offer switching to a public one. Only computed when access is denied (the only time the gate, and
+		// thus the switch affordance, is shown) to avoid an aggregate visibility() scan on every (allowed)
+		// dataset fetch, including each load-more. The result is cached on the provider.
+		const allowRepoSwitch =
+			result.access.allowed === false ? (await this.container.git.visibility()) === 'mixed' : false;
+
 		return {
 			dataset: result.dataset,
 			scope: result.scope,
 			repository: result.repository,
 			access: result.access,
+			allowRepoSwitch: allowRepoSwitch,
 		};
 	}
 
@@ -515,8 +506,9 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 
 	private openInEditor(scopeSerialized: TimelineScopeSerialized): void {
 		const scope = deserializeTimelineScope(scopeSerialized);
-		// Reconstruct URI from relativePath — the webview may have changed
-		// relativePath (via choosePath/changeScope) without updating the URI
+		// Reconstruct URI from relativePath — the webview may have changed relativePath (via choosePath/changeScope)
+		// without updating the URI. getRepository resolves a nested worktree here because the timeline dataset already
+		// registered it (so getClosest finds it, not the container).
 		if (scopeSerialized.relativePath && scope.type !== 'repo') {
 			const repo = this.container.git.getRepository(scope.uri);
 			if (repo != null) {

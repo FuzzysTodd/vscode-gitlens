@@ -7,17 +7,20 @@ import type { GitStatus } from '@gitlens/git/models/status.js';
 import { GitWorktree } from '@gitlens/git/models/worktree.js';
 import type { BranchContributionsOverview } from '@gitlens/git/providers/branches.js';
 import type { GitCommandPriority } from '@gitlens/git/run.types.js';
+import { getPullRequestNumberFromUrl } from '@gitlens/git/utils/pullRequest.utils.js';
 import { createRevisionRange } from '@gitlens/git/utils/revision.utils.js';
 import { filterMap } from '@gitlens/utils/iterable.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
 import type { EnrichedAutolink } from '../../autolinks/models/autolinks.js';
 import type { Container } from '../../container.js';
+import { isContinuingPausedOperation } from '../../git/actions/pausedOperation.js';
 import { getAssociatedIssuesForBranch } from '../../git/utils/-webview/branch.issue.utils.js';
 import {
 	getBranchAssociatedPullRequest,
 	getBranchEnrichedAutolinks,
 	getBranchMergeTargetInfo,
 	getBranchRemote,
+	isSelfMergeTarget,
 } from '../../git/utils/-webview/branch.utils.js';
 import { getContributorAvatarUri } from '../../git/utils/-webview/contributor.utils.js';
 import type { LaunchpadCategorizedResult } from '../../plus/launchpad/launchpadProvider.js';
@@ -115,14 +118,11 @@ export async function getBranchMergeTargetStatusInfo(
 	const targetBranch = await svc.branches.getBranch(target, cancellation);
 	// The tip SHA is required — without it the graph's scope anchor can't be placed.
 	if (targetBranch?.sha == null) return undefined;
-	// Bail when the target tip is the same commit as the focal branch's tip — there's no real
-	// merge to describe (happens on the default branch, where the fallback chain has nowhere
-	// to land, and on any feature branch transiently equal to its target). Letting it through
-	// poisons `scope.mergeTargetTipSha` via `reconcileScopeMergeTarget` / `scopeToBranchById`,
-	// and the graph component's `shouldHideWipRowForScope` then hides the WIP row of every
-	// worktree on the scoped branch because the parent sha matches the (excluded) merge-target
-	// tip. Matches the early-out in `computeScopeAnchor` (graphWebview.ts).
-	if (targetBranch.sha === branch.sha) return undefined;
+	// Self target with equal tips (the default branch up to date with its own remote): 0/0 counts and a
+	// trivially-merged status say nothing, so the sidebars skip it. The graph's `computeScopeAnchor` still
+	// anchors this shape (scope always scopes) — the divergence is safe because `reconcileScopeMergeTarget`
+	// only backfills scope anchors from this enrichment, never strips them.
+	if (targetBranch.sha === branch.sha && isSelfMergeTarget(target, branch.name)) return undefined;
 
 	const [countsResult, conflictResult, mergedStatusResult] = await Promise.allSettled([
 		svc.commits.getLeftRightCommitCount(
@@ -195,7 +195,6 @@ export async function getLaunchpadItemInfo(
 				approval: lpi.approvalReviewCount,
 				changeRequest: lpi.changeRequestReviewCount,
 				comment: lpi.commentReviewCount,
-				codeSuggest: lpi.codeSuggestionsCount,
 			},
 		},
 
@@ -217,6 +216,7 @@ export async function getPullRequestInfo(
 
 	return {
 		id: pr.id,
+		number: getPullRequestNumberFromUrl(pr.url) ?? pr.id,
 		url: pr.url,
 		state: pr.state,
 		title: pr.title,
@@ -225,6 +225,10 @@ export async function getPullRequestInfo(
 		updatedDate: pr.updatedDate?.getTime(),
 		reviewDecision: pr.reviewDecision,
 		providerId: pr.provider.id,
+		stack:
+			pr.stack != null
+				? { number: pr.stack.number, position: pr.stack.position, size: pr.stack.size }
+				: undefined,
 		launchpad: getLaunchpadItemInfo(container, pr, launchpadPromise),
 	};
 }
@@ -247,7 +251,7 @@ export async function getOverviewWip(
 		 * Cheap mode for Recent worktree-backed branches: probes `status.hasWorkingChanges()`
 		 * (`git diff --quiet` + `git ls-files`) per worktree instead of running a full status. Result
 		 * carries `hasChanges` only — `workingTreeState`, conflicts, and pausedOp are all undefined
-		 * and get filled in lazily on hover via `GetOverviewWipDetailedRequest`. The probe is
+		 * and get filled in lazily on hover via `GraphOverviewService.getWipDetailed`. The probe is
 		 * `@gate`d at the sub-provider so concurrent identical calls dedup.
 		 */
 		cheap?: boolean;
@@ -270,7 +274,7 @@ export async function getOverviewWip(
 	if (cheap) {
 		// Cheap path: dirty-bit only, no paused-op, no breakdown. Used for Recent worktree-backed
 		// cards so they can show a clean/dirty indicator without paying for a full `git status` per
-		// branch. The full breakdown is fetched on hover via `GetOverviewWipDetailedRequest`.
+		// branch. The full breakdown is fetched on hover via `GraphOverviewService.getWipDetailed`.
 		await Promise.allSettled(
 			branchIds.map(async branchId => {
 				if (!branchesById.has(branchId)) return;
@@ -349,6 +353,11 @@ export async function getOverviewWip(
 					hasConflicts: status?.hasConflicts,
 					conflictsCount: status?.conflicts.length,
 					pausedOpStatus: pausedOpStatus,
+					// Asked with the same worktree-aware path as the status above — the in-flight set holds
+					// the path of the repo that OWNS the paused op. `repoPath` may be a raw `Uri.fsPath`
+					// (backslashes on Windows); the lookup normalizes it to the set's key form.
+					pausedOpContinuing:
+						pausedOpStatus != null && isContinuingPausedOperation(repoPath) ? true : undefined,
 				};
 			}
 		}),

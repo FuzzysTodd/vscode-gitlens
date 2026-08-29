@@ -10,9 +10,9 @@ import { urls } from './constants.js';
 import type { Source } from './constants.telemetry.js';
 import type { Container } from './container.js';
 import { formatIdentityDisplayName, getCommitFormattedDate } from './git/utils/-webview/commit.utils.js';
-import { mcpRegistrationAllowed } from './plus/gk/utils/-webview/mcp.utils.js';
 import { executeCommand, executeCoreCommand } from './system/-webview/command.js';
 import { configuration } from './system/-webview/configuration.js';
+import { openTerminal } from './system/-webview/terminal.js';
 import { openUrl } from './system/-webview/vscode/uris.js';
 
 export function showBlameInvalidIgnoreRevsFileWarningMessage(
@@ -110,7 +110,7 @@ function escapeShellArg(arg: string): string {
 }
 
 function showGitCommandInTerminal(gitCommand: GitCommandContext, error: GitCommandError<any>): void {
-	const terminal = window.createTerminal({
+	const terminal = openTerminal({
 		cwd: gitCommand.repoPath,
 		name: 'GitLens',
 		hideFromUser: false,
@@ -310,9 +310,14 @@ export async function showWhatsNewMessage(majorVersion: string): Promise<void> {
 	const confirm = { title: 'OK', isCloseAffordance: true };
 	const releaseNotes = { title: 'View Release Notes' };
 	const openWalkthrough = { title: 'Open Walkthrough' };
+	const openGraph = { title: 'Show Commit Graph' };
 
 	let message: string;
 	switch (majorVersion) {
+		case '19':
+			message =
+				'GitLens 19 is here — the Commit Graph has been rebuilt from the ground up: dramatically faster, lighter, now the heart of GitLens, with new and enhanced workflows from code to merge.';
+			break;
 		case '18':
 			message =
 				'GitLens upgraded to 18 — the Commit Graph is all new with agent integration, multi-worktree WIP rows, AI-powered Review and Compose modes, and more.';
@@ -326,7 +331,7 @@ export async function showWhatsNewMessage(majorVersion: string): Promise<void> {
 			break;
 	}
 
-	const actions: MessageItem[] = [releaseNotes];
+	const actions: MessageItem[] = majorVersion === '19' ? [openGraph, releaseNotes] : [releaseNotes];
 	if (majorVersion === '18') {
 		actions.push(openWalkthrough);
 	}
@@ -338,11 +343,13 @@ export async function showWhatsNewMessage(majorVersion: string): Promise<void> {
 		void openUrl(urls.releaseNotes);
 	} else if (result === openWalkthrough) {
 		void executeCommand('gitlens.showWelcomeView', { mode: 'graph' });
+	} else if (result === openGraph) {
+		void executeCommand('gitlens.showGraphView');
 	}
 }
 
 export async function showMcpMessage(container: Container, _current: string): Promise<void> {
-	const isAutoInstallable = mcpRegistrationAllowed(container);
+	const isAutoInstallable = container.gkMcp?.isRegistrationAllowed ?? false;
 	const confirm = { title: 'OK', isCloseAffordance: true };
 	const learnMore = { title: 'Learn More' };
 	const connectMore = { title: 'Connect More Agents' };
@@ -376,7 +383,7 @@ export async function showMcpMessage(container: Container, _current: string): Pr
 	}
 
 	if (result === connectMore) {
-		void executeCommand<Source>('gitlens.ai.mcp.selectAgents', { source: 'mcp-welcome-message' });
+		void executeCommand<Source>('gitlens.ai.mcp.installForAllAgents', { source: 'mcp-welcome-message' });
 	}
 
 	if (result === learnMore) {
@@ -461,7 +468,7 @@ function suppressedMessage(suppressionKey: SuppressedMessages) {
 
 	for (const [key, value] of Object.entries(messages)) {
 		if (value !== true) {
-			// eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+			// oxlint-disable-next-line typescript/no-dynamic-delete
 			delete messages[key as keyof typeof messages];
 		}
 	}

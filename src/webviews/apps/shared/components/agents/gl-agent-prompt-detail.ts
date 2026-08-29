@@ -50,21 +50,21 @@ export class GlAgentPromptDetail extends LitElement {
 		.composite {
 			display: flex;
 			flex-direction: column;
-			gap: 0.2rem;
-			padding: 0.4rem 0.5rem;
-			border-radius: 0.3rem;
-			background-color: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+			gap: var(--gl-space-2);
 			min-width: 0;
+			padding: 0.4rem 0.5rem;
+			background-color: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+			border-radius: var(--gl-radius-sm);
 		}
 
 		.block {
-			font-size: 0.85em;
-			word-break: break-word;
 			display: -webkit-box;
-			-webkit-line-clamp: 2;
-			-webkit-box-orient: vertical;
-			overflow: hidden;
 			min-width: 0;
+			overflow: hidden;
+			-webkit-line-clamp: 2;
+			font-size: 0.85em;
+			overflow-wrap: anywhere;
+			-webkit-box-orient: vertical;
 		}
 
 		.block--code {
@@ -79,48 +79,69 @@ export class GlAgentPromptDetail extends LitElement {
 
 		.caption-row {
 			display: flex;
+			gap: var(--gl-space-4);
 			align-items: center;
-			gap: 0.4rem;
 			min-width: 0;
 		}
 
 		.caption {
 			flex: 1 1 auto;
 			min-width: 0;
+			overflow: hidden;
+			text-overflow: ellipsis;
 			font-size: 0.8em;
 			color: var(--vscode-descriptionForeground);
 			white-space: nowrap;
-			overflow: hidden;
-			text-overflow: ellipsis;
 		}
 
 		.caption-actions {
-			flex: none;
 			display: inline-flex;
+			flex: none;
+			gap: var(--gl-space-2);
 			align-items: center;
-			gap: 0.2rem;
 		}
 
 		/* gl-copy-container hosts a bare code-icon — give it the same hover affordance the
-		   sibling gl-action-chip has so the two buttons read as a matched pair. */
+	   sibling gl-action-chip has so the two buttons read as a matched pair. */
 		.caption-copy {
 			display: inline-flex;
 			align-items: center;
 			justify-content: center;
 			width: 2rem;
 			height: 2rem;
-			border-radius: 0.5rem;
 			color: inherit;
 			cursor: pointer;
+			border-radius: var(--gl-radius-sm);
 		}
 
 		.caption-copy:hover {
 			background-color: var(--vscode-toolbar-hoverBackground);
 		}
+
+		/* Only the agent-session detail sheet sets [expanded] — it has the room to show the
+		   full block and caption inline, so the clamp/ellipsis/tooltip that a cramped hover
+		   needs would just be noise there. */
+		:host([expanded]) .block {
+			display: block;
+			-webkit-line-clamp: unset;
+		}
+
+		:host([expanded]) .block--code {
+			white-space: pre-wrap;
+		}
+
+		:host([expanded]) .caption {
+			overflow: visible;
+			text-overflow: unset;
+			white-space: normal;
+		}
 	`;
 
 	@property({ attribute: false })
 	permission?: PendingPermission;
+
+	@property({ type: Boolean, reflect: true })
+	expanded = false;
 
 	override render(): unknown {
 		const permission = this.permission;
@@ -129,12 +150,13 @@ export class GlAgentPromptDetail extends LitElement {
 		const content = this.resolveContent(permission);
 		// Tooltip anchors to the block text only — wrapping the whole composite would intercept
 		// hovers over the caption-row's action chips/copy-container and conflict with their own
-		// tooltips.
-		const blockHtml = content.tooltip
-			? html`<gl-tooltip content=${content.tooltip} placement="bottom">
-					<div class=${content.blockClass}>${content.block}</div>
-				</gl-tooltip>`
-			: html`<div class=${content.blockClass}>${content.block}</div>`;
+		// tooltips. Expanded mode already shows the full text, so the tooltip would just be noise.
+		const blockHtml =
+			content.tooltip && !this.expanded
+				? html`<gl-tooltip content=${content.tooltip} placement="bottom">
+						<div class=${content.blockClass}>${content.block}</div>
+					</gl-tooltip>`
+				: html`<div class=${content.blockClass}>${content.block}</div>`;
 
 		return html` <div class="composite">${blockHtml}${this.renderCaptionRow(content)}</div> `;
 	}
@@ -144,30 +166,34 @@ export class GlAgentPromptDetail extends LitElement {
 
 		return html`
 			<div class="caption-row">
-				${content.caption
-					? content.captionTooltip
-						? html`<gl-tooltip content=${content.captionTooltip} placement="bottom">
-								<span class="caption">${content.caption}</span>
-							</gl-tooltip>`
-						: html`<span class="caption">${content.caption}</span>`
-					: nothing}
-				${content.planActions != null
-					? html`<span class="caption-actions">
-							<gl-action-chip
-								icon="tasklist"
-								label="View Plan"
-								overlay="tooltip"
-								href=${content.planActions.openHref}
-							></gl-action-chip>
-							<gl-copy-container
-								class="caption-copy"
-								.content=${content.planActions.copyContent}
-								copyLabel="Copy Plan Path"
-							>
-								<code-icon icon="copy"></code-icon>
-							</gl-copy-container>
-						</span>`
-					: nothing}
+				${
+					content.caption
+						? content.captionTooltip
+							? html`<gl-tooltip content=${content.captionTooltip} placement="bottom">
+									<span class="caption">${content.caption}</span>
+								</gl-tooltip>`
+							: html`<span class="caption">${content.caption}</span>`
+						: nothing
+				}
+				${
+					content.planActions != null
+						? html`<span class="caption-actions">
+								<gl-action-chip
+									icon="tasklist"
+									label="View Plan"
+									overlay="tooltip"
+									href=${content.planActions.openHref}
+								></gl-action-chip>
+								<gl-copy-container
+									class="caption-copy"
+									.content=${content.planActions.copyContent}
+									copyLabel="Copy Plan Path"
+								>
+									<code-icon icon="copy"></code-icon>
+								</gl-copy-container>
+							</span>`
+						: nothing
+				}
 			</div>
 		`;
 	}

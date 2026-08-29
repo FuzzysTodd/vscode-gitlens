@@ -1,7 +1,7 @@
-import { createContext } from '@lit/context';
 import type { Signal } from '@lit-labs/signals';
+import { createContext } from '@lit/context';
 import type { AiModelInfo, AIState } from '../../../rpc/services/types.js';
-import { createSignalGroup } from '../state.js';
+import { createSignalGroup } from '../state/signals.js';
 
 export interface AIContextState {
 	readonly model: Signal.State<AiModelInfo | undefined>;
@@ -16,10 +16,11 @@ export function createAIState(): AIContextState {
 		state: signal<AIState>({
 			enabled: false,
 			orgEnabled: true,
-			mcp: { settingEnabled: false, installed: false, bundled: false },
+			mcp: { settingEnabled: false, installed: false, bundled: false, capable: false },
 			hooks: {
-				claude: { detected: false, supported: false, installed: false },
-				canInstallClaudeHook: false,
+				agents: [],
+				canInstallHooks: false,
+				anyInstalled: false,
 			},
 			defaultAgent: undefined,
 		}),
